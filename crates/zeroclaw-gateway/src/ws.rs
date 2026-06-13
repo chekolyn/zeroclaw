@@ -968,15 +968,17 @@ fn first_chat_message_content(text: &str) -> Option<String> {
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
-        None => is_global_chat_event(event),
+        // The cron chat-leak fix (v0.8.1-era `69dd83ed`, replayed for
+        // v0.8.5): automated cron outputs are routed exclusively to the
+        // `cron` session — never broadcast to every chat WebSocket.
+        None => {
+            if event.get("type").and_then(|value| value.as_str()) == Some("cron_result") {
+                session_id == "cron"
+            } else {
+                false
+            }
+        }
     }
-}
-
-fn is_global_chat_event(event: &serde_json::Value) -> bool {
-    matches!(
-        event.get("type").and_then(serde_json::Value::as_str),
-        Some("cron_result")
-    )
 }
 
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
@@ -2126,7 +2128,8 @@ data: {\"type\":\"message_stop\"}\n\n",
             "source": "observability",
             "model": "gpt-4o"
         });
-        // No session_id but on the global whitelist (`cron_result`) → forwarded.
+        // No session_id + `cron_result` → routed exclusively to the `cron`
+        // session (the cron chat-leak fix), never to another chat WebSocket.
         let cron = serde_json::json!({
             "type": "cron_result",
             "output": "global notification"
@@ -2138,7 +2141,8 @@ data: {\"type\":\"message_stop\"}\n\n",
             &nameless_observability,
             "operator-1"
         ));
-        assert!(event_matches_session(&cron, "operator-1"));
+        assert!(!event_matches_session(&cron, "operator-1"));
+        assert!(event_matches_session(&cron, "cron"));
     }
 
     #[test]
