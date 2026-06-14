@@ -2840,16 +2840,24 @@ impl DelegateTool {
             Some(s) => s,
             None => {
                 let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
+                // The allow_scripts propagation fix (v0.8.1-era `352672c02`,
+                // replayed for v0.8.5): a delegated subagent inherits the
+                // root config snapshot's `skills.allow_scripts` instead of
+                // the hardcoded `false` — a subagent's skill load used to
+                // drop every script-carrying skill.
+                let root_config = self.root_config.as_deref();
                 resolved_skills = if bundle_dirs.is_empty() {
                     let default_dir = crate::skills::skills_dir(workspace_dir);
-                    crate::skills::load_skills_from_directory(&default_dir, false).0
+                    let allow_scripts = root_config.is_some_and(|c| c.skills.allow_scripts);
+                    crate::skills::load_skills_from_directory(&default_dir, allow_scripts).0
                 } else {
+                    let allow_scripts = root_config.is_some_and(|c| c.skills.allow_scripts);
                     bundle_dirs
                         .into_iter()
                         .flat_map(|dir| {
                             crate::skills::load_skills_from_directory(
                                 &workspace_dir.join(dir),
-                                false,
+                                allow_scripts,
                             )
                             .0
                         })
