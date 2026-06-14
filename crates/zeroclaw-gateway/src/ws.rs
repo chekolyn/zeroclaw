@@ -1711,11 +1711,6 @@ mod tests {
         });
         assert!(event_matches_session(&chat_tool_call, "operator-1"));
         assert!(!is_observability_telemetry(&chat_tool_call));
-=======
-        assert!(event_matches_session(&global_event, "operator-1"));
-        assert!(!event_matches_session(&cron_result_event, "operator-1"));
-        assert!(event_matches_session(&cron_result_event, "cron"));
->>>>>>> 792a5f80 (fix(gateway): route cron results exclusively to 'cron' session)
     }
 
     #[test]
