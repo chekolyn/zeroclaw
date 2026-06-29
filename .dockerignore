@@ -5,6 +5,8 @@
 
 # Rust build artifacts (can be multiple GB)
 target
+**/target
+.worktrees
 
 # Web build artifacts and local dependencies
 web/node_modules

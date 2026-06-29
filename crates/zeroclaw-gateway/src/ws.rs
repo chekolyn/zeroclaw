@@ -846,7 +846,13 @@ fn needs_onboarding_ws_error(
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
-        None => is_global_chat_event(event),
+        None => {
+            if event.get("type").and_then(|value| value.as_str()) == Some("cron_result") {
+                session_id == "cron"
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -1585,7 +1591,8 @@ mod tests {
             &nameless_observability,
             "operator-1"
         ));
-        assert!(event_matches_session(&cron, "operator-1"));
+        assert!(!event_matches_session(&cron, "operator-1"));
+        assert!(event_matches_session(&cron, "cron"));
     }
 
     #[test]

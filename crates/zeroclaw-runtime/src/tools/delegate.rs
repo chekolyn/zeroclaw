@@ -1843,14 +1843,19 @@ impl DelegateTool {
         // bundles, load + concat skills from each. With none, fall back to
         // the workspace default.
         let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
+        let allow_scripts = self
+            .root_config
+            .as_ref()
+            .map(|c| c.skills.allow_scripts)
+            .unwrap_or(false);
         let skills = if bundle_dirs.is_empty() {
             let default_dir = crate::skills::skills_dir(workspace_dir);
-            crate::skills::load_skills_from_directory(&default_dir, false)
+            crate::skills::load_skills_from_directory(&default_dir, allow_scripts)
         } else {
             bundle_dirs
                 .into_iter()
                 .flat_map(|dir| {
-                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false)
+                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), allow_scripts)
                 })
                 .collect()
         };
