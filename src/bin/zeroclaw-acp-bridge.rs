@@ -33,6 +33,10 @@ async fn run() -> Result<()> {
         .as_str()
         .into_client_request()
         .with_context(|| format!("failed to build request for {}", bridge_target.url))?;
+    // Override Host header to remove port (HAProxy ACL matches hostname only)
+    request.headers_mut().insert(header::HOST, HeaderValue::from_str(&bridge_target.host).unwrap());
+    // Send ACP subprotocol for proper gateway routing
+    request.headers_mut().insert(header::SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("zeroclaw.acp.v1"));
     if let Some(token) = bridge_target.token {
         let auth = HeaderValue::from_str(&format!("Bearer {token}"))
             .context("gateway paired token contains invalid header characters")?;
@@ -149,13 +153,15 @@ async fn resolve_acp_bridge_target(
 }
 
 fn bridge_target(config: &BridgeGatewayConfig, token: Option<String>) -> BridgeTarget {
+    let host = config.host.trim().to_string();
     BridgeTarget {
         url: acp_websocket_url(
             config.gateway_scheme(),
-            config.host.trim(),
+            &host,
             config.port,
             config.path_prefix.as_deref(),
         ),
+        host,
         token,
     }
 }
@@ -369,6 +375,7 @@ fn bracket_host(host: &str) -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct BridgeTarget {
     url: String,
+    host: String,
     token: Option<String>,
 }
 
