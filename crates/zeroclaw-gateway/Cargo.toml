@@ -107,6 +107,7 @@ channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+channel-webhook = ["zeroclaw-channels/channel-webhook"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults

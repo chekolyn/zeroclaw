@@ -14401,6 +14401,13 @@ pub struct WebhookConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
+    /// Header name for incoming webhook signature verification.
+    /// Common values: "X-Hub-Signature-256" (GitHub, WhatsApp),
+    /// "X-Webhook-Signature" (Linq), "X-Webhook-Secret" (generic).
+    /// Default: "X-Hub-Signature-256".
+    #[tab(Connection)]
+    #[serde(default = "default_webhook_signature_header")]
+    pub signature_header: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -14435,6 +14442,10 @@ pub struct WebhookConfig {
 
 fn default_webhook_channel_port() -> u16 {
     8090
+}
+
+fn default_webhook_signature_header() -> String {
+    "X-Hub-Signature-256".to_string()
 }
 
 impl ChannelConfig for WebhookConfig {
