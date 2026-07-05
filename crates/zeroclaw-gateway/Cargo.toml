@@ -98,6 +98,7 @@ channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
+channel-webhook = ["zeroclaw-channels/channel-webhook"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
