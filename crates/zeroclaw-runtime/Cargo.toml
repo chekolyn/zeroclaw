@@ -79,6 +79,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
 zeroclaw-macros.workspace = true
+rumqttc = { version = "0.25", optional = true }
 
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
@@ -99,6 +100,7 @@ encoding_rs = "0.8"
 
 [features]
 default = ["observability-prometheus", "schema-export"]
+channel-mqtt = ["dep:rumqttc"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
