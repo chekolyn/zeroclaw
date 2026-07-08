@@ -3330,6 +3330,13 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Subdirectory (relative to the agent workspace dir) where background
+    /// delegate task lifecycle records (`<task_id>.json`) are persisted.
+    /// `None` (default) preserves the upstream behavior of `"delegate_results"`.
+    /// Operators may override it (e.g. `"event_engine/tasks"`) to align the
+    /// durable task store with the MQTT topic tree (`.../tasks/<id>`).
+    #[serde(default)]
+    pub results_dir: Option<PathBuf>,
 }
 
 impl Default for DelegateToolConfig {
@@ -3337,6 +3344,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            results_dir: None,
         }
     }
 }
