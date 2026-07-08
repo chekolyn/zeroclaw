@@ -14571,6 +14571,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "ring",
+ "rumqttc",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

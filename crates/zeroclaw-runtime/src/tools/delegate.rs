@@ -49,6 +49,75 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// R4: project this task belongs to (for the MQTT topic hierarchy).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// R4: milestone within the project.
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    /// R4: chain ID linking a sequence of delegations (v1: manual follow-up).
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// R4: time-to-live in seconds (default 300). Used by the stuck-watchdog
+    /// SOP to detect stuck tasks.
+    #[serde(default = "default_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// R4: originating session ID (optional, for cross-session correlation).
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Default TTL for background delegate tasks (5 minutes).
+fn default_ttl_seconds() -> u64 {
+    300
+}
+
+/// R4: Event-driven delegate args parsed from the tool's JSON arguments.
+/// Used to thread project/milestone/chain metadata into the MQTT topic
+/// hierarchy and the `BackgroundDelegateResult`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegateEventArgs {
+    pub project_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub chain_id: Option<String>,
+    pub ttl_seconds: u64,
+    pub session_id: Option<String>,
+}
+
+/// Parse the event-driven args from a tool's JSON argument value.
+/// Returns a `DelegateEventArgs` with defaults applied (ttl_seconds=300).
+pub fn parse_delegate_event_args(args: &serde_json::Value) -> DelegateEventArgs {
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let milestone_id = args
+        .get("milestone_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let chain_id = args
+        .get("chain_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ttl_seconds = args
+        .get("ttl_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_ttl_seconds());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    DelegateEventArgs {
+        project_id,
+        milestone_id,
+        chain_id,
+        ttl_seconds,
+        session_id,
+    }
 }
 
 /// Status of a background delegate task.
@@ -773,6 +842,32 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Project ID for the event-driven topic hierarchy \
+                                    (zeroclaw/projects/{project_id}/...). Optional."
+                },
+                "milestone_id": {
+                    "type": "string",
+                    "description": "Milestone ID within the project for the topic hierarchy. \
+                                    Optional; use with project_id."
+                },
+                "chain_id": {
+                    "type": "string",
+                    "description": "Chain ID linking a sequence of delegations for manual \
+                                    follow-up (v1; no auto-dispatch). Optional."
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "description": "Time-to-live in seconds for the background task. Used by \
+                                    the stuck-watchdog SOP to detect stuck tasks. Default: 300.",
+                    "default": 300
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Originating session ID for cross-session correlation. \
+                                    Optional."
                 }
             },
             "required": []
@@ -1142,6 +1237,10 @@ impl DelegateTool {
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
 
+        // R4: parse event-driven args (project/milestone/chain/ttl/session) from
+        // the tool args, for the MQTT topic hierarchy and the result struct.
+        let event_args = parse_delegate_event_args(args);
+
         // Write initial "running" status
         let initial_result = BackgroundDelegateResult {
             task_id: task_id.clone(),
@@ -1151,9 +1250,41 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
+            project_id: event_args.project_id.clone(),
+            milestone_id: event_args.milestone_id.clone(),
+            chain_id: event_args.chain_id.clone(),
+            ttl_seconds: event_args.ttl_seconds,
+            session_id: event_args.session_id.clone(),
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
+
+        // R2: publish 'started' event (retained) to the MQTT bus for the event-driven
+        // swarm engine. No-op when mqtt unconfigured. Uses the project/milestone
+        // hierarchy topic; falls back to 'unassigned' when project_id is None.
+        #[cfg(feature = "channel-mqtt")]
+        {
+            let proj = event_args.project_id.clone().unwrap_or_else(|| "unassigned".to_string());
+            let ms = event_args.milestone_id.clone().unwrap_or_else(|| "unassigned".to_string());
+            let topic = crate::mqtt_bus::topic_for(&[
+                "projects", &proj, "milestones", &ms, "tasks", &task_id, "started",
+            ]);
+            let payload = serde_json::json!({
+                "task_id": task_id,
+                "agent": agent_name_owned,
+                "project_id": event_args.project_id,
+                "milestone_id": event_args.milestone_id,
+                "chain_id": event_args.chain_id,
+                "ttl_seconds": event_args.ttl_seconds,
+                "session_id": event_args.session_id,
+                "started_at": started_at,
+            }).to_string();
+            tokio::spawn(async move {
+                let _ = crate::mqtt_bus::publish(
+                    &topic, payload.into_bytes(), true,
+                ).await;
+            });
+        }
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
         // spawn, so a crash between here and the spawn is recoverable by the reaper. A
@@ -1183,6 +1314,7 @@ impl DelegateTool {
 
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
+        let event_args = event_args.clone();
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
         // Monotonic descent: was `self.depth` (verbatim copy), which left the
@@ -1273,6 +1405,11 @@ impl DelegateTool {
                         error: None,
                         started_at,
                         finished_at: Some(finished_at),
+                        project_id: event_args.project_id.clone(),
+                        milestone_id: event_args.milestone_id.clone(),
+                        chain_id: event_args.chain_id.clone(),
+                        ttl_seconds: event_args.ttl_seconds,
+                        session_id: event_args.session_id.clone(),
                     },
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
@@ -1288,6 +1425,11 @@ impl DelegateTool {
                             error: Some(err),
                             started_at,
                             finished_at: Some(finished_at),
+                            project_id: event_args.project_id.clone(),
+                            milestone_id: event_args.milestone_id.clone(),
+                            chain_id: event_args.chain_id.clone(),
+                            ttl_seconds: event_args.ttl_seconds,
+                            session_id: event_args.session_id.clone(),
                         }
                     }
                 };
@@ -1320,6 +1462,39 @@ impl DelegateTool {
                             final_result.error.clone(),
                         )
                         .await;
+                }
+
+                // R3: publish terminal event (retained) to the MQTT bus for the
+                // event-driven swarm engine. No-op when mqtt unconfigured.
+                #[cfg(feature = "channel-mqtt")]
+                {
+                    let state = match final_result.status {
+                        BackgroundTaskStatus::Completed => "completed",
+                        BackgroundTaskStatus::Failed => "failed",
+                        BackgroundTaskStatus::Cancelled => "cancelled",
+                        BackgroundTaskStatus::Running => "completed",
+                    };
+                    let proj = final_result.project_id.clone().unwrap_or_else(|| "unassigned".to_string());
+                    let ms = final_result.milestone_id.clone().unwrap_or_else(|| "unassigned".to_string());
+                    let topic = crate::mqtt_bus::topic_for(&[
+                        "projects", &proj, "milestones", &ms, "tasks", &task_id_clone, state,
+                    ]);
+                    let payload = serde_json::json!({
+                        "task_id": task_id_clone,
+                        "status": state,
+                        "project_id": final_result.project_id,
+                        "milestone_id": final_result.milestone_id,
+                        "chain_id": final_result.chain_id,
+                        "session_id": final_result.session_id,
+                        "started_at": final_result.started_at,
+                        "finished_at": final_result.finished_at,
+                        "error": final_result.error,
+                    }).to_string();
+                    tokio::spawn(async move {
+                        let _ = crate::mqtt_bus::publish(
+                            &topic, payload.into_bytes(), true,
+                        ).await;
+                    });
                 }
 
                 // Drop the live cancel token now the task has settled.
@@ -5841,5 +6016,103 @@ mod tests {
             "target policy should have filtered out file_write, but got: {}",
             result.output
         );
+    }
+
+    // ── R4: event-driven arg parsing tests ─────────────────────────
+
+    #[test]
+    fn parse_delegate_event_args_with_all_fields() {
+        let args = serde_json::json!({
+            "project_id": "p1",
+            "milestone_id": "m1",
+            "chain_id": "c1",
+            "ttl_seconds": 600,
+            "session_id": "s1",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id.as_deref(), Some("p1"));
+        assert_eq!(parsed.milestone_id.as_deref(), Some("m1"));
+        assert_eq!(parsed.chain_id.as_deref(), Some("c1"));
+        assert_eq!(parsed.ttl_seconds, 600);
+        assert_eq!(parsed.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn parse_delegate_event_args_defaults_when_absent() {
+        let args = serde_json::json!({});
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.ttl_seconds, 300, "default ttl_seconds should be 300");
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_empty_strings_become_none() {
+        let args = serde_json::json!({
+            "project_id": "",
+            "milestone_id": "",
+            "chain_id": "",
+            "session_id": "",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None, "empty string should map to None");
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_ttl_falls_back_to_default() {
+        let args = serde_json::json!({
+            "ttl_seconds": "not_a_number",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.ttl_seconds, 300);
+    }
+
+    #[cfg(feature = "channel-mqtt")]
+    #[test]
+    fn topic_for_hierarchy_contract() {
+        // Lock the topic hierarchy contract: the started/completed events
+        // must produce topics matching the design's tree topology.
+        let topic = crate::mqtt_bus::topic_for(&[
+            "projects", "p1", "milestones", "m1", "tasks", "t1", "started",
+        ]);
+        assert_eq!(
+            topic,
+            "zeroclaw/projects/p1/milestones/m1/tasks/t1/started"
+        );
+
+        let topic2 = crate::mqtt_bus::topic_for(&[
+            "projects", "unassigned", "milestones", "unassigned", "tasks", "t2", "completed",
+        ]);
+        assert_eq!(
+            topic2,
+            "zeroclaw/projects/unassigned/milestones/unassigned/tasks/t2/completed"
+        );
+    }
+
+    #[test]
+    fn parameter_schema_includes_event_args() {
+        // Verify the 5 new args are present in the parameter schema.
+        let tool = DelegateTool::new(
+            sample_agents(),
+            None,
+            test_security(),
+        );
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["project_id"].is_object(),
+            "project_id should be in parameter schema");
+        assert!(schema["properties"]["milestone_id"].is_object(),
+            "milestone_id should be in parameter schema");
+        assert!(schema["properties"]["chain_id"].is_object(),
+            "chain_id should be in parameter schema");
+        assert!(schema["properties"]["ttl_seconds"].is_object(),
+            "ttl_seconds should be in parameter schema");
+        assert!(schema["properties"]["session_id"].is_object(),
+            "session_id should be in parameter schema");
+        assert_eq!(schema["properties"]["ttl_seconds"]["default"], 300);
     }
 }
