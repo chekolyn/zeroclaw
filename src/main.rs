@@ -3910,6 +3910,23 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // Initialize the outbound MQTT publisher (mqtt_bus) from the first
+                // enabled `[channels.mqtt.*]`. Idempotent: first call wins; later
+                // iterations (config reload) are no-ops. No-op when no MQTT channel
+                // is enabled (graceful degradation). Powers the R2/R3 delegate
+                // publish hooks (started/completed/failed/cancelled) + the future
+                // mqtt_publish SOP tool. Without this call the global publisher
+                // stays None and mqtt_bus::publish() is a silent no-op.
+                #[cfg(feature = "channel-mqtt")]
+                {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "mqtt_bus: init call site reached (daemon startup)"
+                    );
+                    zeroclaw_runtime::mqtt_bus::init(&current_config).await?;
+                }
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
