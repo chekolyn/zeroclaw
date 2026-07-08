@@ -728,8 +728,17 @@ impl DelegateTool {
     }
 
     /// Directory where background delegate results are stored.
+    ///
+    /// The subdir is resolved from `DelegateToolConfig.results_dir` (configurable
+    /// via `[delegate] results_dir = "..."`), defaulting to `"delegate_results"`
+    /// to preserve upstream behavior. The path is relative to the agent workspace.
     fn results_dir(&self) -> PathBuf {
-        self.workspace_dir.join("delegate_results")
+        let subdir = self
+            .delegate_config
+            .results_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("delegate_results"));
+        self.workspace_dir.join(subdir)
     }
 
     /// Persist a background result atomically: write to a sibling temp file then
@@ -4918,6 +4927,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn results_dir_defaults_to_delegate_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_default_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "default results_dir should be delegate_results (upstream behavior)"
+        );
+    }
+
+    #[test]
+    fn results_dir_config_override_honored() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_override_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = DelegateToolConfig {
+            results_dir: Some("event_engine/tasks".into()),
+            ..DelegateToolConfig::default()
+        };
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_delegate_config(cfg)
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("event_engine/tasks"),
+            "results_dir should honor the config override, not delegate_results"
+        );
+        assert_ne!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "overridden results_dir must NOT fall back to delegate_results"
+        );
     }
 
     // ── Background and Parallel execution tests ─────────────────────
