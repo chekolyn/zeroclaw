@@ -10,6 +10,11 @@ pub mod identity;
 pub mod migration;
 pub mod util;
 
+/// Outbound MQTT publish helper for the event-driven swarm engine.
+/// Only compiled when the `channel-mqtt` feature is enabled (rumqttc is optional).
+#[cfg(feature = "channel-mqtt")]
+pub mod mqtt_bus;
+
 pub mod agent;
 pub mod approval;
 pub mod browse;
