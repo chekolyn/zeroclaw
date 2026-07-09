@@ -384,6 +384,49 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         Ok(filtered)
     }
 
+    /// Append content to an existing memory entry.
+    ///
+    /// If no entry exists for `key`, behaves like `store`.
+    /// If the existing value parses as a JSON array, parse `content` as JSON and push it
+    /// as a new element.
+    /// Otherwise text-concatenate with a `'\n'` separator.
+    ///
+    /// Default implementation: read-modify-write via `get` + `store`.
+    async fn store_append(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let existing = self.get(key).await?;
+        let new_content = match existing {
+            Some(entry) => {
+                // Try JSON array append first
+                if let Ok(existing_val) = serde_json::from_str::<serde_json::Value>(&entry.content) {
+                    if let serde_json::Value::Array(mut arr) = existing_val {
+                        if let Ok(new_val) = serde_json::from_str(content) {
+                            arr.push(new_val);
+                            serde_json::to_string(&arr)
+                        } else {
+                            // content is not valid JSON — append as string element
+                            arr.push(serde_json::Value::String(content.to_string()));
+                            serde_json::to_string(&arr)
+                        }
+                    } else {
+                        // non-array JSON value — text concatenate
+                        Ok(format!("{}\n{content}", entry.content))
+                    }
+                } else {
+                    // Not JSON — text concatenate
+                    Ok(format!("{}\n{content}", entry.content))
+                }
+            }
+            None => Ok(content.to_string()),
+        }?;
+        self.store(key, &new_content, category, session_id).await
+    }
+
     /// Store a memory entry with namespace and importance.
     ///
     /// Default implementation delegates to `store()`. Backends with native

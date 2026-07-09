@@ -43,6 +43,10 @@ impl Tool for MemoryStoreTool {
                 "category": {
                     "type": "string",
                     "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, append to any existing value instead of overwriting. JSON-array values get a new element; text values are newline-joined."
                 }
             },
             "required": ["key", "content"]
@@ -82,6 +86,11 @@ impl Tool for MemoryStoreTool {
             Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
+        let append = args
+            .get("append")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
@@ -93,7 +102,15 @@ impl Tool for MemoryStoreTool {
             });
         }
 
-        match self.memory.store(key, content, category, None).await {
+        let result = if append {
+            self.memory
+                .store_append(key, content, category, None)
+                .await
+        } else {
+            self.memory.store(key, content, category, None).await
+        };
+
+        match result {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}"),
@@ -217,6 +234,102 @@ mod tests {
                 .contains("read-only mode")
         );
         assert!(mem.get("lang").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn store_append_text_concatenates() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        // First store "line1"
+        let result1 = tool
+            .execute(json!({"key": "append_test", "content": "line1"}))
+            .await
+            .unwrap();
+        assert!(result1.success);
+
+        // Append "line2"
+        let result2 = tool
+            .execute(json!({"key": "append_test", "content": "line2", "append": true}))
+            .await
+            .unwrap();
+        assert!(result2.success);
+
+        // Verify content contains both lines
+        let entry = mem.get("append_test").await.unwrap().unwrap();
+        assert!(entry.content.contains("line1"));
+        assert!(entry.content.contains("line2"));
+        // Newline separator between them
+        assert!(
+            entry.content == "line1\nline2"
+                || entry.content == "line2\nline1"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_append_json_array_pushes() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        // Store a JSON array
+        let result1 = tool
+            .execute(json!({"key": "arr_test", "content": "[\"a\"]"}))
+            .await
+            .unwrap();
+        assert!(result1.success);
+
+        // Append a JSON value (string "b")
+        let result2 = tool
+            .execute(json!({"key": "arr_test", "content": "\"b\"", "append": true}))
+            .await
+            .unwrap();
+        assert!(result2.success);
+
+        // Verify resulting content is JSON array ["a","b"]
+        let entry = mem.get("arr_test").await.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&entry.content).unwrap();
+        assert!(parsed.is_array());
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "a");
+        assert_eq!(arr[1], "b");
+    }
+
+    #[tokio::test]
+    async fn store_append_missing_key_behaves_like_store() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        // Append on an absent key should behave like store
+        let result = tool
+            .execute(json!({"key": "brand_new", "content": "first entry", "append": true}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let entry = mem.get("brand_new").await.unwrap().unwrap();
+        assert_eq!(entry.content, "first entry");
+    }
+
+    #[tokio::test]
+    async fn store_non_append_still_overwrites() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        let r1 = tool
+            .execute(json!({"key": "ow", "content": "first"}))
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        let r2 = tool
+            .execute(json!({"key": "ow", "content": "second"}))
+            .await
+            .unwrap();
+        assert!(r2.success);
+
+        let entry = mem.get("ow").await.unwrap().unwrap();
+        assert_eq!(entry.content, "second");
     }
 
     #[tokio::test]
