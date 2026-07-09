@@ -14,6 +14,38 @@ impl MemoryRecallTool {
     pub fn new(memory: Arc<dyn Memory>) -> Self {
         Self { memory }
     }
+
+    /// Handle prefix recall mode: list all entries whose key starts with `prefix`.
+    async fn handle_prefix_recall(&self, prefix: &str, limit: usize) -> anyhow::Result<ToolResult> {
+        let entries = self.memory.list(None, None).await?;
+        let matched: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.key.starts_with(prefix))
+            .take(limit)
+            .collect();
+
+        if matched.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: "No memories found.".into(),
+                error: None,
+            });
+        }
+
+        let mut output = format!("Found {} memories:\n", matched.len());
+        for entry in &matched {
+            let _ = writeln!(
+                output,
+                "- [{}] {}: {}",
+                entry.category, entry.key, entry.content
+            );
+        }
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -36,7 +68,7 @@ impl Tool for MemoryRecallTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max results to return (default: 5)"
+                    "description": "Max results to return (default: 5 for keyword, 100 for prefix)"
                 },
                 "since": {
                     "type": "string",
@@ -50,6 +82,10 @@ impl Tool for MemoryRecallTool {
                     "type": "string",
                     "enum": ["bm25", "embedding", "hybrid"],
                     "description": "Search strategy: bm25 (keyword), embedding (semantic), or hybrid (both). Defaults to config value."
+                },
+                "prefix": {
+                    "type": "string",
+                    "description": "If set, return ALL entries whose key starts with this prefix (unranked, complete list), ignoring query/since/until/search_mode."
                 }
             }
         })
@@ -102,6 +138,19 @@ impl Tool for MemoryRecallTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
+
+        // Prefix mode: list all entries whose key starts with the given prefix
+        if let Some(prefix) = args.get("prefix").and_then(|v| v.as_str()) {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                return Ok(ToolResult {
+                    success: true,
+                    output: "No memories found.".into(),
+                    error: None,
+                });
+            }
+            return self.handle_prefix_recall(prefix, limit).await;
+        }
 
         match self.memory.recall(query, limit, None, since, until).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -406,6 +455,61 @@ mod tests {
         let score: Option<f64> = None;
         let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
         assert_eq!(formatted, "");
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_returns_only_matching_keys() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("proj:a:1", "first", MemoryCategory::Core, None).await.unwrap();
+        mem.store("proj:a:2", "second", MemoryCategory::Core, None).await.unwrap();
+        mem.store("proj:b:1", "third", MemoryCategory::Core, None).await.unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"prefix": "proj:a:"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("proj:a:1"));
+        assert!(result.output.contains("proj:a:2"));
+        assert!(!result.output.contains("proj:b:1"));
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_respects_limit() {
+        let (_tmp, mem) = seeded_mem();
+        for i in 0..5 {
+            mem.store(
+                &format!("proj:a:{i}"),
+                &format!("entry {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"prefix": "proj:a:", "limit": 2}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 2"));
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_empty_returns_nothing() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("some_key", "value", MemoryCategory::Core, None).await.unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"prefix": "nonexistent:"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No memories found"));
     }
 
     #[test]
