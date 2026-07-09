@@ -26,6 +26,8 @@ pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
 pub mod model_switch;
+#[cfg(feature = "channel-mqtt")]
+pub mod mqtt_publish;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -135,6 +137,8 @@ pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
+#[cfg(feature = "channel-mqtt")]
+pub use mqtt_publish::MqttPublishTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
@@ -621,6 +625,11 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // mqtt_publish — event-bus publisher for the event-driven swarm engine.
+    // Only available when the channel-mqtt feature is compiled in.
+    #[cfg(feature = "channel-mqtt")]
+    tool_arcs.push(Arc::new(MqttPublishTool::new()));
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
