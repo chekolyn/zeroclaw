@@ -112,10 +112,16 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// Timeout override for background delegation (in seconds). If set, overrides
+    /// the timeout resolved from the runtime profile and delegate config.
+    timeout_override: Option<u64>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// Timeout override for background delegation (in seconds). If set, overrides
+    /// the timeout resolved from the runtime profile and delegate config.
+    timeout_override: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1040,6 +1046,11 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for background delegation. Only used when background:true.",
+                    "default": null
                 }
             },
             "required": []
@@ -1286,7 +1297,8 @@ impl DelegateTool {
 
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
-            .resolve_delegation_timeout(&agent_config.runtime_profile)
+            .timeout_override
+            .or_else(|| self.resolve_delegation_timeout(&agent_config.runtime_profile))
             .unwrap_or(self.delegate_config.timeout_secs);
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
         let result = tokio::time::timeout(
@@ -1434,6 +1446,9 @@ impl DelegateTool {
 
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
+        let ttl_seconds = args
+            .get("ttl_seconds")
+            .and_then(|v| v.as_u64());
 
         // Write initial "running" status
         let initial_result = BackgroundDelegateResult {
@@ -1532,6 +1547,7 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     caller_alias,
+                    timeout_override: ttl_seconds,
                 };
 
                 let args_inner = json!({
@@ -2399,7 +2415,8 @@ impl DelegateTool {
         let noop_observer = NoopObserver;
 
         let agentic_timeout_secs = self
-            .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
+            .timeout_override
+            .or_else(|| self.resolve_agentic_timeout_secs(&agent_config.runtime_profile))
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
         // Forward the per-turn receipt scope from the parent loop so subagent
         // tool calls land in the same collector as the top-level turn. When
