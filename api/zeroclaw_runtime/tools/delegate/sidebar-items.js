@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BackgroundTaskStatus"],"fn":["parse_delegate_event_args"],"struct":["BackgroundDelegateResult","DelegateEventArgs","DelegateTool"]};
