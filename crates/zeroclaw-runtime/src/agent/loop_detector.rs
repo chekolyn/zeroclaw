@@ -16,6 +16,13 @@ pub struct LoopDetectorConfig {
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
+    /// Tools exempt from the no-progress detector. These are typically
+    /// read-only search tools that can legitimately return identical
+    /// results for different queries (e.g. memory_recall returning
+    /// similar content for different keys, or search returning "no
+    /// results" for different queries). Exact-repeat and ping-pong
+    /// detection still apply to these tools.
+    pub no_progress_exempt_tools: Vec<String>,
 }
 
 impl Default for LoopDetectorConfig {
@@ -24,6 +31,12 @@ impl Default for LoopDetectorConfig {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            no_progress_exempt_tools: vec![
+                "memory_recall".to_string(),
+                "content_search".to_string(),
+                "web_search_tool".to_string(),
+                "glob_search".to_string(),
+            ],
         }
     }
 }
@@ -311,6 +324,7 @@ mod tests {
             enabled: true,
             window_size: 20,
             max_repeats,
+            no_progress_exempt_tools: Vec::new(),
         }
     }
 
@@ -588,6 +602,7 @@ mod tests {
             enabled: true,
             window_size: 5,
             max_repeats: 3,
+            no_progress_exempt_tools: Vec::new(),
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -639,6 +654,7 @@ mod tests {
             enabled: true,
             window_size: 6,
             max_repeats: 3,
+            no_progress_exempt_tools: Vec::new(),
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -702,6 +718,77 @@ mod tests {
                 assert!(msg.contains("identical arguments"));
             }
             other => panic!("expected exact-repeat Warning, got {other:?}"),
+        }
+    }
+
+    // ── No-progress exemption tests ──────────────────────────────
+
+    #[test]
+    fn no_progress_exempt_tool_different_args_identical_result_returns_ok() {
+        // memory_recall is a read-only search tool that can legitimately
+        // return identical results for different queries. 7 calls with
+        // different args but the same result must NOT trip the no-progress
+        // detector — this is the false positive that killed the director
+        // agent. The exemption list comes from the default config.
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..7 {
+            let args = json!({"key": format!("memory_key_{i}")});
+            let result = det.record("memory_recall", &args, "no results found");
+            assert_eq!(
+                result,
+                LoopDetectionResult::Ok,
+                "memory_recall call {i} should be exempt from no-progress"
+            );
+        }
+    }
+
+    #[test]
+    fn no_progress_exempt_tool_same_args_still_triggers_exact_repeat() {
+        // The exemption only applies to detect_no_progress. Exact-repeat
+        // detection must still fire when an exempt tool is called with the
+        // SAME arguments repeatedly. 7 identical calls with max_repeats=3
+        // -> consecutive=7 >= max_repeats+2(5) -> Break.
+        let mut det = LoopDetector::new(config_with_repeats(3));
+        let args = json!({"key": "same_key"});
+
+        for _ in 0..6 {
+            det.record("memory_recall", &args, "some result");
+        }
+        // 7th consecutive identical call -> exact-repeat Break (circuit breaker).
+        match det.record("memory_recall", &args, "some result") {
+            LoopDetectionResult::Break(msg) => {
+                assert!(
+                    msg.contains("memory_recall"),
+                    "should mention the tool: {msg}"
+                );
+                assert!(
+                    msg.contains("identical arguments"),
+                    "should be exact-repeat Break, got: {msg}"
+                );
+            }
+            other => panic!("expected exact-repeat Break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_non_exempt_tool_still_triggers_break() {
+        // Backward compatibility: a non-exempt tool (e.g. "shell") called 7
+        // times with different args but identical results must still trip
+        // the no-progress circuit breaker.
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..6 {
+            let args = json!({"cmd": format!("echo {i}")});
+            det.record("shell", &args, "done");
+        }
+        // 7th call: count=7 >= MIN_CALLS(5)+2 -> Break.
+        match det.record("shell", &json!({"cmd": "echo 6"}), "done") {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("shell"));
+                assert!(msg.contains("no progress"));
+            }
+            other => panic!("expected no-progress Break for non-exempt tool, got {other:?}"),
         }
     }
 }

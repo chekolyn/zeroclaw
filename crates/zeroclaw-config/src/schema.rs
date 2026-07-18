@@ -5933,6 +5933,16 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Read-only search tools exempt from the no-progress loop detector.
+    /// These tools can legitimately return identical results (empty results,
+    /// "not found", similar content) for different queries, so repeated
+    /// calls with different args that return the same result are not
+    /// necessarily a sign of being stuck. Exact-repeat and ping-pong
+    /// detection still apply to these tools. Defaults to a small set of
+    /// search tools.
+    #[serde(default = "default_no_progress_exempt_tools")]
+    pub no_progress_exempt_tools: Vec<String>,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -5947,6 +5957,15 @@ fn default_loop_detection_max_repeats() -> usize {
     3
 }
 
+fn default_no_progress_exempt_tools() -> Vec<String> {
+    vec![
+        "memory_recall".to_string(),
+        "content_search".to_string(),
+        "web_search_tool".to_string(),
+        "glob_search".to_string(),
+    ]
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -5957,6 +5976,7 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            no_progress_exempt_tools: default_no_progress_exempt_tools(),
         }
     }
 }
