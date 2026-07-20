@@ -16221,6 +16221,17 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    // Clears the global model_switch_state on drop so this test cannot leak a
+    // pending switch into sibling tests that run afterwards under parallel
+    // execution. `clear_model_switch_request()` is imported from
+    // `zeroclaw_runtime::agent::loop_` (already in scope in this module).
+    struct ClearModelSwitchOnDrop;
+    impl Drop for ClearModelSwitchOnDrop {
+        fn drop(&mut self) {
+            clear_model_switch_request();
+        }
+    }
+
     /// Regression for #6173: when a `model_switch` request is pending
     /// (set by the `model_switch` tool during the previous tool
     /// iteration), `process_channel_message` must:
@@ -16315,6 +16326,8 @@ BTC is currently around $65,000 based on latest tool output."#
             let mut guard = state.lock().unwrap();
             *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
         }
+        // Guard ensures model_switch_state is cleared on scope exit (panic-safe).
+        let _clear_on_drop = ClearModelSwitchOnDrop;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
