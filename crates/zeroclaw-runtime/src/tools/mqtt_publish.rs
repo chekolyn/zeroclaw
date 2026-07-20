@@ -176,7 +176,7 @@ impl Tool for MqttPublishTool {
         if let Err(message) = self.check_rate_limit(now_secs) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(message),
             });
         }
@@ -194,13 +194,14 @@ impl Tool for MqttPublishTool {
                     output: format!(
                         "published to {topic} (retain={retain}); \
                          note: if MQTT is unconfigured this was a no-op"
-                    ),
+                    )
+                    .into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("mqtt publish failed: {e:#}")),
             }),
         }
