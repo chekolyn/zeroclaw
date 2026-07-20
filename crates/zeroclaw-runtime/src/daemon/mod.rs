@@ -2284,6 +2284,7 @@ mod tests {
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
+                ..Default::default()
             },
         );
         assert!(has_supervised_channels(&config));
