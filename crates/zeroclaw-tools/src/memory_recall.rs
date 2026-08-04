@@ -42,7 +42,7 @@ impl MemoryRecallTool {
         }
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

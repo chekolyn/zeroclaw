@@ -1184,7 +1184,6 @@ impl Tool for DelegateTool {
                     "description": "Originating session ID for cross-session correlation. \
                                     Optional."
                 }
-                }
             },
             "required": []
         })
