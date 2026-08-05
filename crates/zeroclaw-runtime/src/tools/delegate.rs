@@ -3237,6 +3237,11 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            project_id: None,
+            milestone_id: None,
+            chain_id: None,
+            ttl_seconds: 300,
+            session_id: None,
         }
     }
 

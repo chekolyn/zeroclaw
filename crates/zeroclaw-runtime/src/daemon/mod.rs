@@ -2571,6 +2571,7 @@ mod tests {
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
+                signature_header: "X-Hub-Signature-256".to_string(),
             },
         );
         assert!(has_supervised_channels(&config));
