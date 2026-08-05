@@ -22617,6 +22617,15 @@ pub struct SopConfig {
     #[serde(default = "default_sop_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
+    /// Maximum seconds a SOP run may stay in `Running` before the maintenance
+    /// tick reaps it as `Failed` ("stuck-run timeout"). Protects against runs
+    /// that started an executing step and never reached a terminal state (a
+    /// crashed agent loop, a lost executor). Default `3600` (1h); `0` disables
+    /// the reaper. Independent of `approval_timeout_secs` (which covers runs
+    /// parked at a HITL gate).
+    #[serde(default = "default_sop_stuck_run_timeout_secs")]
+    pub stuck_run_timeout_secs: u64,
+
     /// Maximum number of finished runs kept in memory for status queries.
     /// Oldest runs are evicted when over capacity. 0 = unlimited.
     #[serde(default = "default_sop_max_finished_runs")]
@@ -22856,6 +22865,10 @@ fn default_sop_approval_timeout_secs() -> u64 {
     300
 }
 
+fn default_sop_stuck_run_timeout_secs() -> u64 {
+    3600
+}
+
 fn default_sop_max_finished_runs() -> usize {
     100
 }
@@ -22914,6 +22927,7 @@ impl Default for SopConfig {
             default_execution_mode: default_sop_execution_mode(),
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
+            stuck_run_timeout_secs: default_sop_stuck_run_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
             maintenance_interval_secs: default_sop_maintenance_interval_secs(),
             persist_runs: default_sop_persist_runs(),

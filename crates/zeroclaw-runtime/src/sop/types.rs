@@ -159,8 +159,12 @@ pub enum SopTrigger {
     /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
     #[trigger(display = "expression")]
     Cron {
-        /// Cron expression evaluated over the run window.
-        expression: String,
+        /// Cron expression evaluated over the run window. Optional: when the
+        /// schedule is owned by `config.toml` (cron jobs), this is `None` and the
+        /// SOP trigger is a declarative tag only — `SopCronCache` skips it and
+        /// scheduling is config-driven.
+        #[serde(default)]
+        expression: Option<String>,
     },
     /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
     #[trigger(display = "board/signal")]
@@ -979,7 +983,7 @@ pub(crate) fn sample_trigger(source: SopTriggerSource) -> SopTrigger {
             path: "/hook".into(),
         },
         SopTriggerSource::Cron => SopTrigger::Cron {
-            expression: "* * * * *".into(),
+            expression: Some("* * * * *".into()),
         },
         SopTriggerSource::Peripheral => SopTrigger::Peripheral {
             board: "b".into(),
@@ -1440,5 +1444,44 @@ path = "/sop/test"
         assert_eq!(parsed.status, SopRunStatus::Running);
         assert_eq!(parsed.step_results.len(), 1);
         assert_eq!(parsed.step_results[0].status, SopStepStatus::Completed);
+    }
+
+    // T1: cron SOPs with the schedule owned by config.toml.j2 author
+    // `[[triggers]] type = "cron"` with NO `expression`. The SOP trigger's
+    // `expression` must be optional so these SOPs load.
+    #[test]
+    fn cron_trigger_without_expression_loads() {
+        let toml_str = r#"type = "cron""#;
+        let trigger: SopTrigger =
+            toml::from_str(toml_str).expect("cron trigger without expression must load");
+        assert!(
+            matches!(trigger, SopTrigger::Cron { ref expression } if expression.is_none()),
+            "cron trigger without expression must load with expression = None"
+        );
+    }
+
+    #[test]
+    fn cron_trigger_with_expression_loads() {
+        let toml_str = r#"
+type = "cron"
+expression = "*/5 * * * *"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Cron { ref expression } if expression.as_deref() == Some("*/5 * * * *")),
+            "cron trigger with expression must preserve it as Some"
+        );
+    }
+
+    #[test]
+    fn cron_trigger_display_handles_none_and_some() {
+        // No expression: the source name is used as a placeholder suffix.
+        let none = SopTrigger::Cron { expression: None };
+        assert_eq!(none.to_string(), "cron:cron");
+
+        let some = SopTrigger::Cron {
+            expression: Some("*/5 * * * *".into()),
+        };
+        assert_eq!(some.to_string(), "cron:*/5 * * * *");
     }
 }

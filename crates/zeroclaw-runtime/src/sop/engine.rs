@@ -110,6 +110,8 @@ pub struct MaintenanceSummary {
     pub reaped_claims: usize,
     /// Terminal runs pruned past the retention policy.
     pub pruned_runs: usize,
+    /// `Running` runs reaped by the stuck-run timeout.
+    pub reaped_stuck_runs: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -119,7 +121,10 @@ pub struct MaintenanceSummary {
 impl MaintenanceSummary {
     /// True when the pass did nothing (no timeouts, reaps, or prunes).
     pub fn is_empty(&self) -> bool {
-        self.timed_out == 0 && self.reaped_claims == 0 && self.pruned_runs == 0
+        self.timed_out == 0
+            && self.reaped_claims == 0
+            && self.pruned_runs == 0
+            && self.reaped_stuck_runs == 0
     }
 }
 
@@ -4696,11 +4701,13 @@ impl SopEngine {
         self.retry_capacity_blocked_gated_pends();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
+        let reaped_stuck_runs = self.reap_stuck_running_runs();
         let pruned_runs = self.prune_terminal_runs();
         MaintenanceSummary {
             timed_out,
             reaped_claims,
             pruned_runs,
+            reaped_stuck_runs,
             timeout_actions,
         }
     }
@@ -4759,6 +4766,45 @@ impl SopEngine {
                 0
             }
         }
+    }
+
+    /// Reap SOP runs stuck in `Running` longer than `stuck_run_timeout_secs`:
+    /// finalize each as `Failed` with a "stuck-run timeout" reason. Best-effort;
+    /// a store error on finish is surfaced by `finish_run`. Returns the count
+    /// reaped. `stuck_run_timeout_secs == 0` disables the reaper.
+    fn reap_stuck_running_runs(&mut self) -> usize {
+        let timeout_secs = self.config.stuck_run_timeout_secs;
+        if timeout_secs == 0 {
+            return 0;
+        }
+        let stuck: Vec<String> = self
+            .active_runs
+            .values()
+            .filter(|r| r.status == SopRunStatus::Running)
+            .filter(|r| cooldown_elapsed(&r.started_at, timeout_secs))
+            .map(|r| r.run_id.clone())
+            .collect();
+        let mut reaped = 0;
+        for run_id in stuck {
+            match self.finish_run(
+                &run_id,
+                SopRunStatus::Failed,
+                Some("stuck-run timeout".to_string()),
+            ) {
+                Ok(_) => reaped += 1,
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": e.to_string(),
+                        })),
+                    "SOP maintenance: failed to reap stuck running run"
+                ),
+            }
+        }
+        reaped
     }
 
     /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
@@ -4824,6 +4870,17 @@ impl SopEngine {
             .find(|r| r.sop_name == sop_name)
     }
 
+    /// Count of terminal runs currently held in the persisted run store
+    /// (unbounded read). For tests asserting the store is pruned to the
+    /// retention cap on the finish path.
+    #[cfg(test)]
+    pub(crate) fn terminal_run_count(&self) -> usize {
+        self.store
+            .load_terminal_runs(0)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
     pub fn finish_run(
         &mut self,
         run_id: &str,
@@ -4856,6 +4913,11 @@ impl SopEngine {
             let excess = self.finished_runs.len() - max;
             self.finished_runs.drain(..excess);
         }
+
+        // Prune the persisted run store to the same retention cap so the durable
+        // terminal records stay bounded on the finish path (not only on the
+        // maintenance tick). Best-effort; a store error is logged by the helper.
+        self.prune_terminal_runs();
 
         Ok(match status {
             SopRunStatus::Failed => SopRunAction::Failed {
@@ -4899,6 +4961,9 @@ impl SopEngine {
             let excess = self.finished_runs.len() - max;
             self.finished_runs.drain(..excess);
         }
+
+        // Prune the persisted run store on the finish path too (see finish_run).
+        self.prune_terminal_runs();
 
         Ok(match status {
             SopRunStatus::Failed => SopRunAction::Failed {
@@ -6383,7 +6448,7 @@ mod tests {
     fn cron_trigger_matches_only_matching_expression() {
         let sop = Sop {
             triggers: vec![SopTrigger::Cron {
-                expression: "0 */5 * * *".into(),
+                expression: Some("0 */5 * * *".into()),
             }],
             ..test_sop("cron-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -11611,6 +11676,123 @@ mod tests {
         // Oldest (first) run should be evicted, newest two remain
         assert_eq!(finished[0].run_id, finished_ids[1]);
         assert_eq!(finished[1].run_id, finished_ids[2]);
+    }
+
+    // T2: the persisted run store must also be pruned to `max_finished_runs` on
+    // the finish path (not only on the maintenance tick), so the durable
+    // terminal records stay bounded.
+    #[test]
+    fn finish_run_prunes_persisted_store_to_max() {
+        let mut engine = SopEngine::new(SopConfig {
+            max_finished_runs: 2,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        for _ in 0..4 {
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let rid = extract_run_id(&action).to_string();
+            engine
+                .advance_step(
+                    &rid,
+                    SopStepResult {
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "ok".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        effective_agent: None,
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            2,
+            "in-memory finished_runs must cap at max_finished_runs"
+        );
+        assert_eq!(
+            engine.terminal_run_count(),
+            2,
+            "persisted run store must also be pruned to max_finished_runs on finish"
+        );
+    }
+
+    // T3: a SOP run stuck in `Running` longer than `stuck_run_timeout_secs` must
+    // be reaped to `Failed` by the maintenance tick.
+    #[test]
+    fn reap_stuck_running_runs_finalizes_overdue_runs() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 60,
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        // Force the run's started_at to be ancient (well past the 60s timeout).
+        if let Some(run) = engine.active_runs.get_mut(&rid) {
+            run.started_at = "2020-01-01T00:00:00Z".to_string();
+        }
+
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 1, "overdue running run should be reaped");
+
+        let finished = engine.finished_runs(None);
+        assert_eq!(finished.len(), 1, "reaped run should land in finished_runs");
+        assert!(matches!(finished[0].status, SopRunStatus::Failed));
+    }
+
+    #[test]
+    fn reap_stuck_running_runs_skips_fresh_runs() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 3600, // 1h
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        // started_at is now() -> not overdue
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 0, "fresh run should not be reaped");
+        assert!(engine.active_runs.contains_key(&rid), "fresh run must stay active");
+    }
+
+    #[test]
+    fn reap_stuck_running_runs_disabled_when_timeout_zero() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 0, // disabled
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        if let Some(run) = engine.active_runs.get_mut(&rid) {
+            run.started_at = "2020-01-01T00:00:00Z".to_string();
+        }
+
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 0, "timeout=0 disables the reaper");
+        assert!(engine.active_runs.contains_key(&rid), "run must stay active when reaper disabled");
     }
 
     #[test]

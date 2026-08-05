@@ -2320,6 +2320,25 @@ pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
                 quote! { Self::#vident { #(#binds),* , .. } }
             };
 
+            // Field names whose declared type is `Option<T>`: rendered with a
+            // `source`-name placeholder when `None` so a trigger may declare an
+            // optional display field (e.g. `Cron { expression: Option<String> }`).
+            let option_fields: std::collections::HashSet<String> = match &variant.fields {
+                syn::Fields::Named(named) => named
+                    .named
+                    .iter()
+                    .filter_map(|fld| {
+                        let ident = fld.ident.as_ref()?;
+                        if extract_option_inner(&fld.ty).is_some() {
+                            Some(ident.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => std::collections::HashSet::new(),
+            };
+
             let body = if disp.fields.is_empty() {
                 quote! { write!(f, "{source}") }
             } else {
@@ -2338,7 +2357,19 @@ pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
                         if i > 0 {
                             parts.push(quote! { write!(f, "/")?; });
                         }
-                        parts.push(quote! { write!(f, "{}", #id)?; });
+                        // An `Option<T>` display field renders its inner value
+                        // when `Some`, or the bare source name as a placeholder
+                        // when `None` (so the suffix is never empty).
+                        if option_fields.contains(&disp.fields[i]) {
+                            parts.push(quote! {
+                                match ::core::option::Option::as_deref(#id) {
+                                    ::core::option::Option::Some(v) => write!(f, "{}", v)?,
+                                    ::core::option::Option::None => write!(f, "{}", source)?,
+                                }
+                            });
+                        } else {
+                            parts.push(quote! { write!(f, "{}", #id)?; });
+                        }
                     }
                     parts
                 };

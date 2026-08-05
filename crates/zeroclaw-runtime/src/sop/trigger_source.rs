@@ -62,11 +62,15 @@ impl TriggerBehavior for Webhook<'_> {
 }
 
 struct Cron<'a> {
-    expression: &'a str,
+    expression: &'a Option<String>,
 }
 impl TriggerBehavior for Cron<'_> {
     fn matches(&self, event: &SopEvent) -> bool {
-        event.topic.as_deref().is_some_and(|t| t == self.expression)
+        // A cron trigger with no expression is a declarative tag (the schedule
+        // is config-driven); it never matches a `SopEvent` on its own.
+        self.expression
+            .as_deref()
+            .is_some_and(|e| event.topic.as_deref().is_some_and(|t| t == e))
     }
 }
 

@@ -147,20 +147,11 @@ impl FileReadTool {
             });
         }
 
-        // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
-        match tokio::fs::metadata(&resolved_path).await {
-            Ok(meta) => {
-                if meta.len() > MAX_FILE_SIZE_BYTES {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
-                            meta.len()
-                        )),
-                    });
-                }
-            }
+        // Directory: return a listing of entries instead of an "Is a directory"
+        // error, so an agent that probes a directory can recover (read
+        // individual files). Skip the size/binary checks — they are file-only.
+        let meta = match tokio::fs::metadata(&resolved_path).await {
+            Ok(m) => m,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -168,6 +159,21 @@ impl FileReadTool {
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
+        };
+        if meta.is_dir() {
+            return directory_listing(&resolved_path).await;
+        }
+
+        // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
+        if meta.len() > MAX_FILE_SIZE_BYTES {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
+                    meta.len()
+                )),
+            });
         }
 
         let encoding = args
@@ -323,6 +329,49 @@ impl FileReadTool {
             }
         }
     }
+}
+
+/// List the immediate entries of a directory as a `file_read` tool result. The
+/// listing is sorted, with directories suffixed by `/`, so an agent that probes
+/// a directory can recover (read individual files) instead of hitting an
+/// "Is a directory" error. The directory itself was already sandbox-checked.
+async fn directory_listing(dir: &std::path::Path) -> anyhow::Result<ToolResult> {
+    let mut entries: Vec<String> = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => {
+            let mut names = Vec::new();
+            let mut it = rd;
+            while let Ok(Some(entry)) = it.next_entry().await {
+                let name = entry.file_name();
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false);
+                let mut s = name.to_string_lossy().into_owned();
+                if is_dir {
+                    s.push('/');
+                }
+                names.push(s);
+            }
+            names
+        }
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to read directory: {e}")),
+            });
+        }
+    };
+    entries.sort();
+    let count = entries.len();
+    let body = entries.join("\n");
+    let output = format!("Directory listing ({} entries):\n{body}", count);
+    Ok(ToolResult {
+        success: true,
+        output: output.into(),
+        error: None,
+    })
 }
 
 fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
@@ -1467,6 +1516,46 @@ mod tests {
         assert!(!r3.success);
 
         assert!(!tool.security.record_action(), "budget must be exhausted");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // T4: file_read of a directory must return a listing of entries, not an
+    // "Is a directory" error, so an agent that probes a directory can recover.
+    #[tokio::test]
+    async fn file_read_directory_returns_listing() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_dir_listing");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("a.txt"), "alpha").await.unwrap();
+        tokio::fs::write(dir.join("b.txt"), "beta").await.unwrap();
+        tokio::fs::create_dir_all(dir.join("sub")).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "."})).await.unwrap();
+
+        assert!(
+            result.success,
+            "file_read of a directory must succeed, got error: {:?}",
+            result.error
+        );
+        let out = &result.output;
+        assert!(
+            out.contains("a.txt"),
+            "listing must include a.txt, got: {out}"
+        );
+        assert!(
+            out.contains("b.txt"),
+            "listing must include b.txt, got: {out}"
+        );
+        assert!(
+            out.contains("sub"),
+            "listing must include the sub directory, got: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("is a directory"),
+            "must not surface an 'Is a directory' error, got: {out}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
