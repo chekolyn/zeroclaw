@@ -230,14 +230,54 @@ pub fn load_sops(
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
-/// Load a single SOP by directory name from the SOPs root. Errors if the
-/// directory or its `SOP.toml` is missing or malformed.
+/// Load a single SOP by its declared `name` from the SOPs root.
+///
+/// Resolution is by the SOP's declared `name` field (the same identity the
+/// loader `load_sops_from_directory` and the CLI use), NOT by directory name:
+///
+///   1. Fast path — if a directory literally named `<name>` exists under
+///      `sops_dir` (the upstream flat layout `sops/<name>/`), load it directly.
+///      This is the common case and avoids scanning.
+///   2. Fallback — scan the immediate subdirectories of `sops_dir` and load the
+///      first whose `SOP.toml` declares `name == <name>`. This supports SOPs whose
+///      directory is namespaced (e.g. `sops/<scope>-<domain>-<trigger>-<verb-noun>/`
+///      with `name = "<verb-noun>"`), for which the literal path would not exist.
+///
+/// The path-traversal guard from `resolve_sop_dir` still runs first, so a
+/// caller-controlled `name` can never escape the SOP root: the fallback scan
+/// uses `name` only to match the declared `name` field, never as a path
+/// component. Errors if no SOP with that declared name exists.
 pub fn load_sop_by_name(
     sops_dir: &Path,
     name: &str,
     default_execution_mode: SopExecutionMode,
 ) -> Result<Sop> {
-    load_sop(&resolve_sop_dir(sops_dir, name)?, default_execution_mode)
+    // Guard first: reject multi-component / traversal names before any scan.
+    let literal = resolve_sop_dir(sops_dir, name)?;
+    if literal.exists() {
+        return load_sop(&literal, default_execution_mode);
+    }
+
+    // Fallback: scan immediate subdirectories for one whose declared `name`
+    // field matches. Reuses `load_sop` so malformed manifests are skipped
+    // (matching `load_sops_from_directory`'s tolerant behavior).
+    let Ok(entries) = std::fs::read_dir(sops_dir) else {
+        anyhow::bail!("SOP '{name}' not found");
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path.join("SOP.toml").exists() {
+            continue;
+        }
+        match load_sop(&path, default_execution_mode) {
+            Ok(sop) if sop.name == name => return Ok(sop),
+            _ => continue,
+        }
+    }
+    anyhow::bail!("SOP '{name}' not found");
 }
 
 /// Delete an SOP's directory (manifest, steps, everything). Errors if no
@@ -1299,6 +1339,65 @@ mod tests {
 
         delete_sop(dir.path(), "authoring").unwrap();
         assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
+    }
+
+    /// A SOP whose directory is *namespaced* (dir name != declared `name` field,
+    /// e.g. `sops/harness-gov-mqtt-cb-1-permission-deadlock/` with
+    /// `name = "cb-1-permission-deadlock"`) must still be loadable by its
+    /// declared name. The web `/api/sops/{name}/graph` endpoint and the RPC
+    /// `sops/graph` method route through `load_sop_by_name`; without a
+    /// by-name-field fallback they 404 with "No such file or directory (os error 2)"
+    /// for every namespaced SOP, while the CLI (which scans + matches by `name`)
+    /// works. This test pins the unified behavior.
+    #[test]
+    fn load_sop_by_name_resolves_namespaced_dir_by_name_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First"), titled_step(2, "Second")]);
+
+        // Write the SOP under a namespaced directory whose name != the SOP's
+        // declared `name` ("authoring"), mirroring the chart's
+        // `<scope>-<domain>-<trigger>-<verb-noun>/` layout.
+        save_sop(dir.path(), &sop).unwrap();
+        let namespaced = "harness-gov-mqtt-authoring";
+        std::fs::rename(dir.path().join("authoring"), dir.path().join(namespaced))
+            .expect("rename to namespaced dir");
+        assert!(!dir.path().join("authoring").exists());
+        assert!(dir.path().join(namespaced).is_dir());
+
+        // Literal path `sops/authoring/` does not exist → must fall back to a
+        // scan that matches the declared `name` field.
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.name, "authoring");
+        assert_eq!(loaded.steps, sop.steps);
+    }
+
+    /// When BOTH a flat `sops/<name>/` and a namespaced dir declaring the same
+    /// `name` exist, the flat (literal) directory wins — deterministic fast
+    /// path, no scan ambiguity.
+    #[test]
+    fn load_sop_by_name_prefers_flat_dir_when_both_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = authoring_sop(vec![titled_step(1, "Flat-only step")]);
+        save_sop(dir.path(), &flat).unwrap(); // creates sops/authoring/
+
+        let mut namespaced = authoring_sop(vec![titled_step(1, "Namespaced-only step")]);
+        // Give the namespaced copy a distinct step so we can tell them apart.
+        save_sop(dir.path(), &namespaced).unwrap();
+        std::fs::rename(
+            dir.path().join("authoring"),
+            dir.path().join("harness-gov-mqtt-authoring"),
+        )
+        .unwrap();
+        // Re-save the flat one so both coexist.
+        namespaced.steps[0].title = "Re-saved flat step".into();
+        save_sop(dir.path(), &namespaced).unwrap();
+        assert!(dir.path().join("authoring").is_dir());
+        assert!(dir.path().join("harness-gov-mqtt-authoring").is_dir());
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.steps[0].title, "Re-saved flat step");
     }
 
     #[test]
