@@ -578,6 +578,7 @@ impl SopEngine {
                         )
                     );
                 }
+                self.truncate_finished_runs_to_max();
             }
             Err(e) => {
                 let span = ::zeroclaw_log::info_span!(
@@ -4703,6 +4704,7 @@ impl SopEngine {
         let reaped_claims = self.reap_expired_claims();
         let reaped_stuck_runs = self.reap_stuck_running_runs();
         let pruned_runs = self.prune_terminal_runs();
+        self.truncate_finished_runs_to_max();
         MaintenanceSummary {
             timed_out,
             reaped_claims,
@@ -4765,6 +4767,19 @@ impl SopEngine {
                 );
                 0
             }
+        }
+    }
+
+    /// Cap the in-memory `finished_runs` window to `max_finished_runs` (newest
+    /// kept; `finished_runs` is kept sorted ascending by `started_at`, so the
+    /// oldest are drained first). The store's `load_terminal_runs` and `prune`
+    /// do not enforce the limit on all backends, so the engine truncates the
+    /// display window itself to keep the Runs surface bounded.
+    fn truncate_finished_runs_to_max(&mut self) {
+        let max = self.config.max_finished_runs;
+        if max > 0 && self.finished_runs.len() > max {
+            let excess = self.finished_runs.len() - max;
+            self.finished_runs.drain(..excess);
         }
     }
 
@@ -11793,6 +11808,51 @@ mod tests {
         let summary = engine.run_maintenance_tick();
         assert_eq!(summary.reaped_stuck_runs, 0, "timeout=0 disables the reaper");
         assert!(engine.active_runs.contains_key(&rid), "run must stay active when reaper disabled");
+    }
+
+    #[test]
+    fn maintenance_tick_truncates_finished_runs_to_max() {
+        // The store's `load_terminal_runs` may return more than
+        // `max_finished_runs` (it does not enforce the limit on all backends).
+        // The maintenance tick must cap the in-memory display window itself.
+        let mut engine = SopEngine::new(SopConfig {
+            max_finished_runs: 3,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+        for _ in 0..3 {
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let rid = extract_run_id(&action).to_string();
+            engine
+                .advance_step(
+                    &rid,
+                    SopStepResult {
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "ok".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        effective_agent: None,
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.finished_runs.len(), 3);
+        // Simulate a buggy restore that loaded more than max.
+        for _ in 0..3 {
+            engine.finished_runs.push(engine.finished_runs[0].clone());
+        }
+        assert_eq!(engine.finished_runs.len(), 6);
+        engine.run_maintenance_tick();
+        assert!(
+            engine.finished_runs.len() <= 3,
+            "maintenance tick must truncate to max_finished_runs, got {}",
+            engine.finished_runs.len()
+        );
     }
 
     #[test]
