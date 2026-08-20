@@ -108,6 +108,20 @@ impl<'a> SopIngress<'a> {
         target_sop: Option<&str>,
         dedup: Option<(String, bool)>,
     ) -> SopIngressOutcome {
+        // Span the unified SOP ingress so every untrusted trigger (MQTT,
+        // RPC, ...) is visible in OTel via the tracing-opentelemetry bridge.
+        // Target `zeroclaw_sop` is the future filter key (bridge-only-SOP).
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_sop",
+            "sop.ingress",
+            source = ?source,
+            topic = ?topic,
+        );
+        // Wrap the body in an instrumented async block (not an `.enter()`
+        // guard): an `Entered` guard held across `.await` makes the future
+        // non-Send, which would break `tokio::spawn` callers (the MQTT SOP
+        // listener). The span still covers every `.await` in the body.
+        let __dispatch_body = async move {
         let Some(engine) = self.engine else {
             let reason = if self.audit.is_some() {
                 SopIngressUnavailable::MissingEngine
@@ -157,6 +171,8 @@ impl<'a> SopIngress<'a> {
             )
             .await,
         )
+        };
+        ::zeroclaw_log::Instrument::instrument(__dispatch_body, span).await
     }
 }
 
