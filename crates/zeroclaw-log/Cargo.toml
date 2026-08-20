@@ -21,14 +21,28 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt", "ansi", "env-filter"] }
 uuid = { version = "1.18", default-features = false, features = ["v4", "std"] }
 
+# OTel bridge: export `tracing` spans to OTel via a `tracing-opentelemetry`
+# `OpenTelemetryLayer` wired through a `ReloadLayer` slot (swapped in once
+# the global tracer provider is set). All bridge deps are optional + gated
+# behind the `otel-bridge` feature, which the workspace `observability-otel`
+# feature forwards. `opentelemetry` (the API crate) is a production dep
+# (the layer binds to the global tracer); `opentelemetry_sdk` is test-only
+# (in-memory exporter + `SdkTracerProvider`).
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
+
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
 
 # zeroclaw-log IS the log pipeline. The `record!` macro it exports is
 # the workspace-wide deny gate for `tracing::info!`/`warn!`/etc. — see
 # workspace clippy.toml. This crate's own implementation has to call
 # the underlying `tracing::*` macros directly to bootstrap the
 # pipeline, so the ban is lifted here and only here.
+[features]
+otel-bridge = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
 [lints.clippy]
 disallowed_macros = "allow"

@@ -102,7 +102,7 @@ encoding_rs = "0.8"
 default = ["observability-prometheus", "schema-export"]
 channel-mqtt = ["dep:rumqttc"]
 observability-prometheus = ["dep:prometheus"]
-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "zeroclaw-log/otel-bridge"]
 sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
 

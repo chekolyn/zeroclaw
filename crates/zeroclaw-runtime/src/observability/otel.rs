@@ -93,6 +93,14 @@ impl OtelObserver {
 
         global::set_tracer_provider(tracer_provider.clone());
 
+        // The OTel bridge (a `tracing-opentelemetry` `OpenTelemetryLayer` wired
+        // through a `ReloadLayer` slot in `install_global_subscriber`) was
+        // installed with a no-op tracer (the provider wasn't set yet). Now
+        // that the provider is set, swap the real bridge in so gateway
+        // `tracing` spans (cron, SOP engine, channels, providers) export to
+        // OTel alongside this observer's agent-loop spans.
+        zeroclaw_log::activate_otel_bridge();
+
         // ── Metric exporter ─────────────────────────────────────
         let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
