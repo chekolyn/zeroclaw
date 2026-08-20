@@ -5,6 +5,8 @@ use crate::util::{truncate_field, truncate_json_leaves};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
 use opentelemetry::{Context, KeyValue, global};
+use opentelemetry::propagation::TextMapCompositePropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -19,6 +21,20 @@ struct ActiveAgentSpan {
     context: Context,
     first_user_input: Option<String>,
     last_output_text: Option<String>,
+}
+
+/// Install the W3C `TraceContext` + `Baggage` composite propagator as the
+/// process-global text-map propagator.
+///
+/// Once installed, `global::text_map_propagator().inject(...)` / `.extract(...)`
+/// carry `traceparent` + `baggage` across process boundaries (HTTP headers,
+/// MQTT5 user-properties). Called once from `OtelObserver::new` after the
+/// tracer provider is set.
+pub(crate) fn install_w3c_propagator() {
+    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]));
 }
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
@@ -92,6 +108,10 @@ impl OtelObserver {
             .build();
 
         global::set_tracer_provider(tracer_provider.clone());
+
+        // Install the W3C TraceContext + Baggage composite propagator so
+        // `traceparent` + `baggage` carry across HTTP/MQTT boundaries.
+        install_w3c_propagator();
 
         // The OTel bridge (a `tracing-opentelemetry` `OpenTelemetryLayer` wired
         // through a `ReloadLayer` slot in `install_global_subscriber`) was
@@ -2123,5 +2143,74 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(clean_for_display(input), expected);
         }
+    }
+
+    /// The W3c composite propagator (TraceContext + Baggage), once installed,
+    /// must round-trip a `traceparent` + a baggage entry through a carrier
+    /// (HashMap standing in for HTTP headers / MQTT5 user-properties). This
+    /// proves the propagator is installed + that both signals carry, which
+    /// steps 4 (inbound extract) + 5 (outbound inject) rely on.
+    #[test]
+    fn w3c_propagator_round_trips_traceparent_and_baggage() {
+        install_w3c_propagator();
+
+        use opentelemetry::baggage::{Baggage, BaggageExt};
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceContextExt as _, TraceId, TraceFlags, TraceState,
+        };
+
+        let span_ctx = SpanContext::new(
+            TraceId::from(1),
+            SpanId::from(11),
+            TraceFlags::new(0x01),
+            true,
+            TraceState::default(),
+        );
+
+        let mut baggage = Baggage::new();
+        baggage.insert("correlation_id", "chain-abc");
+
+        let cx = Context::current()
+            .with_remote_span_context(span_ctx.clone())
+            .with_baggage(baggage);
+
+        // Inject via the installed global propagator (opentelemetry 0.32
+        // exposes it through a closure getter, not a by-value clone).
+        let mut carrier: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        global::get_text_map_propagator(|p| p.inject_context(&cx, &mut carrier));
+        assert!(
+            carrier.contains_key("traceparent"),
+            "traceparent should be injected: {carrier:?}"
+        );
+        assert!(
+            carrier.contains_key("baggage"),
+            "baggage should be injected: {carrier:?}"
+        );
+
+        // Extract via the same global propagator + assert round-trip.
+        let extracted = global::get_text_map_propagator(|p| p.extract(&carrier));
+        let extracted_span = extracted.span();
+        let extracted_sc = extracted_span.span_context();
+        assert_eq!(
+            extracted_sc.trace_id(),
+            span_ctx.trace_id(),
+            "extracted trace id should match"
+        );
+        assert_eq!(
+            extracted_sc.span_id(),
+            span_ctx.span_id(),
+            "extracted span id should match"
+        );
+        assert_eq!(
+            extracted_sc.trace_flags(),
+            span_ctx.trace_flags(),
+            "extracted trace flags should match"
+        );
+        assert_eq!(
+            extracted.baggage().get("correlation_id"),
+            Some(&opentelemetry::StringValue::from("chain-abc")),
+            "extracted baggage should round-trip the correlation_id"
+        );
     }
 }
