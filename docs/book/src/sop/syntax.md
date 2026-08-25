@@ -1,11 +1,11 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir` is omitted from config, CLI commands fall back to `<workspace>/sops` for offline inspection, but runtime SOP execution is disabled.
+SOP definitions are loaded from subdirectories under `sops_dir`, which is unset by default, so runtime SOP execution is off until an operator opts in. Set `sops_dir` to a directory to enable it: a relative value resolves against the install root (the directory holding `config.toml`), so the documented `shared/sops` yields `<install>/shared/sops`, the same directory the SOP author writes to. An absolute or `~`-prefixed value is used as-is. Setting it back to `""` (or leaving it unset) disables runtime SOP execution; CLI commands still fall back to `<install>/shared/sops` for offline inspection.
 
 ## 1. Directory Layout
 
 ```text
-<workspace>/sops/
+<shared>/sops/
   deploy-prod/
     SOP.toml
     SOP.md
@@ -25,8 +25,26 @@ the runtime schema, and `condition` expressions. Before running a generated or
 checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 
 `SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
-`triggers`, and its execution knobs. The concurrency-admission fields govern what
-happens when a trigger arrives while this SOP's execution slots are full:
+`triggers`, its owning `agent`, and its execution knobs.
+
+`agent` names the configured agent alias that `execute` steps run as; an
+individual step's own `agent` overrides it, and the resolved alias must be a
+configured agent with `enabled = true`. **A SOP with any headless trigger
+(cron, mqtt, webhook, amqp, filesystem, calendar, peripheral, channel) must
+resolve an owner for every `execute` step**, from one level or the other:
+validation blocks the save otherwise. Those triggers fire with no agent turn to
+inherit an identity from, and an unowned step is refused at dispatch rather than
+run as an unrelated agent.
+
+`manual` triggers are the one case validation only warns about, because they
+start from both sides: through `sop_execute` the calling agent owns the run, so
+no `agent` is needed, while the dashboard's run endpoint starts the same
+procedure with no agent behind it. That endpoint refuses an unowned procedure
+(see [Manual](./fan-in/manual.md)), so declare `agent` on any SOP you intend to
+start from the dashboard.
+
+The concurrency-admission fields govern what happens when a trigger arrives
+while this SOP's execution slots are full:
 
 | Field | Default | Effect |
 |---|---:|---|

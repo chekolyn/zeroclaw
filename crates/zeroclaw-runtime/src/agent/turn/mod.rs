@@ -29,7 +29,7 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, StreamDelta};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -42,6 +42,10 @@ pub use outcome::{
     is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub use outcome::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -85,6 +89,101 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Complete system-prompt variants for the two tool transports supported by a
+/// turn. The caller owns construction; the loop only selects the variant after
+/// a before-LLM hook has finalized the model that will receive the request.
+#[derive(Clone)]
+pub(crate) struct ToolProtocolPrompts {
+    text_tools_section: String,
+}
+
+impl ToolProtocolPrompts {
+    pub(crate) fn new(_native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self { text_tools_section }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+}
+
+/// Scope complete prompt variants around an Agent turn. This remains transient
+/// request state: durable history keeps the caller-owned canonical prompt.
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+    prompts: Arc<ToolProtocolPrompts>,
+    future: F,
+) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+}
+
+fn refresh_scoped_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+        if let Some(system) = request_messages
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+    });
+}
+
+fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
+    let start = prompt.find("## Tools\n")?;
+    let following = &prompt[start..];
+    let end = following
+        .find("\n\n## Safety")
+        .map_or(prompt.len(), |offset| start + offset);
+    Some(start..end)
+}
+
+fn replace_tool_protocol_section(
+    prompt: &mut String,
+    text_tools_section: &str,
+    use_native_tools: bool,
+) {
+    if let Some(bounds) = tool_section_bounds(prompt) {
+        if use_native_tools {
+            prompt.replace_range(bounds, "");
+        } else {
+            prompt.replace_range(bounds, text_tools_section);
+        }
+        return;
+    }
+
+    if !use_native_tools && !text_tools_section.is_empty() {
+        let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
+        prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
+fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
+    budget
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+}
 
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
@@ -462,6 +561,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
+        // Re-resolved every iteration, against the tools callable *right now*.
+        //
+        // A step's scope is resolved by name, so it can only narrow tools that
+        // exist when it runs: `tool_search` activates deferred MCP tools in the
+        // middle of a turn, and a scoped step must narrow those on the next
+        // iteration rather than the next turn — otherwise a step that may call
+        // `tool_search` can reach a tool its scope excludes. Reading the scope
+        // from the task (rather than a parameter) also covers the loops this
+        // one drives on behalf of another agent: a delegated target assembles
+        // its own registry, and inherits the boundary all the same.
+        //
+        // `None` for every ordinary turn, which keeps its own slice and pays
+        // nothing.
+        let step_scoped_excluded: Option<Vec<String>> =
+            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+                let mut merged = excluded_tools.to_vec();
+                crate::agent::loop_::merge_sop_step_exclusions(
+                    &mut merged,
+                    tools_registry,
+                    activated_tools,
+                    Some(&scope),
+                );
+                merged
+            });
+        let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
+
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -493,20 +618,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget {
-            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
-            if remaining == 0 {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration"
-                );
-                break;
-            }
-            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref budget) = shared_budget
+            && !try_reserve_shared_iteration(budget)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"iteration": iteration})),
+                "Shared iteration budget exhausted at iteration"
+            );
+            break;
         }
 
         preflight_history_maintenance(turn_state.history);
@@ -621,6 +744,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
+            model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -648,15 +772,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
-
-        refresh_prompt_anchor(turn_state.history, use_native_tools);
-
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -664,18 +779,83 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             image_cache.as_deref_mut(),
         )
         .await?;
+        let mut provider_request_messages = prepared_messages.messages;
+        let mut hook_selected_model = None;
+
+        if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            let mut candidate_model = active_model.to_string();
+            match hooks
+                .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
+                .await
+            {
+                crate::hooks::HookResult::Continue(()) => {
+                    hook_selected_model = Some(candidate_model);
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    anyhow::bail!("LLM call cancelled by hook: {reason}");
+                }
+            }
+        }
+        let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // Only direct Agent turns scope the complete prompt variants. Preserve
+        // the channel loop's existing hook/protocol behavior rather than
+        // silently widening this delegation-focused repair into channel prompt
+        // reconciliation.
+        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let protocol_model = if uses_scoped_tool_protocol {
+            provider_request_model
+        } else {
+            active_model
+        };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
+
+        // For scoped direct Agent turns, the hook can choose a different routed
+        // model. Every protocol-bearing surface follows that dispatched model.
+        // Unscoped channel turns intentionally retain their pre-existing
+        // protocol behavior; channel prompt reconciliation is separate work.
+        refresh_prompt_anchor(turn_state.history, use_native_tools);
+        refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
+        refresh_scoped_tool_protocol_prompt(
+            turn_state.history,
+            &mut provider_request_messages,
+            use_native_tools,
+        );
+
+        // Fail closed on the local budget BEFORE announcing the request.
+        // `announce_llm_request` emits the user-visible `WaitingOnModel`
+        // state, and a rejected turn never reaches the provider — announcing
+        // first would claim the agent is waiting on a model that is never
+        // called.
+        enforce_tool_loop_budget()?;
+
+        if strict_tool_parsing
+            && !tool_specs.is_empty()
+            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
+        {
+            return Err(zeroclaw_providers::ProviderCapabilityError {
+                model_provider: active_model_provider_name.to_string(),
+                capability: "tool_protocol".to_string(),
+                message: crate::i18n::get_required_cli_string(
+                    "turn-tool-protocol-strict-mixed-error",
+                ),
+            }
+            .into());
+        }
 
         let llm_started_at = announce_llm_request(
             &ctx,
-            turn_state.history,
+            &provider_request_messages,
             active_model_provider,
             active_model_provider_name,
-            active_model,
+            provider_request_model,
             iteration,
         )
         .await;
-
-        enforce_tool_loop_budget()?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -685,8 +865,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             None
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
-        let base_provider_supports_native_tools = model_provider.supports_native_tools();
-        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let base_provider_supports_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+        let active_provider_supports_native_tools = active_model_provider
+            .capabilities_for_model(provider_request_model)
+            .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
@@ -716,19 +900,48 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
+            rejected_attempt_usage,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
-            active_model,
-            &prepared_messages.messages,
+            provider_request_model,
+            &provider_request_messages,
             request_tools,
             should_consume_provider_stream,
             iteration,
         )
         .await?;
+
+        if let Some(usage) = rejected_attempt_usage.as_ref() {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                ctx.provider_name,
+                ctx.model,
+                usage,
+            );
+        }
+
+        // Reliable providers classify this before retries and fallback. Keep
+        // the turn-level guard for direct/unwrapped providers: a transport
+        // success with no final text and no tool calls cannot complete a turn.
+        // This runs before response-success telemetry and history mutation.
+        let chat_result = chat_result.and_then(|response| {
+            if response.is_semantically_empty_terminal() {
+                if let Some(usage) = response.usage.as_ref() {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        usage,
+                    );
+                }
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                ));
+            }
+            Ok(response)
+        });
 
         let (
             response_text,
@@ -744,8 +957,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
+                    provider_request_model,
                     resp,
-                    &prepared_messages.messages,
+                    &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -766,12 +980,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(&ctx, llm_started_at, iteration, &e);
+                if let Some(rejected) = e.chain().find_map(|cause| {
+                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                }) {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        &rejected.usage,
+                    );
+                }
+                record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
                     &e,
                     iteration,
                     event_tx.as_ref(),
+                    on_delta.as_ref(),
                     observer,
                     context_token_budget,
                 )
@@ -1222,7 +1446,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     .await
 }
 
-fn collect_callable_tool_names(
+pub(crate) fn collect_callable_tool_names(
     tools_registry: &[Box<dyn crate::tools::Tool>],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Vec<String> {
@@ -1270,7 +1494,7 @@ fn sop_step_excluded_tools(
     excluded_tools: &[String],
 ) -> Vec<String> {
     let mut scoped = excluded_tools.to_vec();
-    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+    for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
         push_excluded_tool(&mut scoped, tool);
     }
 
@@ -2288,12 +2512,73 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
+    async fn recovered_rejected_usage_does_not_trigger_context_trim() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+
+        // The rejected attempt's 80 input tokens remain billed separately; the
+        // accepted response reports 80 input tokens, which is within this
+        // model's 100-token context budget and must not trim history.
+        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver).await;
+
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "accepted context usage must not include rejected usage"
+        );
+    }
+
+    #[tokio::test]
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+#[cfg(test)]
+mod shared_iteration_budget_tests {
+    use super::try_reserve_shared_iteration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn exhausted_budget_never_wraps() {
+        let budget = AtomicUsize::new(1);
+
+        assert!(try_reserve_shared_iteration(&budget));
+        assert!(!try_reserve_shared_iteration(&budget));
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn contention_grants_exactly_the_available_iterations() {
+        const AVAILABLE: usize = 8;
+        const WORKERS: usize = 64;
+
+        let budget = Arc::new(AtomicUsize::new(AVAILABLE));
+        let granted = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let budget = Arc::clone(&budget);
+                let granted = Arc::clone(&granted);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    if try_reserve_shared_iteration(&budget) {
+                        granted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        assert_eq!(granted.load(Ordering::Relaxed), AVAILABLE);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 }
 

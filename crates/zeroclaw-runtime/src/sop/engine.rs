@@ -1248,10 +1248,11 @@ impl SopEngine {
         }
     }
 
-    /// Load/reload SOPs from the configured directory.
-    pub fn reload(&mut self, workspace_dir: &Path) {
+    /// Load/reload SOPs from the configured directory, resolved against
+    /// `install_root` (the install root, `config_path`'s parent).
+    pub fn reload(&mut self, install_root: &Path) {
         self.sops = load_sops(
-            workspace_dir,
+            install_root,
             self.config.sops_dir.as_deref(),
             super::parse_execution_mode(&self.config.default_execution_mode),
         );
@@ -1642,13 +1643,31 @@ impl SopEngine {
     }
 
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
+        self.start_run_owned(sop_name, event, None)
+    }
+
+    /// [`Self::start_run`] for a run started INSIDE an agent turn, recording that
+    /// agent on the run.
+    ///
+    /// An unowned procedure borrows its owner from the calling turn, which is
+    /// enough right up until the run parks at an approval: the approved step
+    /// resumes on the headless driver, with no turn to borrow from. Recording
+    /// the initiator here is what lets that resume still run as the agent that
+    /// started it. `None` for every headless trigger, which has no initiating
+    /// turn to record.
+    pub fn start_run_owned(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+        initiator: Option<&str>,
+    ) -> Result<SopRunAction> {
         // A start is a two-phase operation: reserve the exec slot through the
         // authoritative store CAS (no side effect yet), then activate the reserved
         // slot into a live run and dispatch its first step. The phases are split so the
         // AMQP multi-match path can reserve the WHOLE matched batch before activating
         // any of it (see `dispatch`). A single start runs both phases back-to-back.
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, initiator)
     }
 
     /// Phase 1 of a start: reserve `sop_name`'s exec slot through the authoritative
@@ -1720,6 +1739,7 @@ impl SopEngine {
         &mut self,
         reservation: StartReservation,
         event: SopEvent,
+        initiator: Option<&str>,
     ) -> Result<SopRunAction> {
         let StartReservation {
             run_id,
@@ -1731,6 +1751,7 @@ impl SopEngine {
         let run = SopRun {
             run_id: run_id.clone(),
             sop_name: sop.name.clone(),
+            initiating_agent: initiator.map(str::to_string),
             trigger_event: event,
             frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
@@ -1916,12 +1937,14 @@ impl SopEngine {
                 );
                 recorded.status = SopStepStatus::Failed;
                 recorded.output = full_reason;
-            } else if serde_json::from_str::<Value>(&result.output).is_err()
-                && output != Value::String(result.output.clone())
-            {
+            } else if jsonish_value(&result.output) != output {
                 // Canonicalize a schema-validated recovery at the model-output
                 // boundary. Downstream piping, retry, replay, and persisted run
-                // data can then keep their exact JSON-or-string parser.
+                // data re-parse the recorded text with the exact JSON-or-string
+                // parser, so the record must hold whatever value validation
+                // accepted — a fenced object recovered from prose and a
+                // double-encoded object unwrapped from a JSON string both
+                // differ from that re-parse until rewritten here.
                 recorded.output = output.to_string();
             }
         }
@@ -3694,7 +3717,7 @@ impl SopEngine {
         // Reserve + activate through the shared two-phase start path (identical run_id
         // prefix, logging, and dispatch to the pre-refactor inline body).
         let reservation = self.reserve_run_slot(sop_name)?;
-        self.activate_reserved_run(reservation, event)
+        self.activate_reserved_run(reservation, event, None)
     }
 
     pub fn drive_headless_deterministic(
@@ -6900,6 +6923,58 @@ mod tests {
     }
 
     #[test]
+    fn double_encoded_step_output_validates_and_pipes_as_declared_object() {
+        let mut sop = test_sop(
+            "schema-double-encoded-output",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("schema-double-encoded-output", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: serde_json::to_string(r#"{"ok":true}"#).unwrap(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "the unwrapped object must satisfy step 1 output and step 2 input schemas"
+        );
+        assert_eq!(
+            engine.active_runs()[&run_id].step_results[0].output,
+            r#"{"ok":true}"#,
+            "the record must hold the canonical object, not the escaped string"
+        );
+        assert_eq!(
+            super::step_input_value(&engine.active_runs()[&run_id], 2),
+            serde_json::json!({"ok": true}),
+            "the next step must be piped the object, not a string"
+        );
+    }
+
+    #[test]
     fn wrapped_step_output_validates_and_pipes_as_declared_object() {
         let mut sop = test_sop(
             "schema-wrapped-output",
@@ -7289,6 +7364,32 @@ mod tests {
         assert!(engine.cancel_run("nonexistent").is_err());
     }
 
+    #[test]
+    fn finish_unknown_run_returns_error_without_mutating_engine() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+
+        let error = engine
+            .finish_run("nonexistent", SopRunStatus::Failed, Some("failed".into()))
+            .expect_err("finishing an unknown run must return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Active run not found: nonexistent")
+        );
+        assert!(engine.active_runs().is_empty());
+        assert!(engine.finished_runs(None).is_empty());
+
+        let action = engine
+            .start_run("s1", manual_event())
+            .expect("the engine must remain usable after an unknown finish");
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+    }
+
     // ── Concurrency ─────────────────────────────────────
 
     #[test]
@@ -7410,6 +7511,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -7460,6 +7562,7 @@ mod tests {
                 SopRun {
                     run_id: run_id.to_string(),
                     sop_name: "s1".to_string(),
+                    initiating_agent: None,
                     trigger_event: manual_event(),
                     frame_marker_id: "m".to_string(),
                     status: SopRunStatus::WaitingApproval,
@@ -7503,6 +7606,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::Running,
@@ -8183,6 +8287,7 @@ mod tests {
             let run = SopRun {
                 run_id: format!("restore-{i}"),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: format!("marker-{i}"),
                 status: SopRunStatus::Running,
@@ -8714,6 +8819,7 @@ mod tests {
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "pump-shutdown".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-001".into(),
             status: SopRunStatus::Running,
@@ -9598,6 +9704,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -9651,6 +9758,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -9719,6 +9827,7 @@ mod tests {
         let parked = SopRun {
             run_id: "parked-1".to_string(),
             sop_name: "s1".to_string(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker".to_string(),
             status: SopRunStatus::WaitingApproval,
@@ -11483,6 +11592,7 @@ mod tests {
             SopRun {
                 run_id: "r1".to_string(),
                 sop_name: "s1".to_string(),
+                initiating_agent: None,
                 trigger_event: manual_event(),
                 frame_marker_id: "m".to_string(),
                 status: SopRunStatus::WaitingApproval,
@@ -14479,6 +14589,7 @@ type = "manual"
         let run = SopRun {
             run_id: "r-restore".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -14523,6 +14634,7 @@ type = "manual"
         let mut run = SopRun {
             run_id: "r-persist".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -15119,6 +15231,7 @@ type = "manual"
         let base = SopRun {
             run_id: "r-done".to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

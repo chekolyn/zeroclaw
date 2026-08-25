@@ -32,7 +32,10 @@ pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
 pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
-pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
+pub use executor::{
+    SopDriverHandles, SopDriverRegistry, SopDriverSink, drive_resumed_broker_action,
+    register_sop_driver, spawn_headless_run_driver,
+};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
     GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState,
@@ -109,9 +112,21 @@ pub struct SopEngineAdapters {
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
 /// directly outside this module.
+///
+/// The two directory arguments serve different roles and must not be conflated:
+/// - `data_dir` is the daemon state dir. It anchors the durable run store, which
+///   lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
+/// - `install_root` is the install root (`config.install_root_dir()`, i.e.
+///   `config_path`'s parent). It anchors SOP-*definition* loading, so a relative
+///   `[sop] sops_dir` (documented `shared/sops`) resolves to `<install>/shared/sops`
+///   — the same directory the web/RPC SOP author writes to. Passing `data_dir` for
+///   both (the historical bug) made the engine load definitions from `<data_dir>/sops`,
+///   which authored SOPs never populate, so every manual trigger reported "no
+///   matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    install_root: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
@@ -122,10 +137,10 @@ pub fn build_sop_engine(
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
-    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
-    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+    // startup, so fall back to in-memory with a loud log. The run store is anchored
+    // at the daemon data dir, so a durable store lands at `<data_dir>/sop/runs.db`
+    // unless `[sop] run_state_dir` overrides it.
+    let store = store::build_run_store(&config, data_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -158,7 +173,7 @@ pub fn build_sop_engine(
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
         .with_capabilities(Arc::new(capabilities));
-    engine.reload(workspace_dir);
+    engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
@@ -180,24 +195,30 @@ pub fn parse_execution_mode(s: &str) -> SopExecutionMode {
 
 // ── SOP directory helpers ───────────────────────────────────────
 
-/// Return the default SOPs directory: `<workspace>/sops`.
-fn sops_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("sops")
+/// Canonical fallback SOPs directory: `<install>/shared/sops`.
+fn default_sops_dir(install_root: &Path) -> PathBuf {
+    install_root.join("shared").join("sops")
 }
 
-/// Resolve the SOPs directory from config, falling back to workspace default.
+/// Resolve the SOPs directory from config, falling back to the canonical
+/// shared default.
 ///
-/// A relative `config_dir` (the common case in the documented
-/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
-/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
-/// the base entirely when the joined path is itself absolute).
-pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
+/// A relative `config_dir` resolves against `install_root` (the install root,
+/// `config_path`'s parent), matching the `skill-bundles` convention: the
+/// documented `shared/sops` value yields `<install>/shared/sops`, the same
+/// directory the web/RPC SOP author writes to and the CLI scans. An absolute
+/// or `~`-prefixed value is used as-is (`Path::join` replaces the base entirely
+/// when the joined path is itself absolute). Unset, empty, or whitespace-only
+/// falls back to the canonical `<install>/shared/sops` — the same disabled
+/// sentinel `SopConfig::runtime_enabled()` recognizes, so the CLI/RPC scan root
+/// never diverges from whether the daemon built an engine.
+pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
-        Some(dir) if !dir.is_empty() => {
+        Some(dir) if !dir.trim().is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            workspace_dir.join(expanded.as_ref())
+            install_root.join(expanded.as_ref())
         }
-        _ => sops_dir(workspace_dir),
+        _ => default_sops_dir(install_root),
     }
 }
 
@@ -220,13 +241,13 @@ fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
 
 // ── SOP loading ─────────────────────────────────────────────────
 
-/// Load all SOPs from the configured directory.
+/// Load all SOPs from the configured directory, resolved against `install_root`.
 pub fn load_sops(
-    workspace_dir: &Path,
+    install_root: &Path,
     config_dir: Option<&str>,
     default_execution_mode: SopExecutionMode,
 ) -> Vec<Sop> {
-    let dir = resolve_sops_dir(workspace_dir, config_dir);
+    let dir = resolve_sops_dir(install_root, config_dir);
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
@@ -1107,6 +1128,115 @@ fn validate_planned_call_bindings(
     }
 }
 
+/// `execute` step numbers that resolve no owning agent, from the step's own
+/// `agent` or the procedure's.
+///
+/// One source for both the authoring gate and the run surfaces that start a
+/// procedure with no ambient agent turn, so a start can never be permitted on a
+/// rule the executing driver does not share. `checkpoint` and `capability` steps
+/// are exempt — they park for approval and run through the deterministic
+/// capability registry respectively, neither of which assumes an agent.
+#[must_use]
+pub fn unowned_execute_steps(sop: &Sop) -> Vec<u32> {
+    let has_owner = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|alias| !alias.trim().is_empty())
+    };
+    if has_owner(&sop.agent) {
+        return Vec::new();
+    }
+    sop.steps
+        .iter()
+        .filter(|step| step.kind == SopStepKind::Execute && !has_owner(&step.agent))
+        .map(|step| step.number)
+        .collect()
+}
+
+/// The refusal a headless start surface returns for a procedure whose `execute`
+/// steps resolve no owner. `None` when every step has one.
+///
+/// Phrased for the operator who pressed the button rather than for the author,
+/// but drawn from [`unowned_execute_steps`] — the same rule the authoring gate
+/// and the headless driver apply.
+#[must_use]
+pub fn headless_ownership_refusal(sop: &Sop) -> Option<String> {
+    let steps = unowned_execute_steps(sop);
+    if steps.is_empty() {
+        return None;
+    }
+    let numbers = steps
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SOP '{}' cannot be started here: step(s) [{numbers}] resolve no owning agent, and a run \
+         started outside an agent turn has none to inherit. Set `agent` on the SOP or on the \
+         step, or start the procedure from an agent with `sop_execute`.",
+        sop.name
+    ))
+}
+
+/// Every `execute` step reachable by a headless trigger must resolve an owning
+/// agent.
+///
+/// Blocking rather than advisory: a headless trigger has no ambient agent turn
+/// to borrow an identity from, so the headless driver refuses an unowned step
+/// outright. Saving such a SOP produces a procedure that fires on schedule and
+/// then fails every run at dispatch.
+///
+/// `manual` is the one trigger that can start from either side, so it warns
+/// instead of blocking: through `sop_execute` the calling agent owns the run and
+/// no declared owner is needed, but the dashboard's run endpoint emits the same
+/// Manual event from outside any agent turn and hands the run to the headless
+/// driver. That endpoint refuses an unowned procedure at start
+/// ([`headless_ownership_refusal`]); blocking the save instead would force an
+/// owner on every ordinary agent-driven procedure.
+fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let unowned = unowned_execute_steps(sop);
+    if unowned.is_empty() {
+        return;
+    }
+    let mut sources: Vec<String> = sop
+        .triggers
+        .iter()
+        .filter(|trigger| trigger.is_headless())
+        .map(|trigger| trigger.source().to_string())
+        .collect();
+    sources.sort();
+    sources.dedup();
+
+    if sources.is_empty() {
+        if sop
+            .triggers
+            .iter()
+            .any(|trigger| matches!(trigger, SopTrigger::Manual))
+        {
+            warnings.push(format!(
+                "Step(s) [{}]: no owning agent. `sop_execute` runs these under the calling agent, \
+                 but a dashboard-started run has no agent turn to inherit from and will be \
+                 refused. Set `agent` on the SOP or on the step to make it startable from the \
+                 dashboard.",
+                unowned
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return;
+    }
+
+    for step in unowned {
+        blocking.push(format!(
+            "Step {step}: no owning agent for headless trigger(s) [{}]. Set `agent` on the SOP or \
+             on the step; a headless run has no agent turn to inherit one from.",
+            sources.join(", ")
+        ));
+    }
+}
+
 /// Result of `validate_sop_strict`: `blocking` problems reject a save,
 /// `warnings` surface in editors but do not block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1143,6 +1273,7 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     }
 
     let mut warnings = Vec::new();
+    validate_headless_ownership(sop, &mut blocking, &mut warnings);
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
 
     let graph = SopGraph::from_sop(sop);
@@ -1169,27 +1300,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
-        assert_eq!(resolved, workspace.join("shared/sops"));
+    fn resolve_sops_dir_joins_relative_config_value_to_install_root() {
+        // The documented `shared/sops` must resolve to `<install>/shared/sops`,
+        // not double the `shared` segment. Regression guard for a config that
+        // carries `sops_dir = "shared/sops"`.
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("shared/sops"));
+        assert_eq!(resolved, install_root.join("shared").join("sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_joins_bare_relative_value_under_install_root() {
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("custom-sops"));
+        assert_eq!(resolved, install_root.join("custom-sops"));
     }
 
     #[test]
     fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("/srv/shared/sops"));
         assert_eq!(resolved, Path::new("/srv/shared/sops"));
     }
 
     #[test]
-    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+    fn resolve_sops_dir_falls_back_to_shared_sops_when_unset() {
+        let install_root = Path::new("/test/install");
+        let canonical = install_root.join("shared").join("sops");
+        assert_eq!(resolve_sops_dir(install_root, None), canonical);
+        assert_eq!(resolve_sops_dir(install_root, Some("")), canonical);
+        // Whitespace-only is the disabled sentinel `runtime_enabled()` also
+        // rejects; the scan root must fall back, not join a garbage segment.
+        assert_eq!(resolve_sops_dir(install_root, Some("   ")), canonical);
+    }
+
+    // Boundary regression: for the documented `sops_dir = "shared/sops"`, the
+    // authoring write path (`create_sop_typed`, used by web/RPC), the runtime/CLI
+    // load path (`load_sops`), and the delete path (`delete_sop_typed`) must all
+    // resolve against the install root and converge on `<install>/shared/sops`.
+    // This is the documented shared-workspace configuration; before the
+    // install-root base it doubled to `<install>/shared/shared/sops` and authored
+    // SOPs were invisible to loading.
+    #[test]
+    fn shared_sops_config_converges_across_author_load_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let config_dir = Some("shared/sops");
+        let canonical = install_root.join("shared").join("sops");
+
+        // The authoring surface resolves the write directory the same way the
+        // loader does — one resolver, one root.
+        let author_dir = resolve_sops_dir(install_root, config_dir);
         assert_eq!(
-            resolve_sops_dir(workspace, Some("")),
-            workspace.join("sops")
+            author_dir, canonical,
+            "author path must target <install>/shared/sops"
         );
+
+        // Author a SOP (web/RPC `handle_sop_create` -> `create_sop_typed`).
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&author_dir, &sop).expect("author create should succeed");
+        assert!(
+            canonical.join("authoring").join("SOP.toml").exists(),
+            "authored SOP.toml must land under <install>/shared/sops"
+        );
+        assert!(
+            !install_root
+                .join("shared")
+                .join("shared")
+                .join("sops")
+                .exists(),
+            "resolution must not double the shared segment"
+        );
+
+        // The runtime/CLI loader sees the authored SOP through the same base.
+        let loaded = load_sops(install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "loader must see exactly the authored SOP");
+        assert_eq!(loaded[0].name, "authoring");
+
+        // Delete resolves to the same directory and removes it.
+        delete_sop_typed(&author_dir, "authoring").expect("delete should succeed");
+        assert!(
+            !canonical.join("authoring").exists(),
+            "delete must remove the SOP from <install>/shared/sops"
+        );
+        assert!(
+            load_sops(install_root, config_dir, SopExecutionMode::Supervised).is_empty(),
+            "loader must see the SOP gone after delete"
+        );
+    }
+
+    #[test]
+    fn absolute_sops_dir_converges_across_author_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("install");
+        let abs_sops = tmp.path().join("elsewhere").join("sops");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let config_dir = Some(abs_sops.to_string_lossy());
+        let config_dir = config_dir.as_deref();
+
+        // An absolute value ignores the install root entirely.
+        assert_eq!(resolve_sops_dir(&install_root, config_dir), abs_sops);
+
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&abs_sops, &sop).expect("author create should succeed");
+        let loaded = load_sops(&install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "absolute-path SOP must load");
+        assert_eq!(loaded[0].name, "authoring");
     }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {
@@ -1483,6 +1699,143 @@ mod tests {
 
         let ok = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
         assert!(ok.is_ok());
+    }
+
+    fn cron_sop(steps: Vec<SopStep>, agent: Option<&str>) -> Sop {
+        Sop {
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            agent: agent.map(str::to_string),
+            ..authoring_sop(steps)
+        }
+    }
+
+    /// A headless trigger has no agent turn to inherit an owner from, so the
+    /// authoring gate must reject an unowned procedure rather than let it fire
+    /// on schedule and fail every run at dispatch.
+    #[test]
+    fn validate_sop_strict_blocks_unowned_headless_sop() {
+        let validation = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], None));
+
+        assert!(!validation.is_ok());
+        let blocking = validation
+            .blocking
+            .iter()
+            .find(|b| b.contains("no owning agent"))
+            .expect("missing owner should block, got {validation:?}");
+        assert!(
+            blocking.contains("cron"),
+            "the message should name the headless trigger, got {blocking:?}"
+        );
+    }
+
+    /// The owner may come from either level: the procedure's `agent`, or the
+    /// step's own override.
+    #[test]
+    fn validate_sop_strict_accepts_owned_headless_sop() {
+        let by_sop = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], Some("ops")));
+        assert!(by_sop.is_ok(), "{:?}", by_sop.blocking);
+
+        let mut step = titled_step(1, "a");
+        step.agent = Some("ops".into());
+        let by_step = validate_sop_strict(&cron_sop(vec![step], None));
+        assert!(by_step.is_ok(), "{:?}", by_step.blocking);
+    }
+
+    /// `Manual` is agent-initiated through `sop_execute`, so the calling turn
+    /// owns the run and no declared `agent` is required. Guards the rule
+    /// against over-blocking every ordinary procedure.
+    #[test]
+    fn validate_sop_strict_allows_unowned_manual_sop() {
+        let validation = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
+
+        assert!(validation.is_ok(), "{:?}", validation.blocking);
+    }
+
+    /// ...but a Manual SOP is also startable from the dashboard, which has no
+    /// agent turn behind it. That start is refused, so the author is warned
+    /// rather than left with a procedure that only works from one of its two
+    /// surfaces.
+    #[test]
+    fn validate_sop_strict_warns_that_an_unowned_manual_sop_is_not_dashboard_startable() {
+        let sop = authoring_sop(vec![titled_step(1, "a")]);
+
+        let validation = validate_sop_strict(&sop);
+
+        let warning = validation
+            .warnings
+            .iter()
+            .find(|w| w.contains("no owning agent"))
+            .unwrap_or_else(|| panic!("expected an ownership warning, got {validation:?}"));
+        assert!(
+            warning.contains("dashboard"),
+            "the warning should name the surface that refuses the start, got {warning:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(
+            !validate_sop_strict(&owned)
+                .warnings
+                .iter()
+                .any(|w| w.contains("no owning agent")),
+            "an owned procedure must not warn"
+        );
+    }
+
+    /// The refusal a headless start surface returns is derived from the same
+    /// rule the authoring gate uses, so a start can never be permitted on a
+    /// rule the executing driver does not share.
+    #[test]
+    fn headless_ownership_refusal_names_every_unowned_execute_step() {
+        let mut owned_step = titled_step(2, "b");
+        owned_step.agent = Some("ops".into());
+        let mut checkpoint = titled_step(3, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let sop = authoring_sop(vec![titled_step(1, "a"), owned_step, checkpoint]);
+
+        assert_eq!(unowned_execute_steps(&sop), vec![1]);
+        let refusal =
+            headless_ownership_refusal(&sop).expect("an unowned execute step must be refused");
+        assert!(
+            refusal.contains("[1]"),
+            "only the unowned execute step should be named — the owned step and the checkpoint \
+             carry their own exemption, got {refusal:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(unowned_execute_steps(&owned).is_empty());
+        assert!(
+            headless_ownership_refusal(&owned).is_none(),
+            "a procedure whose SOP-level agent covers every step must start"
+        );
+    }
+
+    /// Only `execute` steps need an agent: checkpoints park for human approval
+    /// and capability steps run through the deterministic registry.
+    #[test]
+    fn validate_sop_strict_exempts_non_execute_steps_from_ownership() {
+        let mut checkpoint = titled_step(1, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let mut capability = titled_step(2, "compute");
+        capability.kind = SopStepKind::Capability;
+
+        let validation = validate_sop_strict(&cron_sop(vec![checkpoint, capability], None));
+
+        assert!(
+            !validation
+                .blocking
+                .iter()
+                .any(|b| b.contains("owning agent")),
+            "non-execute steps should not require an owner, got {:?}",
+            validation.blocking
+        );
     }
 
     #[test]
