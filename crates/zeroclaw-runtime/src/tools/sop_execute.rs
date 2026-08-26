@@ -177,6 +177,11 @@ impl Tool for SopExecuteTool {
                     } => {
                         format!("SOP run {run_id} pending before step {step}: {reason}")
                     }
+                    SopRunAction::Skipped { sop_name, reason } => {
+                        format!(
+                            "SOP '{sop_name}' skipped at dispatch (no run created): {reason}"
+                        )
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
@@ -203,6 +208,7 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         | SopRunAction::DeterministicStep { run_id, .. }
         | SopRunAction::CheckpointWait { run_id, .. }
         | SopRunAction::Pending { run_id, .. } => Some(run_id),
+        SopRunAction::Skipped { .. } => None,
     }
 }
 

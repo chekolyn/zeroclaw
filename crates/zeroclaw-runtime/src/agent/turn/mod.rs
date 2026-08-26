@@ -2357,6 +2357,20 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
+                // Skip-at-dispatch: no run was created (sidecar SOP). There is
+                // nothing for the live turn to drive — log and move on.
+                crate::sop::SopRunAction::Skipped { sop_name, reason } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name,
+                                "reason": reason,
+                            })),
+                        "SOP live executor skipped sidecar SOP (no run created)"
+                    );
+                    break;
+                }
             }
         }
     }

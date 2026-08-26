@@ -261,6 +261,11 @@ impl Tool for SopAdvanceTool {
                     } => {
                         format!("Step recorded. Run {run_id} pending before step {step}: {reason}")
                     }
+                    // `advance_step` never returns `Skipped` (it operates on an
+                    // existing run, not a start); keep the match exhaustive.
+                    SopRunAction::Skipped { sop_name, reason } => {
+                        format!("SOP '{sop_name}' skipped at dispatch: {reason}")
+                    }
                 };
                 Ok(ToolResult {
                     success: true,

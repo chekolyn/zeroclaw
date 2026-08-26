@@ -1741,6 +1741,36 @@ impl SopEngine {
         event: SopEvent,
         initiator: Option<&str>,
     ) -> Result<SopRunAction> {
+        // Skip-at-dispatch: a Deterministic SOP with no gateway-runnable step is
+        // handled entirely by the sidecar (a Python handler). The gateway reads
+        // the STEP KIND (execution_mode + step.kind), never the `executor`
+        // field. A Deterministic SOP with neither a `Capability` step (headless-
+        // drivable) nor a `Checkpoint` step (a gateway approval pause) has
+        // nothing the gateway can run: its `Execute` steps require an external
+        // driver and would only fail headlessly ("requires an external
+        // driver"). Creating a gateway run for it is the sidecar double-dispatch
+        // bug, so release the reservation and return `Skipped` WITHOUT creating
+        // a run — before the `active_runs.insert` below.
+        if reservation.sop.execution_mode == SopExecutionMode::Deterministic
+            && !reservation
+                .sop
+                .steps
+                .iter()
+                .any(|s| s.kind == SopStepKind::Capability)
+            && !reservation
+                .sop
+                .steps
+                .iter()
+                .any(|s| s.kind == SopStepKind::Checkpoint)
+        {
+            let sop_name = reservation.sop.name.clone();
+            self.release_reservation(reservation);
+            return Ok(SopRunAction::Skipped {
+                sop_name,
+                reason: "no gateway-runnable (Capability) step; handled by sidecar".into(),
+            });
+        }
+
         let StartReservation {
             run_id,
             claim,
@@ -5974,6 +6004,7 @@ mod tests {
             | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
+            SopRunAction::Skipped { .. } => "",
         }
     }
 
@@ -6632,6 +6663,150 @@ mod tests {
 
     // ── Run lifecycle ───────────────────────────────────
 
+    /// Build a Deterministic SOP whose steps are ALL `Execute` (no `Capability`,
+    /// no `Checkpoint`) — the sidecar profile that `activate_reserved_run` must
+    /// skip at dispatch.
+    fn det_all_execute_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic all-execute SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Step two".into(),
+                    body: "Do step two".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    /// Build a Deterministic SOP with one `Capability` ("noop") step — the
+    /// gateway-runnable profile that must NOT be skipped.
+    fn det_capability_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic capability SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Capability step".into(),
+                body: "Run the noop capability".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::Capability,
+                schema: None,
+                capability: Some("noop".into()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn start_run_skips_deterministic_sop_with_no_capability_step() {
+        // Skip-at-dispatch: a Deterministic SOP whose steps are all `Execute` (no
+        // gateway-runnable Capability step) is handled by the sidecar. The gateway
+        // must NOT create a run for it — return `Skipped` and leave
+        // `active_runs` empty.
+        let mut engine = engine_with_sops(vec![det_all_execute_sop("det-sidecar")]);
+        let action = engine.start_run("det-sidecar", manual_event()).unwrap();
+        assert!(
+            matches!(
+                &action,
+                SopRunAction::Skipped {
+                    sop_name,
+                    reason,
+                } if sop_name == "det-sidecar"
+                    && reason.contains("sidecar")
+            ),
+            "a Deterministic all-Execute SOP must skip at dispatch, got {action:?}"
+        );
+        assert!(
+            engine.active_runs().is_empty(),
+            "no run must be created for a skipped sidecar SOP"
+        );
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            0,
+            "a skipped SOP must not leave a finished (failed/completed) run either"
+        );
+    }
+
+    #[test]
+    fn start_run_does_not_skip_deterministic_sop_with_capability_step() {
+        // A Deterministic SOP that has a `Capability` step IS gateway-runnable — it
+        // must not be skipped; the gateway creates a run and (for a single
+        // capability step) drives it to a terminal action.
+        let mut engine = engine_with_sops(vec![det_capability_sop("det-cap")]);
+        let action = engine.start_run("det-cap", manual_event()).unwrap();
+        assert!(
+            !matches!(action, SopRunAction::Skipped { .. }),
+            "a Deterministic SOP with a Capability step must not be skipped, got {action:?}"
+        );
+        assert_eq!(
+            engine.active_runs().len(),
+            0,
+            "the single capability step drains headlessly; no active run remains"
+        );
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            1,
+            "the capability run completes (a run WAS created, unlike the skip case)"
+        );
+    }
+
+    #[test]
+    fn start_run_does_not_skip_auto_sop() {
+        // An `Auto` SOP is never in scope for the Deterministic-only skip — it
+        // must create a run and return an `ExecuteStep` (the first LLM step).
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { .. }),
+            "an Auto SOP must not be skipped, got {action:?}"
+        );
+        assert_eq!(engine.active_runs().len(), 1);
+    }
+
     #[test]
     fn start_run_returns_first_step() {
         let mut engine = engine_with_sops(vec![test_sop(
@@ -6858,7 +7033,7 @@ mod tests {
             input: Some(required_object_schema("ok")),
             output: None,
         });
-        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]).with_store(store.clone());
 
         let err = engine
             .start_deterministic_run("det-schema-start-finish-fail", manual_event())
@@ -12266,7 +12441,7 @@ mod tests {
                 ..SopStep::default()
             },
         ];
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
 
         let action = engine.start_run("det-sop", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
@@ -12286,7 +12461,9 @@ mod tests {
         // Check savings
         let savings = engine.deterministic_savings();
         assert_eq!(savings.total_runs, 1);
-        assert_eq!(savings.total_llm_calls_saved, 2);
+        // 2 Execute steps + the tail noop Capability step all complete and each
+        // saved an LLM call.
+        assert_eq!(savings.total_llm_calls_saved, 3);
     }
 
     #[test]
@@ -12394,9 +12571,32 @@ type = "manual"
         }
     }
 
+    /// Append a `noop` `Capability` step (numbered after the last step) so a
+    /// Deterministic SOP is gateway-runnable and NOT skipped at dispatch — while
+    /// leaving the steps the test actually exercises (1..n) untouched. The
+    /// appended step is only reached if a test drives the run to completion past
+    /// its last exercised step, in which case the capability executes inline
+    /// and the run still reaches the same terminal outcome the test asserts.
+    fn with_tail_capability(mut sop: Sop) -> Sop {
+        let next_number = sop.steps.iter().map(|s| s.number).max().unwrap_or(0) + 1;
+        sop.steps.push(SopStep {
+            number: next_number,
+            title: "Tail capability".into(),
+            body: "noop capability so the SOP is gateway-runnable".into(),
+            suggested_tools: vec![],
+            requires_confirmation: false,
+            kind: SopStepKind::Capability,
+            schema: None,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        });
+        sop
+    }
+
     #[test]
     fn deterministic_run_drives_to_completion_through_advance_step() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-run")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-run"))]);
         let action = engine.start_run("det-run", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(
@@ -12453,7 +12653,7 @@ type = "manual"
             ..SopStep::default()
         });
         sop.steps[0].routing.next = Some(3);
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
         let action = engine.start_run("det-route", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(
@@ -12513,7 +12713,8 @@ type = "manual"
 
     #[test]
     fn deterministic_failed_step_fails_run_through_advance_step() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-fail")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-fail"))]);
         let action = engine.start_run("det-fail", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -12544,7 +12745,7 @@ type = "manual"
             input: None,
             output: Some(required_object_schema("ok")),
         });
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
         let action = engine.start_run("det-schema", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -12561,7 +12762,8 @@ type = "manual"
 
     #[test]
     fn deterministic_advance_step_preserves_caller_timestamps() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-ts")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-ts"))]);
         let action = engine.start_run("det-ts", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 

@@ -291,6 +291,8 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::Pending { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
+        // No run was created for a skipped (sidecar) SOP — there is no run_id.
+        SopRunAction::Skipped { .. } => "",
     }
 }
 
@@ -304,6 +306,7 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::Pending { .. } => "Pending",
         SopRunAction::Completed { .. } => "Completed",
         SopRunAction::Failed { .. } => "Failed",
+        SopRunAction::Skipped { .. } => "Skipped",
     }
 }
 
@@ -891,7 +894,31 @@ async fn dispatch_sop_event_filtered(
                 return results;
             }
             for (sop_name, action) in activated {
-                let result = record_started_run(&mut eng, &sop_name, action, &mut started_runs);
+                // Skip-at-dispatch: a `Skipped` action means no run was created
+                // (sidecar SOP). Do NOT drive or audit it as a started run —
+                // surface it as a handled `Skipped` result and ack it.
+                let result = if let SopRunAction::Skipped { reason, .. } = &action {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({
+                            "sop_name": sop_name.as_str(),
+                            "reason": reason.as_str()
+                        })),
+                        &format!(
+                            "SOP dispatch: skipped '{sop_name}' at dispatch (sidecar): {reason}"
+                        )
+                    );
+                    DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason: reason.clone(),
+                    }
+                } else {
+                    record_started_run(&mut eng, &sop_name, action, &mut started_runs)
+                };
                 remember_dispatch_start(&mut eng, &sop_name, dedup, &result);
                 results.push(result);
             }
@@ -963,8 +990,33 @@ async fn dispatch_sop_event_filtered(
                 }
                 match eng.start_run(sop_name, event.clone()) {
                     Ok(action) => {
+                        // Skip-at-dispatch: a `Skipped` action means no run was
+                        // created (sidecar SOP). Do NOT drive or audit it as a
+                        // started run — surface it as a handled `Skipped` result.
                         let result =
-                            record_started_run(&mut eng, sop_name, action, &mut started_runs);
+                            if let SopRunAction::Skipped { reason, .. } = &action {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "sop_name": sop_name,
+                                        "reason": reason.as_str()
+                                    })),
+                                    &format!(
+                                        "SOP dispatch: skipped '{sop_name}' at dispatch (sidecar): {reason}"
+                                    )
+                                );
+                                DispatchResult::Skipped {
+                                    sop_name: sop_name.clone(),
+                                    reason: reason.clone(),
+                                }
+                            } else {
+                                record_started_run(
+                                    &mut eng, sop_name, action, &mut started_runs)
+                            };
                         remember_dispatch_start(&mut eng, sop_name, dedup, &result);
                         results.push(result);
                     }
@@ -1086,6 +1138,10 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                 SopRunAction::Failed { reason, .. } => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}"));
                 }
+                // A `Skipped` action never reaches `record_started_run` (it is
+                // surfaced as `DispatchResult::Skipped` upstream), so this arm is
+                // unreachable for a `Started` result; keep the match exhaustive.
+                SopRunAction::Skipped { .. } => {}
             },
             DispatchResult::Skipped { sop_name, reason } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: skipped '{sop_name}': {reason}"));
@@ -2672,6 +2728,20 @@ mod tests {
         sop.execution_mode = SopExecutionMode::Deterministic;
         sop.deterministic = true;
         sop.max_concurrent = 1;
+        // Append a `noop` Capability step so the SOP is gateway-runnable and not
+        // skipped at dispatch (the headless drain under test fails the first
+        // Execute step driverlessly; the tail capability is never reached).
+        sop.steps.push(SopStep {
+            number: 2,
+            title: "Tail capability".into(),
+            body: "noop so the SOP is gateway-runnable".into(),
+            suggested_tools: vec![],
+            requires_confirmation: false,
+            kind: crate::sop::SopStepKind::Capability,
+            schema: None,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        });
         sop
     }
 

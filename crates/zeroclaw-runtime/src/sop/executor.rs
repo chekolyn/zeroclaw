@@ -668,6 +668,22 @@ async fn drive_headless_run(
                 );
                 return;
             }
+            // Skip-at-dispatch: no run was created (sidecar SOP). The headless
+            // driver is never invoked for a skipped SOP (dispatch surfaces it as
+            // `DispatchResult::Skipped` before reaching here), but keep the
+            // match exhaustive and treat it as a no-op terminal.
+            SopRunAction::Skipped { sop_name, reason } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "sop_name": sop_name,
+                            "reason": reason,
+                        })),
+                    "SOP headless driver: skipped sidecar SOP (no run created)"
+                );
+                return;
+            }
         }
     }
     ::zeroclaw_log::record!(
