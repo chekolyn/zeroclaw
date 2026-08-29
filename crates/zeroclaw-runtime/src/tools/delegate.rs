@@ -130,6 +130,110 @@ pub fn parse_delegate_event_args(args: &serde_json::Value) -> DelegateEventArgs 
     }
 }
 
+// ── M2 Part B: typed Task* event helpers ──────────────────────────
+//
+// Pure functions that build the fixed-topic, IDs-in-payload event
+// envelopes matching the sidecar `zc_engine.core.schemas.events.task_events`
+// pydantic models (T6a). Extracted so they are unit-testable without a
+// live MQTT broker (`mqtt_bus::publish` is a free function, not mockable).
+//
+// Contract: non-retained, fixed topics, single canonical `timestamp`,
+// `status` enum (no lossy Cancelled→failed mapping). Publishing is skipped
+// entirely when `project_id` or `milestone_id` is `None` — the sidecar
+// schemas require both as non-empty strings.
+
+/// Fixed MQTT topic for task-started events.
+pub fn task_started_topic() -> &'static str {
+    "zeroclaw/tasks/started"
+}
+
+/// Fixed MQTT topic for task-completed events (success and cancel).
+pub fn task_completed_topic() -> &'static str {
+    "zeroclaw/tasks/completed"
+}
+
+/// Fixed MQTT topic for task-failed events.
+pub fn task_failed_topic() -> &'static str {
+    "zeroclaw/tasks/failed"
+}
+
+/// Build the `TaskStarted` payload (sidecar schema: `TaskStarted`).
+///
+/// Fields: `project_id`, `milestone_id`, `task_id`, `timestamp` (required),
+/// plus optional `chain_id`, `session_id`, `ttl_seconds`. No `agent` field
+/// (it lives in the delegate result file, not the event payload).
+pub fn build_task_started_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+    ttl_seconds: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+        "ttl_seconds": ttl_seconds,
+    })
+}
+
+/// Build the `TaskCompleted` payload (sidecar schema: `TaskCompleted`).
+///
+/// `status` must be `"completed"` or `"cancelled"`. Failures go to the
+/// `failed` topic via [`build_task_failed_payload`], not here.
+pub fn build_task_completed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    status: &str,
+    result: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "status": status,
+        "result": result,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
+}
+
+/// Build the `TaskFailed` payload (sidecar schema: `TaskFailed`).
+///
+/// `reason` is a short failure label (min 1 char). `error` is the longer
+/// error detail, if available.
+pub fn build_task_failed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    reason: &str,
+    error: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "reason": reason,
+        "error": error,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
+}
+
 /// Status of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1671,29 +1775,29 @@ impl DelegateTool {
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
-        // R2: publish 'started' event (retained) to the MQTT bus for the event-driven
-        // swarm engine. No-op when mqtt unconfigured. Uses the project/milestone
-        // hierarchy topic; falls back to 'unassigned' when project_id is None.
+        // R2: publish 'started' event to the MQTT bus for the event-driven swarm
+        // engine. No-op when mqtt unconfigured. Uses a FIXED topic with IDs in
+        // the payload (M2 Part B). Non-retained. Skipped when project_id or
+        // milestone_id is None — the sidecar schema requires both as non-empty
+        // strings, so there is no 'unassigned' placeholder.
         #[cfg(feature = "channel-mqtt")]
+        if let (Some(proj), Some(ms)) =
+            (event_args.project_id.as_deref(), event_args.milestone_id.as_deref())
         {
-            let proj = event_args.project_id.clone().unwrap_or_else(|| "unassigned".to_string());
-            let ms = event_args.milestone_id.clone().unwrap_or_else(|| "unassigned".to_string());
-            let topic = crate::mqtt_bus::topic_for(&[
-                "projects", &proj, "milestones", &ms, "tasks", &task_id, "started",
-            ]);
-            let payload = serde_json::json!({
-                "task_id": task_id,
-                "agent": agent_name_owned,
-                "project_id": event_args.project_id,
-                "milestone_id": event_args.milestone_id,
-                "chain_id": event_args.chain_id,
-                "ttl_seconds": event_args.ttl_seconds,
-                "session_id": event_args.session_id,
-                "started_at": started_at,
-            }).to_string();
+            let topic = task_started_topic().to_string();
+            let payload = build_task_started_payload(
+                proj,
+                ms,
+                &task_id,
+                &started_at,
+                event_args.chain_id.as_deref(),
+                event_args.session_id.as_deref(),
+                Some(event_args.ttl_seconds),
+            )
+            .to_string();
             tokio::spawn(async move {
                 let _ = crate::mqtt_bus::publish(
-                    &topic, payload.into_bytes(), true,
+                    &topic, payload.into_bytes(), false,
                 ).await;
             });
         }
@@ -1880,35 +1984,73 @@ impl DelegateTool {
                         .await;
                 }
 
-                        // R3: publish terminal event (retained) to the MQTT bus for the
+                        // R3: publish terminal event to the MQTT bus for the
                         // event-driven swarm engine. No-op when mqtt unconfigured.
+                        // Uses FIXED topics with IDs in the payload (M2 Part B),
+                        // non-retained. `status` is an enum — cancel maps to the
+                        // completed topic with status='cancelled', NOT to failed.
+                        // Skipped when project_id or milestone_id is None.
                         #[cfg(feature = "channel-mqtt")]
+                        if let (Some(proj), Some(ms)) =
+                            (final_result.project_id.as_deref(), final_result.milestone_id.as_deref())
                         {
-                            let state = match final_result.status {
-                                BackgroundTaskStatus::Completed => "completed",
-                                BackgroundTaskStatus::Failed => "failed",
-                                BackgroundTaskStatus::Cancelled => "cancelled",
-                                BackgroundTaskStatus::Running => "completed",
+                            let timestamp = final_result
+                                .finished_at
+                                .clone()
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                            let chain = final_result.chain_id.as_deref();
+                            let session = final_result.session_id.as_deref();
+                            let (topic, payload) = match final_result.status {
+                                BackgroundTaskStatus::Completed
+                                | BackgroundTaskStatus::Running => {
+                                    let topic = task_completed_topic().to_string();
+                                    let payload = build_task_completed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        "completed",
+                                        final_result.output.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
+                                BackgroundTaskStatus::Cancelled => {
+                                    let topic = task_completed_topic().to_string();
+                                    let payload = build_task_completed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        "cancelled",
+                                        final_result.output.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
+                                BackgroundTaskStatus::Failed => {
+                                    let topic = task_failed_topic().to_string();
+                                    let payload = build_task_failed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        final_result.error.as_deref().unwrap_or("failed"),
+                                        final_result.error.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
                             };
-                            let proj = final_result.project_id.clone().unwrap_or_else(|| "unassigned".to_string());
-                            let ms = final_result.milestone_id.clone().unwrap_or_else(|| "unassigned".to_string());
-                            let topic = crate::mqtt_bus::topic_for(&[
-                                "projects", &proj, "milestones", &ms, "tasks", &task_id_clone, state,
-                            ]);
-                            let payload = serde_json::json!({
-                                "task_id": task_id_clone,
-                                "status": state,
-                                "project_id": final_result.project_id,
-                                "milestone_id": final_result.milestone_id,
-                                "chain_id": final_result.chain_id,
-                                "session_id": final_result.session_id,
-                                "started_at": final_result.started_at,
-                                "finished_at": final_result.finished_at,
-                                "error": final_result.error,
-                            }).to_string();
                             tokio::spawn(async move {
                                 let _ = crate::mqtt_bus::publish(
-                                    &topic, payload.into_bytes(), true,
+                                    &topic, payload.into_bytes(), false,
                                 ).await;
                             });
                         }
@@ -9863,24 +10005,145 @@ command = "echo hi"
 
     #[cfg(feature = "channel-mqtt")]
     #[test]
-    fn topic_for_hierarchy_contract() {
-        // Lock the topic hierarchy contract: the started/completed events
-        // must produce topics matching the design's tree topology.
-        let topic = crate::mqtt_bus::topic_for(&[
-            "projects", "p1", "milestones", "m1", "tasks", "t1", "started",
-        ]);
-        assert_eq!(
-            topic,
-            "zeroclaw/projects/p1/milestones/m1/tasks/t1/started"
-        );
+    fn task_event_topics_are_fixed() {
+        // M2 Part B: task events use FIXED topics (no parameterized hierarchy).
+        assert_eq!(task_started_topic(), "zeroclaw/tasks/started");
+        assert_eq!(task_completed_topic(), "zeroclaw/tasks/completed");
+        assert_eq!(task_failed_topic(), "zeroclaw/tasks/failed");
+    }
 
-        let topic2 = crate::mqtt_bus::topic_for(&[
-            "projects", "unassigned", "milestones", "unassigned", "tasks", "t2", "completed",
-        ]);
-        assert_eq!(
-            topic2,
-            "zeroclaw/projects/unassigned/milestones/unassigned/tasks/t2/completed"
+    #[test]
+    fn build_task_started_payload_fields() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+            Some(600),
         );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        assert_eq!(payload["ttl_seconds"], 600);
+        // No 'agent' field — it lives in the delegate result file.
+        assert!(payload.get("agent").is_none(), "agent must not be in the payload");
+        // No 'started_at' field — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none(), "started_at must not be in the payload");
+    }
+
+    #[test]
+    fn build_task_started_payload_optionals_null() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+        assert_eq!(payload["ttl_seconds"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_completed_payload_completed() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "completed",
+            Some("task output here"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["result"], "task output here");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'started_at'/'finished_at' — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+        // No 'error' field on the completed topic.
+        assert!(payload.get("error").is_none());
+    }
+
+    #[test]
+    fn build_task_completed_payload_cancelled() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "cancelled",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["result"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_failed_payload_fields() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "timeout",
+            Some("full error detail"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["reason"], "timeout");
+        assert_eq!(payload["error"], "full error detail");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'status' field on the failed topic — the topic itself signals failure.
+        assert!(payload.get("status").is_none());
+        // No 'started_at'/'finished_at'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+    }
+
+    #[test]
+    fn build_task_failed_payload_minimal() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "failed",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["reason"], "failed");
+        assert_eq!(payload["error"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
     }
 
     #[test]
