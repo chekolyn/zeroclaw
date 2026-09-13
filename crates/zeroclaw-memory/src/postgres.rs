@@ -183,6 +183,7 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
             CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
+                CREATE INDEX IF NOT EXISTS idx_memories_key_btree ON {qualified_table}(key text_pattern_ops);
             "
         ))?;
 
