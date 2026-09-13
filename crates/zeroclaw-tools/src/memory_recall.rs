@@ -83,6 +83,23 @@ impl Tool for MemoryRecallTool {
                     "enum": ["bm25", "embedding", "hybrid"],
                     "description": "Search strategy: bm25 (keyword), embedding (semantic), or hybrid (both). Defaults to config value."
                 },
+                "category": {
+                    "type": "string",
+                    "description": "Filter by memory category (core, workstream, daily, conversation)"
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Filter by namespace (e.g. 'telemetry' for audit, 'ws' for workstream)"
+                },
+                "key_prefix": {
+                    "type": "string",
+                    "description": "Filter by key prefix (e.g. 'ws:infra:id:' for a workstream enumeration)"
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["filtered", "all"],
+                    "description": "'filtered' (default, applies config exclusion) or 'all' (no exclusion). Use 'all' for audit/debug."
+                },
                 "prefix": {
                     "type": "string",
                     "description": "If set, return ALL entries whose key starts with this prefix (unranked, complete list), ignoring query/since/until/search_mode."
