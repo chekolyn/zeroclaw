@@ -1686,12 +1686,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
-<<<<<<< HEAD
         .merge(sop_webhook_routes())
-        .merge(optional_channel_routes())
-        // ── Claude Code runner hooks ──
-        .route("/hooks/claude-code", post(api::handle_claude_code_hook))
-=======
         .merge(optional_channel_routes());
 
     // ── Dynamic generic webhook routes from [channels.webhook.*] config ──
@@ -1726,7 +1721,6 @@ pub async fn run_gateway(
 
     // ── Claude Code runner hooks ──
     inner = inner.route("/hooks/claude-code", post(api::handle_claude_code_hook))
->>>>>>> cheknet-patched-v0.8.4
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/version/check", get(version::handle_version_check))
