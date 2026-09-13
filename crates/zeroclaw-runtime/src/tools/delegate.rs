@@ -2987,7 +2987,7 @@ impl DelegateTool {
         // describes exactly the assembled skill tools rather than the local bundle resolver's
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
-        let sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
+        let mut sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
 
             DelegateExecutionMode::Independent => {
                 match self
