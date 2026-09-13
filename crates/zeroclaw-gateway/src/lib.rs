@@ -2182,7 +2182,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         nextcloud_talk_webhook_secret,
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
-        #[cfg(feature = "channel-webhook")]
         webhook_secret_hash: None,
         #[cfg(feature = "channel-webhook")]
         generic_webhook_secrets: HashMap::new(),
