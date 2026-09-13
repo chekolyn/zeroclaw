@@ -1616,6 +1616,7 @@ pub async fn run_gateway(
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         #[cfg(feature = "channel-webhook")]
+        webhook_secret_hash: None,
         generic_webhook_secrets: generic_webhook_secrets,
         #[cfg(feature = "channel-webhook")]
         generic_webhook_aliases: generic_webhook_aliases,
