@@ -144,8 +144,7 @@ impl MaintenanceSummary {
             && self.pruned_runs == 0
             && self.finalized_cancellations == 0
             && self.finalized_step_budget_failures == 0
-    /// `Running` runs reaped by the stuck-run timeout.
-    pub reaped_stuck_runs: usize,
+            && self.reaped_stuck_runs == 0
     }
 }
 
@@ -5151,8 +5150,7 @@ impl SopEngine {
             pruned_runs,
             finalized_cancellations,
             finalized_step_budget_failures,
-    /// `Running` runs reaped by the stuck-run timeout.
-    pub reaped_stuck_runs: usize,
+            reaped_stuck_runs: 0,
             timeout_actions,
         }
     }
