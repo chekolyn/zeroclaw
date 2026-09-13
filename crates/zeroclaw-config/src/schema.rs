@@ -3831,6 +3831,13 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Subdirectory (relative to the agent workspace dir) where background
+    /// delegate task lifecycle records (`<task_id>.json`) are persisted.
+    /// `None` (default) preserves the upstream behavior of `"delegate_results"`.
+    /// Operators may override it (e.g. `"event_engine/tasks"`) to align the
+    /// durable task store with the MQTT topic tree (`.../tasks/<id>`).
+    #[serde(default)]
+    pub results_dir: Option<PathBuf>,
 }
 
 impl Default for DelegateToolConfig {
@@ -3838,6 +3845,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            results_dir: None,
         }
     }
 }
@@ -6881,6 +6889,16 @@ pub struct PacingConfig {
     /// caps at Block — it never terminates the turn. Defaults to 5.
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
     pub loop_detection_no_progress_min_calls: usize,
+
+    /// Read-only search tools exempt from the no-progress loop detector.
+    /// These tools can legitimately return identical results (empty results,
+    /// "not found", similar content) for different queries, so repeated
+    /// calls with different args that return the same result are not
+    /// necessarily a sign of being stuck. Exact-repeat and ping-pong
+    /// detection still apply to these tools. Defaults to a small set of
+    /// search tools.
+    #[serde(default = "default_no_progress_exempt_tools")]
+    pub no_progress_exempt_tools: Vec<String>,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6899,6 +6917,15 @@ fn default_loop_detection_no_progress_min_calls() -> usize {
     5
 }
 
+fn default_no_progress_exempt_tools() -> Vec<String> {
+    vec![
+        "memory_recall".to_string(),
+        "content_search".to_string(),
+        "web_search_tool".to_string(),
+        "glob_search".to_string(),
+    ]
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6910,6 +6937,7 @@ impl Default for PacingConfig {
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
             loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
+            no_progress_exempt_tools: default_no_progress_exempt_tools(),
         }
     }
 }
@@ -17602,6 +17630,13 @@ pub struct WebhookConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
+    /// Header name for incoming webhook signature verification.
+    /// Common values: "X-Hub-Signature-256" (GitHub, WhatsApp),
+    /// "X-Webhook-Signature" (Linq), "X-Webhook-Secret" (generic).
+    /// Default: "X-Hub-Signature-256".
+    #[tab(Connection)]
+    #[serde(default = "default_webhook_signature_header")]
+    pub signature_header: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -17638,6 +17673,10 @@ pub const DEFAULT_WEBHOOK_CHANNEL_PORT: u16 = 8090;
 
 fn default_webhook_channel_port() -> u16 {
     DEFAULT_WEBHOOK_CHANNEL_PORT
+}
+
+fn default_webhook_signature_header() -> String {
+    "X-Hub-Signature-256".to_string()
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -28047,6 +28086,15 @@ pub struct SopConfig {
     #[serde(default = "default_sop_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
+    /// Maximum seconds a SOP run may stay in `Running` before the maintenance
+    /// tick reaps it as `Failed` ("stuck-run timeout"). Protects against runs
+    /// that started an executing step and never reached a terminal state (a
+    /// crashed agent loop, a lost executor). Default `3600` (1h); `0` disables
+    /// the reaper. Independent of `approval_timeout_secs` (which covers runs
+    /// parked at a HITL gate).
+    #[serde(default = "default_sop_stuck_run_timeout_secs")]
+    pub stuck_run_timeout_secs: u64,
+
     /// Maximum number of finished runs kept in memory for status queries.
     /// Oldest runs are evicted when over capacity. 0 = unlimited.
     #[serde(default = "default_sop_max_finished_runs")]
@@ -28380,6 +28428,10 @@ fn default_sop_approval_timeout_secs() -> u64 {
     300
 }
 
+fn default_sop_stuck_run_timeout_secs() -> u64 {
+    3600
+}
+
 fn default_sop_max_finished_runs() -> usize {
     100
 }
@@ -28438,6 +28490,7 @@ impl Default for SopConfig {
             default_execution_mode: default_sop_execution_mode(),
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
+            stuck_run_timeout_secs: default_sop_stuck_run_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
             maintenance_interval_secs: default_sop_maintenance_interval_secs(),
             persist_runs: default_sop_persist_runs(),

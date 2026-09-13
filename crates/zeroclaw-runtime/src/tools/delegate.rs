@@ -177,6 +177,179 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// R4: project this task belongs to (for the MQTT topic hierarchy).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// R4: milestone within the project.
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    /// R4: chain ID linking a sequence of delegations (v1: manual follow-up).
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// R4: time-to-live in seconds (default 300). Used by the stuck-watchdog
+    /// SOP to detect stuck tasks.
+    #[serde(default = "default_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// R4: originating session ID (optional, for cross-session correlation).
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Default TTL for background delegate tasks (5 minutes).
+fn default_ttl_seconds() -> u64 {
+    300
+}
+
+/// R4: Event-driven delegate args parsed from the tool's JSON arguments.
+/// Used to thread project/milestone/chain metadata into the MQTT topic
+/// hierarchy and the `BackgroundDelegateResult`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegateEventArgs {
+    pub project_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub chain_id: Option<String>,
+    pub ttl_seconds: u64,
+    pub session_id: Option<String>,
+}
+
+/// Parse the event-driven args from a tool's JSON argument value.
+/// Returns a `DelegateEventArgs` with defaults applied (ttl_seconds=300).
+pub fn parse_delegate_event_args(args: &serde_json::Value) -> DelegateEventArgs {
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let milestone_id = args
+        .get("milestone_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let chain_id = args
+        .get("chain_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ttl_seconds = args
+        .get("ttl_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_ttl_seconds());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    DelegateEventArgs {
+        project_id,
+        milestone_id,
+        chain_id,
+        ttl_seconds,
+        session_id,
+    }
+}
+
+// ── M2 Part B: typed Task* event helpers ──────────────────────────
+//
+// Pure functions that build the fixed-topic, IDs-in-payload event
+// envelopes matching the sidecar `zc_engine.core.schemas.events.task_events`
+// pydantic models (T6a). Extracted so they are unit-testable without a
+// live MQTT broker (`mqtt_bus::publish` is a free function, not mockable).
+//
+// Contract: non-retained, fixed topics, single canonical `timestamp`,
+// `status` enum (no lossy Cancelled→failed mapping). Publishing is skipped
+// entirely when `project_id` or `milestone_id` is `None` — the sidecar
+// schemas require both as non-empty strings.
+
+/// Fixed MQTT topic for task-started events.
+pub fn task_started_topic() -> &'static str {
+    "zeroclaw/tasks/started"
+}
+
+/// Fixed MQTT topic for task-completed events (success and cancel).
+pub fn task_completed_topic() -> &'static str {
+    "zeroclaw/tasks/completed"
+}
+
+/// Fixed MQTT topic for task-failed events.
+pub fn task_failed_topic() -> &'static str {
+    "zeroclaw/tasks/failed"
+}
+
+/// Build the `TaskStarted` payload (sidecar schema: `TaskStarted`).
+///
+/// Fields: `project_id`, `milestone_id`, `task_id`, `timestamp` (required),
+/// plus optional `chain_id`, `session_id`, `ttl_seconds`. No `agent` field
+/// (it lives in the delegate result file, not the event payload).
+pub fn build_task_started_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+    ttl_seconds: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+        "ttl_seconds": ttl_seconds,
+    })
+}
+
+/// Build the `TaskCompleted` payload (sidecar schema: `TaskCompleted`).
+///
+/// `status` must be `"completed"` or `"cancelled"`. Failures go to the
+/// `failed` topic via [`build_task_failed_payload`], not here.
+pub fn build_task_completed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    status: &str,
+    result: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "status": status,
+        "result": result,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
+}
+
+/// Build the `TaskFailed` payload (sidecar schema: `TaskFailed`).
+///
+/// `reason` is a short failure label (min 1 char). `error` is the longer
+/// error detail, if available.
+pub fn build_task_failed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    reason: &str,
+    error: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "reason": reason,
+        "error": error,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
 }
 
 /// Output artifact written by current background delegates.
@@ -1880,8 +2053,17 @@ impl DelegateTool {
     }
 
     /// Directory where background delegate results are stored.
+    ///
+    /// The subdir is resolved from `DelegateToolConfig.results_dir` (configurable
+    /// via `[delegate] results_dir = "..."`), defaulting to `"delegate_results"`
+    /// to preserve upstream behavior. The path is relative to the agent workspace.
     fn results_dir(&self) -> PathBuf {
-        self.workspace_dir.join("delegate_results")
+        let subdir = self
+            .delegate_config
+            .results_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("delegate_results"));
+        self.workspace_dir.join(subdir)
     }
 
     async fn background_control_plane(
@@ -2482,6 +2664,32 @@ impl Tool for DelegateTool {
                     "minimum": 0,
                     "maximum": Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis(),
                     "description": "Maximum milliseconds for await_sessions to wait before returning partial results. Capped at 120000."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Project ID for the event-driven topic hierarchy \
+                                    (zeroclaw/projects/{project_id}/...). Optional."
+                },
+                "milestone_id": {
+                    "type": "string",
+                    "description": "Milestone ID within the project for the topic hierarchy. \
+                                    Optional; use with project_id."
+                },
+                "chain_id": {
+                    "type": "string",
+                    "description": "Chain ID linking a sequence of delegations for manual \
+                                    follow-up (v1; no auto-dispatch). Optional."
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "description": "Time-to-live in seconds for the background task. Used by \
+                                    the stuck-watchdog SOP to detect stuck tasks. Default: 300.",
+                    "default": 300
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Originating session ID for cross-session correlation. \
+                                    Optional."
                 }
             },
             "required": []
@@ -3244,14 +3452,53 @@ impl DelegateTool {
         let agent_name_owned = agent_name.to_string();
 
         // The workspace artifact scopes listing and stores output, but never owns
+        // R4: parse event-driven args (project/milestone/chain/ttl/session) from
+        // the tool args, for the MQTT topic hierarchy and the result struct.
+        let event_args = parse_delegate_event_args(args);
+
         // lifecycle status. Status is created atomically in the task store below.
-        let initial_result = BackgroundDelegateOutput {
+        let initial_result = BackgroundDelegateResult {
             task_id: task_id.clone(),
             output: None,
+            error: None,
+            started_at: started_at.clone(),
+            finished_at: None,
+            project_id: event_args.project_id.clone(),
+            milestone_id: event_args.milestone_id.clone(),
+            chain_id: event_args.chain_id.clone(),
+            ttl_seconds: event_args.ttl_seconds,
+            session_id: event_args.session_id.clone(),
         };
         let result_path =
             Self::durable_artifact_path(&results_dir.join(format!("{task_id}.json")))?;
         Self::write_result_atomic(&result_path, &initial_result).await?;
+
+        // R2: publish 'started' event to the MQTT bus for the event-driven swarm
+        // engine. No-op when mqtt unconfigured. Uses a FIXED topic with IDs in
+        // the payload (M2 Part B). Non-retained. Skipped when project_id or
+        // milestone_id is None — the sidecar schema requires both as non-empty
+        // strings, so there is no 'unassigned' placeholder.
+        #[cfg(feature = "channel-mqtt")]
+        if let (Some(proj), Some(ms)) =
+            (event_args.project_id.as_deref(), event_args.milestone_id.as_deref())
+        {
+            let topic = task_started_topic().to_string();
+            let payload = build_task_started_payload(
+                proj,
+                ms,
+                &task_id,
+                &started_at,
+                event_args.chain_id.as_deref(),
+                event_args.session_id.as_deref(),
+                Some(event_args.ttl_seconds),
+            )
+            .to_string();
+            tokio::spawn(async move {
+                let _ = crate::mqtt_bus::publish(
+                    &topic, payload.into_bytes(), false,
+                ).await;
+            });
+        }
 
         if let Err(error) = task_control_plane
             .store
@@ -3296,6 +3543,7 @@ impl DelegateTool {
         // policy moves into the child tool's `security` field.
         let target_policy_ceiling_cents = target_policy.max_cost_per_day_cents;
         let security = target_policy;
+        let event_args = event_args.clone();
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
         // Depth ownership: a logical hop increments depth exactly once, at the
@@ -3492,7 +3740,6 @@ impl DelegateTool {
 
                 drop(inner);
                 drop(args_inner);
-                drop(agent_name_owned);
                 // Final progress write, then no more: the terminal transition
                 // below must not race a late flush (the store also refuses
                 // progress on non-running rows).
@@ -3505,11 +3752,22 @@ impl DelegateTool {
                     Ok(output) => (
                         crate::control_plane::TaskStatus::Completed,
                         None,
-                        BackgroundDelegateOutput {
+                        BackgroundDelegateResult {
                             task_id: task_id_clone.clone(),
+                            agent: agent_name_owned.clone(),
+                            status: BackgroundTaskStatus::Completed,
                             output: Some(output),
+                            error: None,
+                            started_at,
+                            finished_at: Some(finished_at.clone()),
+                            project_id: event_args.project_id.clone(),
+                            milestone_id: event_args.milestone_id.clone(),
+                            chain_id: event_args.chain_id.clone(),
+                            ttl_seconds: event_args.ttl_seconds,
+                            session_id: event_args.session_id.clone(),
                         },
                     ),
+                let finished_at = chrono::Utc::now().to_rfc3339();
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
                             crate::control_plane::TaskStatus::Cancelled
@@ -3518,35 +3776,118 @@ impl DelegateTool {
                         };
                         (
                             status,
-                            Some(err),
-                            BackgroundDelegateOutput {
+                            Some(err.clone()),
+                            BackgroundDelegateResult {
                                 task_id: task_id_clone.clone(),
+                                agent: agent_name_owned.clone(),
+                                status: if err.contains("Cancelled") {
+                                    BackgroundTaskStatus::Cancelled
+                                } else {
+                                    BackgroundTaskStatus::Failed
+                                },
                                 output: None,
+                                error: Some(err),
+                                started_at,
+                                finished_at: Some(finished_at),
+                                project_id: event_args.project_id.clone(),
+                                milestone_id: event_args.milestone_id.clone(),
+                                chain_id: event_args.chain_id.clone(),
+                                ttl_seconds: event_args.ttl_seconds,
+                                session_id: event_args.session_id.clone(),
                             },
                         )
                     }
                 };
 
-                let _won = DelegateTool::complete_background_task(
-                    terminal_store.as_ref(),
-                    &result_path,
-                    final_result,
-                    terminal_status,
-                    terminal_error,
-                    terminal_owner_pid,
-                    terminal_owner_boot_id,
-                )
-                .await;
+                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                if let Some(cp) = crate::control_plane::control_plane() {
+                    let cp_status = match final_result.status {
+                        BackgroundTaskStatus::Completed => {
+                            crate::control_plane::TaskStatus::Completed
+                        }
+                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
+                        BackgroundTaskStatus::Cancelled => {
+                            crate::control_plane::TaskStatus::Cancelled
+                        }
+                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+                    };
+                    let _ = cp
+                        .store
+                        .update_status(
+                            &task_id_clone,
+                            cp_status,
+                            final_result.output.clone(),
+                            final_result.error.clone(),
+                        )
+                        .await;
+                }
+
+                // R3: publish terminal event to the MQTT bus for the
+                // event-driven swarm engine. No-op when mqtt unconfigured.
+                // Uses FIXED topics with IDs in the payload (M2 Part B),
+                // non-retained. `status` is an enum — cancel maps to the
+                // completed topic with status='cancelled', NOT to failed.
+                // Skipped when project_id or milestone_id is None.
+                #[cfg(feature = "channel-mqtt")]
+                if let (Some(proj), Some(ms)) =
+                    (final_result.project_id.as_deref(), final_result.milestone_id.as_deref())
+                {
+                    let timestamp = final_result
+                        .finished_at
+                        .clone()
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                    let chain = final_result.chain_id.as_deref();
+                    let session = final_result.session_id.as_deref();
+                    let (topic, payload) = match final_result.status {
+                        BackgroundTaskStatus::Completed | BackgroundTaskStatus::Running => {
+                            let topic = task_completed_topic().to_string();
+                            let payload = build_task_completed_payload(
+                                proj, ms, &task_id_clone, "completed",
+                                final_result.output.as_deref(), &timestamp, chain, session,
+                            )
+                            .to_string();
+                            (topic, payload)
+                        }
+                        BackgroundTaskStatus::Cancelled => {
+                            let topic = task_completed_topic().to_string();
+                            let payload = build_task_completed_payload(
+                                proj, ms, &task_id_clone, "cancelled",
+                                final_result.output.as_deref(), &timestamp, chain, session,
+                            )
+                            .to_string();
+                            (topic, payload)
+                        }
+                        BackgroundTaskStatus::Failed => {
+                            let topic = task_failed_topic().to_string();
+                            let payload = build_task_failed_payload(
+                                proj,
+                                ms,
+                                &task_id_clone,
+                                final_result.error.as_deref().unwrap_or("failed"),
+                                final_result.error.as_deref(),
+                                &timestamp,
+                                chain,
+                                session,
+                            )
+                            .to_string();
+                            (topic, payload)
+                        }
+                    };
+                    tokio::spawn(async move {
+                        let _ = crate::mqtt_bus::publish(&topic, payload.into_bytes(), false).await;
+                    });
+                }
+
+                // Drop the live cancel token now the task has settled.
+                Self::background_task_cancels().lock().remove(&task_id_clone);
+
                 // Release both admissions only after the terminal result write
                 // completed (success, failure, or cancellation settlement):
                 // until now they blocked delete/rename of the target and of the
                 // caller workspace owner this task writes into.
                 drop(caller_execution_admission);
                 drop(target_execution_admission);
-                            },
-                        ),
-                    ),
-                ),
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -7179,6 +7520,11 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            project_id: None,
+            milestone_id: None,
+            chain_id: None,
+            ttl_seconds: 300,
+            session_id: None,
         }
     }
 
@@ -12528,6 +12874,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn results_dir_defaults_to_delegate_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_default_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "default results_dir should be delegate_results (upstream behavior)"
+        );
+    }
+
+    #[test]
+    fn results_dir_config_override_honored() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_override_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = DelegateToolConfig {
+            results_dir: Some("event_engine/tasks".into()),
+            ..DelegateToolConfig::default()
+        };
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_delegate_config(cfg)
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("event_engine/tasks"),
+            "results_dir should honor the config override, not delegate_results"
+        );
+        assert_ne!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "overridden results_dir must NOT fall back to delegate_results"
+        );
     }
 
     // ── Background and Parallel execution tests ─────────────────────
@@ -19191,6 +19579,203 @@ command = "rm independent-delegate-marker"
         );
     }
 
+    // ── R4: event-driven arg parsing tests ─────────────────────────
+
+    #[test]
+    fn parse_delegate_event_args_with_all_fields() {
+        let args = serde_json::json!({
+            "project_id": "p1",
+            "milestone_id": "m1",
+            "chain_id": "c1",
+            "ttl_seconds": 600,
+            "session_id": "s1",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id.as_deref(), Some("p1"));
+        assert_eq!(parsed.milestone_id.as_deref(), Some("m1"));
+        assert_eq!(parsed.chain_id.as_deref(), Some("c1"));
+        assert_eq!(parsed.ttl_seconds, 600);
+        assert_eq!(parsed.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn parse_delegate_event_args_defaults_when_absent() {
+        let args = serde_json::json!({});
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.ttl_seconds, 300, "default ttl_seconds should be 300");
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_empty_strings_become_none() {
+        let args = serde_json::json!({
+            "project_id": "",
+            "milestone_id": "",
+            "chain_id": "",
+            "session_id": "",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None, "empty string should map to None");
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_ttl_falls_back_to_default() {
+        let args = serde_json::json!({
+            "ttl_seconds": "not_a_number",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.ttl_seconds, 300);
+    }
+
+    #[cfg(feature = "channel-mqtt")]
+    #[test]
+    fn task_event_topics_are_fixed() {
+        // M2 Part B: task events use FIXED topics (no parameterized hierarchy).
+        assert_eq!(task_started_topic(), "zeroclaw/tasks/started");
+        assert_eq!(task_completed_topic(), "zeroclaw/tasks/completed");
+        assert_eq!(task_failed_topic(), "zeroclaw/tasks/failed");
+    }
+
+    #[test]
+    fn build_task_started_payload_fields() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+            Some(600),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        assert_eq!(payload["ttl_seconds"], 600);
+        // No 'agent' field — it lives in the delegate result file.
+        assert!(payload.get("agent").is_none(), "agent must not be in the payload");
+        // No 'started_at' field — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none(), "started_at must not be in the payload");
+    }
+
+    #[test]
+    fn build_task_started_payload_optionals_null() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+        assert_eq!(payload["ttl_seconds"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_completed_payload_completed() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "completed",
+            Some("task output here"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["result"], "task output here");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'started_at'/'finished_at' — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+        // No 'error' field on the completed topic.
+        assert!(payload.get("error").is_none());
+    }
+
+    #[test]
+    fn build_task_completed_payload_cancelled() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "cancelled",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["result"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_failed_payload_fields() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "timeout",
+            Some("full error detail"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["reason"], "timeout");
+        assert_eq!(payload["error"], "full error detail");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'status' field on the failed topic — the topic itself signals failure.
+        assert!(payload.get("status").is_none());
+        // No 'started_at'/'finished_at'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+    }
+
+    #[test]
+    fn build_task_failed_payload_minimal() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "failed",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["reason"], "failed");
+        assert_eq!(payload["error"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+    }
+
     #[test]
     fn resolve_brain_non_oauth_fallback_preserved() {
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
@@ -21518,6 +22103,26 @@ command = "rm independent-delegate-marker"
             result.error.is_some(),
             "configless delegate must surface a clean tool error: {result:?}"
         );
+
+    #[test]
+    fn parameter_schema_includes_event_args() {
+        // Verify the 5 event-driven args are present in the parameter schema.
+        let config = Arc::new(zeroclaw_config::schema::Config::default());
+        let tool = delegate_tool_for_config(config);
+        let schema = crate::tools::Tool::parameters_schema(&tool);
+        for key in [
+            "project_id",
+            "milestone_id",
+            "chain_id",
+            "ttl_seconds",
+            "session_id",
+        ] {
+            assert!(
+                schema["properties"].get(key).is_some(),
+                "delegate parameter schema must carry {key} for the event-driven swarm",
+            );
+        }
+    }
     }
 }
 

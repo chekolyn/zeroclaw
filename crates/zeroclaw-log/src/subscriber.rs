@@ -47,7 +47,26 @@ pub fn install_global_subscriber(
         .event_format(AgentAliasFormatter::new())
         .with_filter(fmt_filter);
 
-    let subscriber = tracing_subscriber::registry()
+    // OTel bridge: a `reload` slot so the subscriber can be installed now
+    // (boot logs land) with a no-op bridge, then the real bridge swapped in
+    // once the global tracer provider is set later in boot. The handle is
+    // stashed process-globally so the observer init can call
+    // `activate_otel_bridge()` without threading it through call sites.
+    //
+    // The slot MUST be added to `registry()` directly (S=Registry): the
+    // `OpenTelemetryLayer` is parameterized by the subscriber type, and we
+    // fixed it to `Registry`. Adding it after the filtered/fmt layers (where
+    // the subscriber is already `Layered<...>`) would be a type mismatch.
+    let subscriber = tracing_subscriber::registry();
+
+    #[cfg(feature = "otel-bridge")]
+    let subscriber = subscriber.with({
+        let (slot, handle) = crate::otel_bridge::build_otel_bridge_slot();
+        crate::otel_bridge::stash_otel_bridge_handle(handle);
+        slot
+    });
+
+    let subscriber = subscriber
         .with(LogCaptureLayer.with_filter(recording_filter))
         .with(fmt_layer);
 

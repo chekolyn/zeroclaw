@@ -9,6 +9,8 @@ pub mod layer;
 mod log_bridge;
 pub mod migrate;
 pub mod observer_bridge;
+#[cfg(feature = "otel-bridge")]
+pub mod otel_bridge;
 pub mod reader;
 mod subscriber;
 pub mod tool_io;
@@ -69,6 +71,8 @@ pub mod field {
 
 pub use migrate::migrate_legacy_jsonl_in_place;
 pub use observer_bridge::{clear_observer_bridge, set_observer_bridge};
+#[cfg(feature = "otel-bridge")]
+pub use otel_bridge::activate_otel_bridge;
 pub use reader::{
     LogFilter, LogPage, SegmentCursor, current_log_path, find_event_across_segments,
     find_event_by_id, load_page, query_log_page,

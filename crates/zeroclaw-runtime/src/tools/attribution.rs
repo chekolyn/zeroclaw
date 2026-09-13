@@ -12,6 +12,8 @@ use crate::tools::delegate::DelegateTool;
 use crate::tools::deliver_file::DeliverFileTool;
 use crate::tools::file_read::FileReadTool;
 use crate::tools::model_switch::ModelSwitchTool;
+#[cfg(feature = "channel-mqtt")]
+use crate::tools::mqtt_publish::MqttPublishTool;
 use crate::tools::read_skill::ReadSkillTool;
 use crate::tools::schedule::ScheduleTool;
 use crate::tools::security_ops::SecurityOpsTool;
@@ -38,6 +40,8 @@ tool_attribution!(DelegateTool, ToolKind::Plugin);
 tool_attribution!(DeliverFileTool, ToolKind::Plugin);
 tool_attribution!(FileReadTool, ToolKind::Plugin);
 tool_attribution!(ModelSwitchTool, ToolKind::Plugin);
+#[cfg(feature = "channel-mqtt")]
+tool_attribution!(MqttPublishTool, ToolKind::Plugin);
 tool_attribution!(ReadSkillTool, ToolKind::Plugin);
 tool_attribution!(ScheduleTool, ToolKind::Plugin);
 tool_attribution!(SecurityOpsTool, ToolKind::Plugin);

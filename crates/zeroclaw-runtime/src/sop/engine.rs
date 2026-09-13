@@ -158,6 +158,8 @@ pub struct MaintenanceSummary {
     /// whose driver a reload aborted) terminalized on a retry after the first
     /// terminal write failed.
     pub settled_orphaned_runs: usize,
+    /// `Running` runs reaped by the stuck-run timeout.
+    pub reaped_stuck_runs: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -173,6 +175,7 @@ impl MaintenanceSummary {
             && self.finalized_cancellations == 0
             && self.finalized_step_budget_failures == 0
             && self.settled_orphaned_runs == 0
+            && self.reaped_stuck_runs == 0
     }
 }
 
@@ -862,6 +865,7 @@ impl SopEngine {
                         )
                     );
                 }
+                self.truncate_finished_runs_to_max();
             }
             Err(e) => {
                 let span = ::zeroclaw_log::info_span!(
@@ -2099,6 +2103,36 @@ impl SopEngine {
         event: SopEvent,
         initiator: Option<&str>,
     ) -> Result<SopRunAction> {
+        // Skip-at-dispatch: a Deterministic SOP with no gateway-runnable step is
+        // handled entirely by the sidecar (a Python handler). The gateway reads
+        // the STEP KIND (execution_mode + step.kind), never the `executor`
+        // field. A Deterministic SOP with neither a `Capability` step (headless-
+        // drivable) nor a `Checkpoint` step (a gateway approval pause) has
+        // nothing the gateway can run: its `Execute` steps require an external
+        // driver and would only fail headlessly ("requires an external
+        // driver"). Creating a gateway run for it is the sidecar double-dispatch
+        // bug, so release the reservation and return `Skipped` WITHOUT creating
+        // a run — before the `active_runs.insert` below.
+        if reservation.sop.execution_mode == SopExecutionMode::Deterministic
+            && !reservation
+                .sop
+                .steps
+                .iter()
+                .any(|s| s.kind == SopStepKind::Capability)
+            && !reservation
+                .sop
+                .steps
+                .iter()
+                .any(|s| s.kind == SopStepKind::Checkpoint)
+        {
+            let sop_name = reservation.sop.name.clone();
+            self.release_reservation(reservation);
+            return Ok(SopRunAction::Skipped {
+                sop_name,
+                reason: "no gateway-runnable (Capability) step; handled by sidecar".into(),
+            });
+        }
+
         let StartReservation {
             run_id,
             claim,
@@ -5749,7 +5783,9 @@ impl SopEngine {
         let settled_orphaned_runs = self.retry_pending_orphan_settlements();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
+        let reaped_stuck_runs = self.reap_stuck_running_runs();
         let pruned_runs = self.prune_terminal_runs();
+        self.truncate_finished_runs_to_max();
         MaintenanceSummary {
             timed_out,
             reaped_claims,
@@ -5757,6 +5793,7 @@ impl SopEngine {
             finalized_cancellations,
             finalized_step_budget_failures,
             settled_orphaned_runs,
+            reaped_stuck_runs,
             timeout_actions,
         }
     }
@@ -5887,6 +5924,58 @@ impl SopEngine {
                 0
             }
         }
+    }
+
+    /// Cap the in-memory `finished_runs` window to `max_finished_runs` (newest
+    /// kept; `finished_runs` is kept sorted ascending by `started_at`, so the
+    /// oldest are drained first). The store's `load_terminal_runs` and `prune`
+    /// do not enforce the limit on all backends, so the engine truncates the
+    /// display window itself to keep the Runs surface bounded.
+    fn truncate_finished_runs_to_max(&mut self) {
+        let max = self.config.max_finished_runs;
+        if max > 0 && self.finished_runs.len() > max {
+            let excess = self.finished_runs.len() - max;
+            self.finished_runs.drain(..excess);
+        }
+    }
+
+    /// Reap SOP runs stuck in `Running` longer than `stuck_run_timeout_secs`:
+    /// finalize each as `Failed` with a "stuck-run timeout" reason. Best-effort;
+    /// a store error on finish is surfaced by `finish_run`. Returns the count
+    /// reaped. `stuck_run_timeout_secs == 0` disables the reaper.
+    fn reap_stuck_running_runs(&mut self) -> usize {
+        let timeout_secs = self.config.stuck_run_timeout_secs;
+        if timeout_secs == 0 {
+            return 0;
+        }
+        let stuck: Vec<String> = self
+            .active_runs
+            .values()
+            .filter(|r| r.status == SopRunStatus::Running)
+            .filter(|r| cooldown_elapsed(&r.started_at, timeout_secs))
+            .map(|r| r.run_id.clone())
+            .collect();
+        let mut reaped = 0;
+        for run_id in stuck {
+            match self.finish_run(
+                &run_id,
+                SopRunStatus::Failed,
+                Some("stuck-run timeout".to_string()),
+            ) {
+                Ok(_) => reaped += 1,
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": e.to_string(),
+                        })),
+                    "SOP maintenance: failed to reap stuck running run"
+                ),
+            }
+        }
+        reaped
     }
 
     /// Re-stamp a run's `waiting_since` to now (timeout escalation: the gate stays
@@ -6020,6 +6109,11 @@ impl SopEngine {
             self.finished_runs.drain(..excess);
         }
 
+        // Prune the persisted run store to the same retention cap so the durable
+        // terminal records stay bounded on the finish path (not only on the
+        // maintenance tick). Best-effort; a store error is logged by the helper.
+        self.prune_terminal_runs();
+
         Ok(match status {
             SopRunStatus::Failed => SopRunAction::Failed {
                 run_id: run_id_owned,
@@ -6074,6 +6168,9 @@ impl SopEngine {
             let excess = self.finished_runs.len() - max;
             self.finished_runs.drain(..excess);
         }
+
+        // Prune the persisted run store on the finish path too (see finish_run).
+        self.prune_terminal_runs();
 
         Ok(match status {
             SopRunStatus::Failed => SopRunAction::Failed {
@@ -7163,6 +7260,7 @@ mod tests {
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Cancelled { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
+            SopRunAction::Skipped { .. } => "",
         }
     }
 
@@ -7708,7 +7806,7 @@ mod tests {
     fn cron_trigger_matches_only_matching_expression() {
         let sop = Sop {
             triggers: vec![SopTrigger::Cron {
-                expression: "0 */5 * * *".into(),
+                expression: Some("0 */5 * * *".into()),
             }],
             ..test_sop("cron-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -7853,6 +7951,150 @@ mod tests {
     }
 
     // ── Run lifecycle ───────────────────────────────────
+
+    /// Build a Deterministic SOP whose steps are ALL `Execute` (no `Capability`,
+    /// no `Checkpoint`) — the sidecar profile that `activate_reserved_run` must
+    /// skip at dispatch.
+    fn det_all_execute_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic all-execute SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Step two".into(),
+                    body: "Do step two".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    /// Build a Deterministic SOP with one `Capability` ("noop") step — the
+    /// gateway-runnable profile that must NOT be skipped.
+    fn det_capability_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic capability SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Capability step".into(),
+                body: "Run the noop capability".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::Capability,
+                schema: None,
+                capability: Some("noop".into()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn start_run_skips_deterministic_sop_with_no_capability_step() {
+        // Skip-at-dispatch: a Deterministic SOP whose steps are all `Execute` (no
+        // gateway-runnable Capability step) is handled by the sidecar. The gateway
+        // must NOT create a run for it — return `Skipped` and leave
+        // `active_runs` empty.
+        let mut engine = engine_with_sops(vec![det_all_execute_sop("det-sidecar")]);
+        let action = engine.start_run("det-sidecar", manual_event()).unwrap();
+        assert!(
+            matches!(
+                &action,
+                SopRunAction::Skipped {
+                    sop_name,
+                    reason,
+                } if sop_name == "det-sidecar"
+                    && reason.contains("sidecar")
+            ),
+            "a Deterministic all-Execute SOP must skip at dispatch, got {action:?}"
+        );
+        assert!(
+            engine.active_runs().is_empty(),
+            "no run must be created for a skipped sidecar SOP"
+        );
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            0,
+            "a skipped SOP must not leave a finished (failed/completed) run either"
+        );
+    }
+
+    #[test]
+    fn start_run_does_not_skip_deterministic_sop_with_capability_step() {
+        // A Deterministic SOP that has a `Capability` step IS gateway-runnable — it
+        // must not be skipped; the gateway creates a run and (for a single
+        // capability step) drives it to a terminal action.
+        let mut engine = engine_with_sops(vec![det_capability_sop("det-cap")]);
+        let action = engine.start_run("det-cap", manual_event()).unwrap();
+        assert!(
+            !matches!(action, SopRunAction::Skipped { .. }),
+            "a Deterministic SOP with a Capability step must not be skipped, got {action:?}"
+        );
+        assert_eq!(
+            engine.active_runs().len(),
+            0,
+            "the single capability step drains headlessly; no active run remains"
+        );
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            1,
+            "the capability run completes (a run WAS created, unlike the skip case)"
+        );
+    }
+
+    #[test]
+    fn start_run_does_not_skip_auto_sop() {
+        // An `Auto` SOP is never in scope for the Deterministic-only skip — it
+        // must create a run and return an `ExecuteStep` (the first LLM step).
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { .. }),
+            "an Auto SOP must not be skipped, got {action:?}"
+        );
+        assert_eq!(engine.active_runs().len(), 1);
+    }
 
     #[test]
     fn start_run_returns_first_step() {
@@ -8280,7 +8522,7 @@ mod tests {
             input: Some(required_object_schema("ok")),
             output: None,
         });
-        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]).with_store(store.clone());
 
         let err = engine
             .start_deterministic_run("det-schema-start-finish-fail", manual_event())
@@ -13987,6 +14229,168 @@ mod tests {
         assert_eq!(finished[1].run_id, finished_ids[2]);
     }
 
+    // T2: the persisted run store must also be pruned to `max_finished_runs` on
+    // the finish path (not only on the maintenance tick), so the durable
+    // terminal records stay bounded.
+    #[test]
+    fn finish_run_prunes_persisted_store_to_max() {
+        let mut engine = SopEngine::new(SopConfig {
+            max_finished_runs: 2,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        for _ in 0..4 {
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let rid = extract_run_id(&action).to_string();
+            engine
+                .advance_step(
+                    &rid,
+                    SopStepResult {
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "ok".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        effective_agent: None,
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            engine.finished_runs(None).len(),
+            2,
+            "in-memory finished_runs must cap at max_finished_runs"
+        );
+        assert_eq!(
+            engine.terminal_run_count(),
+            2,
+            "persisted run store must also be pruned to max_finished_runs on finish"
+        );
+    }
+
+    // T3: a SOP run stuck in `Running` longer than `stuck_run_timeout_secs` must
+    // be reaped to `Failed` by the maintenance tick.
+    #[test]
+    fn reap_stuck_running_runs_finalizes_overdue_runs() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 60,
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        // Force the run's started_at to be ancient (well past the 60s timeout).
+        if let Some(run) = engine.active_runs.get_mut(&rid) {
+            run.started_at = "2020-01-01T00:00:00Z".to_string();
+        }
+
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 1, "overdue running run should be reaped");
+
+        let finished = engine.finished_runs(None);
+        assert_eq!(finished.len(), 1, "reaped run should land in finished_runs");
+        assert!(matches!(finished[0].status, SopRunStatus::Failed));
+    }
+
+    #[test]
+    fn reap_stuck_running_runs_skips_fresh_runs() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 3600, // 1h
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        // started_at is now() -> not overdue
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 0, "fresh run should not be reaped");
+        assert!(engine.active_runs.contains_key(&rid), "fresh run must stay active");
+    }
+
+    #[test]
+    fn reap_stuck_running_runs_disabled_when_timeout_zero() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 0, // disabled
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        if let Some(run) = engine.active_runs.get_mut(&rid) {
+            run.started_at = "2020-01-01T00:00:00Z".to_string();
+        }
+
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.reaped_stuck_runs, 0, "timeout=0 disables the reaper");
+        assert!(engine.active_runs.contains_key(&rid), "run must stay active when reaper disabled");
+    }
+
+    #[test]
+    fn maintenance_tick_truncates_finished_runs_to_max() {
+        // The store's `load_terminal_runs` may return more than
+        // `max_finished_runs` (it does not enforce the limit on all backends).
+        // The maintenance tick must cap the in-memory display window itself.
+        let mut engine = SopEngine::new(SopConfig {
+            max_finished_runs: 3,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+        for _ in 0..3 {
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let rid = extract_run_id(&action).to_string();
+            engine
+                .advance_step(
+                    &rid,
+                    SopStepResult {
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "ok".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        effective_agent: None,
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.finished_runs.len(), 3);
+        // Simulate a buggy restore that loaded more than max.
+        for _ in 0..3 {
+            engine.finished_runs.push(engine.finished_runs[0].clone());
+        }
+        assert_eq!(engine.finished_runs.len(), 6);
+        engine.run_maintenance_tick();
+        assert!(
+            engine.finished_runs.len() <= 3,
+            "maintenance tick must truncate to max_finished_runs, got {}",
+            engine.finished_runs.len()
+        );
+    }
+
     #[test]
     fn max_finished_runs_zero_means_unlimited() {
         let mut engine = SopEngine::new(SopConfig {
@@ -14289,7 +14693,7 @@ mod tests {
                 ..SopStep::default()
             },
         ];
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
 
         let action = engine.start_run("det-sop", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
@@ -14309,7 +14713,9 @@ mod tests {
         // Check savings
         let savings = engine.deterministic_savings();
         assert_eq!(savings.total_runs, 1);
-        assert_eq!(savings.total_llm_calls_saved, 2);
+        // 2 Execute steps + the tail noop Capability step all complete and each
+        // saved an LLM call.
+        assert_eq!(savings.total_llm_calls_saved, 3);
     }
 
     #[test]
@@ -14418,6 +14824,28 @@ type = "manual"
         }
     }
 
+    /// Append a `noop` `Capability` step (numbered after the last step) so a
+    /// Deterministic SOP is gateway-runnable and NOT skipped at dispatch — while
+    /// leaving the steps the test actually exercises (1..n) untouched. The
+    /// appended step is only reached if a test drives the run to completion past
+    /// its last exercised step, in which case the capability executes inline
+    /// and the run still reaches the same terminal outcome the test asserts.
+    fn with_tail_capability(mut sop: Sop) -> Sop {
+        let next_number = sop.steps.iter().map(|s| s.number).max().unwrap_or(0) + 1;
+        sop.steps.push(SopStep {
+            number: next_number,
+            title: "Tail capability".into(),
+            body: "noop capability so the SOP is gateway-runnable".into(),
+            suggested_tools: vec![],
+            requires_confirmation: false,
+            kind: SopStepKind::Capability,
+            schema: None,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        });
+        sop
+    }
+
     #[test]
     fn deterministic_decision_part_is_skipped_and_its_input_passed_on() {
         let mut sop = deterministic_sop_all_execute("det-parts");
@@ -14482,7 +14910,8 @@ type = "manual"
 
     #[test]
     fn deterministic_run_drives_to_completion_through_advance_step() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-run")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-run"))]);
         let action = engine.start_run("det-run", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(
@@ -14539,7 +14968,7 @@ type = "manual"
             ..SopStep::default()
         });
         sop.steps[0].routing.next = Some(3);
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
         let action = engine.start_run("det-route", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(
@@ -14599,7 +15028,8 @@ type = "manual"
 
     #[test]
     fn deterministic_failed_step_fails_run_through_advance_step() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-fail")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-fail"))]);
         let action = engine.start_run("det-fail", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -14630,7 +15060,7 @@ type = "manual"
             input: None,
             output: Some(required_object_schema("ok")),
         });
-        let mut engine = engine_with_sops(vec![sop]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
         let action = engine.start_run("det-schema", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -14647,7 +15077,8 @@ type = "manual"
 
     #[test]
     fn deterministic_advance_step_preserves_caller_timestamps() {
-        let mut engine = engine_with_sops(vec![deterministic_sop_all_execute("det-ts")]);
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-ts"))]);
         let action = engine.start_run("det-ts", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 

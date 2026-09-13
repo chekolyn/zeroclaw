@@ -21,6 +21,8 @@ pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
+#[cfg(feature = "channel-mqtt")]
+pub mod mqtt_publish;
 pub mod read_skill;
 mod runtime_command_error;
 pub mod schedule;
@@ -174,6 +176,8 @@ pub use deliver_file::{
 };
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
+#[cfg(feature = "channel-mqtt")]
+pub use mqtt_publish::MqttPublishTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
@@ -1805,6 +1809,13 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default()))
     );
     register_tool!("TodoWrite", Arc::new(TodoWriteTool::new()));
+
+    // mqtt_publish — event-bus publisher for the event-driven swarm engine.
+    // Only available when the channel-mqtt feature is compiled in. Kept
+    // outside `register_tool!` deliberately: the swarm substrate must not
+    // be subject to `[tools] optional` selection.
+    #[cfg(feature = "channel-mqtt")]
+    tool_arcs.push(Arc::new(MqttPublishTool::new()));
 
     // Register discord_search if any configured Discord alias has
     // archive enabled. Multiple Discord aliases are supported (one per
