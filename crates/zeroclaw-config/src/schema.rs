@@ -11823,8 +11823,18 @@ pub struct MemoryConfig {
     /// Namespaces protected from budget eviction.
     #[serde(default)]
     pub pin_namespaces: Vec<String>,
+    /// Namespaces excluded from recall by default (telemetry, etc.). Agents can
+    /// override with an explicit scope param or scope="all".
+    #[serde(default)]
+    pub exclude_namespaces: Vec<String>,
+    /// Categories excluded from recall by default (e.g. "sop" for SOP telemetry).
+    #[serde(default)]
+    pub exclude_categories: Vec<String>,
+    /// Key prefixes excluded from recall by default (e.g. "user_msg_", "heartbeat_").
+    #[serde(default)]
+    pub exclude_key_prefixes: Vec<String>,
     /// Pin entries at or above this importance. >1.0 means disabled.
-    #[serde(default = "default_pin_min_importance")]
+    #[serde(default = "default_pin_min_importance")
     pub pin_min_importance: f64,
 
     // ── Audit Trail ─────────────────────────────────────────────

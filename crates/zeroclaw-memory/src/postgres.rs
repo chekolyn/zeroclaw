@@ -414,7 +414,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance,
                        (
                          CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
@@ -459,7 +459,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1
@@ -484,7 +484,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1 AND m.agent_id = $2
@@ -513,7 +513,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($1::TEXT IS NULL OR m.category = $1)
@@ -604,7 +604,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
@@ -702,8 +702,8 @@ impl Memory for PostgresMemory {
         content: &str,
         category: MemoryCategory,
         session_id: Option<&str>,
-        _namespace: Option<&str>,
-        _importance: Option<f64>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
         let client = self.client.get().clone();
@@ -721,23 +721,28 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id, agent_id)
+                    (id, key, content, category, created_at, updated_at, session_id, agent_id, namespace, importance)
                 VALUES
                     ($1, $2, $3, $4, $5, $6, $7,
-                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
+                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                     COALESCE($9, 'default'), COALESCE($10, 0.5))
                 ON CONFLICT (agent_id, key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
                     updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
+                    session_id = EXCLUDED.session_id,
+                    namespace = EXCLUDED.namespace,
+                    importance = EXCLUDED.importance
                 "
             );
 
             let id = Uuid::new_v4().to_string();
+            let ns = namespace.map(str::to_string).unwrap_or_else(|| "default".to_string());
+            let imp = importance.unwrap_or(0.5);
             client.execute(
                 &stmt,
-                &[&id, &key, &content, &category, &now, &now, &sid, &aid],
-            )?;
+                &[&id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp],
+            )?;;
             Ok(())
         })
         .await
@@ -777,7 +782,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance,
                        (
                          CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
