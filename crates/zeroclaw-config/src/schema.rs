@@ -11834,7 +11834,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub exclude_key_prefixes: Vec<String>,
     /// Pin entries at or above this importance. >1.0 means disabled.
-    #[serde(default = "default_pin_min_importance")
+    #[serde(default = "default_pin_min_importance")]
     pub pin_min_importance: f64,
 
     // ── Audit Trail ─────────────────────────────────────────────
