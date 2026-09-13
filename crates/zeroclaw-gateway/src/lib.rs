@@ -1617,11 +1617,11 @@ pub async fn run_gateway(
         gmail_push: gmail_push_channel,
         #[cfg(feature = "channel-webhook")]
         webhook_secret_hash: None,
-        generic_webhook_secrets: generic_webhook_secrets,
+        generic_webhook_secrets: HashMap::new(),
         #[cfg(feature = "channel-webhook")]
-        generic_webhook_aliases: generic_webhook_aliases,
+        generic_webhook_aliases: HashMap::new(),
         #[cfg(feature = "channel-webhook")]
-        generic_webhook_signature_headers: generic_webhook_signature_headers,
+        generic_webhook_signature_headers: HashMap::new(),
         observer: state_observer,
         tools_registry,
         tools_registry_by_agent,
