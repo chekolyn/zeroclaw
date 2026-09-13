@@ -176,6 +176,23 @@ impl Tool for MemoryRecallTool {
                 error: None,
             }),
             Ok(entries) => {
+                // Three-axis inclusion filtering (category + namespace + key_prefix)
+                let category_f = args.get("category").and_then(|v| v.as_str());
+                let namespace_f = args.get("namespace").and_then(|v| v.as_str());
+                let key_prefix_f = args.get("key_prefix").and_then(|v| v.as_str());
+                let entries: Vec<_> = entries
+                    .into_iter()
+                    .filter(|e| category_f.map_or(true, |c| e.category.to_string().to_lowercase() == c.to_lowercase()))
+                    .filter(|e| namespace_f.map_or(true, |ns| e.namespace == ns))
+                    .filter(|e| key_prefix_f.map_or(true, |kp| e.key.starts_with(kp)))
+                    .collect();
+                if entries.is_empty() {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: "No memories found.".into(),
+                        error: None,
+                    });
+                }
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
                     let score = entry
