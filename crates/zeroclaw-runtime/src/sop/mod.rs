@@ -35,7 +35,10 @@ pub use engine::{
     CancelOutcome, MaintenanceSummary, SopEngine, err_is_cancellation_persistence_retained,
     err_is_resume_at_capacity, err_is_terminal_persistence_retained,
 };
-pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
+pub use executor::{
+    SopDriverHandles, SopDriverRegistry, SopDriverSink, drive_resumed_broker_action,
+    register_sop_driver, spawn_headless_run_driver,
+};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
     GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState,
@@ -251,14 +254,54 @@ pub fn load_sops(
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
-/// Load a single SOP by directory name from the SOPs root. Errors if the
-/// directory or its `SOP.toml` is missing or malformed.
+/// Load a single SOP by its declared `name` from the SOPs root.
+///
+/// Resolution is by the SOP's declared `name` field (the same identity the
+/// loader `load_sops_from_directory` and the CLI use), NOT by directory name:
+///
+///   1. Fast path — if a directory literally named `<name>` exists under
+///      `sops_dir` (the upstream flat layout `sops/<name>/`), load it directly.
+///      This is the common case and avoids scanning.
+///   2. Fallback — scan the immediate subdirectories of `sops_dir` and load the
+///      first whose `SOP.toml` declares `name == <name>`. This supports SOPs whose
+///      directory is namespaced (e.g. `sops/<scope>-<domain>-<trigger>-<verb-noun>/`
+///      with `name = "<verb-noun>"`), for which the literal path would not exist.
+///
+/// The path-traversal guard from `resolve_sop_dir` still runs first, so a
+/// caller-controlled `name` can never escape the SOP root: the fallback scan
+/// uses `name` only to match the declared `name` field, never as a path
+/// component. Errors if no SOP with that declared name exists.
 pub fn load_sop_by_name(
     sops_dir: &Path,
     name: &str,
     default_execution_mode: SopExecutionMode,
 ) -> Result<Sop> {
-    load_sop(&resolve_sop_dir(sops_dir, name)?, default_execution_mode)
+    // Guard first: reject multi-component / traversal names before any scan.
+    let literal = resolve_sop_dir(sops_dir, name)?;
+    if literal.exists() {
+        return load_sop(&literal, default_execution_mode);
+    }
+
+    // Fallback: scan immediate subdirectories for one whose declared `name`
+    // field matches. Reuses `load_sop` so malformed manifests are skipped
+    // (matching `load_sops_from_directory`'s tolerant behavior).
+    let Ok(entries) = std::fs::read_dir(sops_dir) else {
+        anyhow::bail!("SOP '{name}' not found");
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path.join("SOP.toml").exists() {
+            continue;
+        }
+        match load_sop(&path, default_execution_mode) {
+            Ok(sop) if sop.name == name => return Ok(sop),
+            _ => continue,
+        }
+    }
+    anyhow::bail!("SOP '{name}' not found");
 }
 
 /// Delete an SOP's directory (manifest, steps, everything). Errors if no
@@ -1292,6 +1335,115 @@ fn validate_planned_call_bindings(
     }
 }
 
+/// `execute` step numbers that resolve no owning agent, from the step's own
+/// `agent` or the procedure's.
+///
+/// One source for both the authoring gate and the run surfaces that start a
+/// procedure with no ambient agent turn, so a start can never be permitted on a
+/// rule the executing driver does not share. `checkpoint` and `capability` steps
+/// are exempt — they park for approval and run through the deterministic
+/// capability registry respectively, neither of which assumes an agent.
+#[must_use]
+pub fn unowned_execute_steps(sop: &Sop) -> Vec<u32> {
+    let has_owner = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|alias| !alias.trim().is_empty())
+    };
+    if has_owner(&sop.agent) {
+        return Vec::new();
+    }
+    sop.steps
+        .iter()
+        .filter(|step| step.kind == SopStepKind::Execute && !has_owner(&step.agent))
+        .map(|step| step.number)
+        .collect()
+}
+
+/// The refusal a headless start surface returns for a procedure whose `execute`
+/// steps resolve no owner. `None` when every step has one.
+///
+/// Phrased for the operator who pressed the button rather than for the author,
+/// but drawn from [`unowned_execute_steps`] — the same rule the authoring gate
+/// and the headless driver apply.
+#[must_use]
+pub fn headless_ownership_refusal(sop: &Sop) -> Option<String> {
+    let steps = unowned_execute_steps(sop);
+    if steps.is_empty() {
+        return None;
+    }
+    let numbers = steps
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SOP '{}' cannot be started here: step(s) [{numbers}] resolve no owning agent, and a run \
+         started outside an agent turn has none to inherit. Set `agent` on the SOP or on the \
+         step, or start the procedure from an agent with `sop_execute`.",
+        sop.name
+    ))
+}
+
+/// Every `execute` step reachable by a headless trigger must resolve an owning
+/// agent.
+///
+/// Blocking rather than advisory: a headless trigger has no ambient agent turn
+/// to borrow an identity from, so the headless driver refuses an unowned step
+/// outright. Saving such a SOP produces a procedure that fires on schedule and
+/// then fails every run at dispatch.
+///
+/// `manual` is the one trigger that can start from either side, so it warns
+/// instead of blocking: through `sop_execute` the calling agent owns the run and
+/// no declared owner is needed, but the dashboard's run endpoint emits the same
+/// Manual event from outside any agent turn and hands the run to the headless
+/// driver. That endpoint refuses an unowned procedure at start
+/// ([`headless_ownership_refusal`]); blocking the save instead would force an
+/// owner on every ordinary agent-driven procedure.
+fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let unowned = unowned_execute_steps(sop);
+    if unowned.is_empty() {
+        return;
+    }
+    let mut sources: Vec<String> = sop
+        .triggers
+        .iter()
+        .filter(|trigger| trigger.is_headless())
+        .map(|trigger| trigger.source().to_string())
+        .collect();
+    sources.sort();
+    sources.dedup();
+
+    if sources.is_empty() {
+        if sop
+            .triggers
+            .iter()
+            .any(|trigger| matches!(trigger, SopTrigger::Manual))
+        {
+            warnings.push(format!(
+                "Step(s) [{}]: no owning agent. `sop_execute` runs these under the calling agent, \
+                 but a dashboard-started run has no agent turn to inherit from and will be \
+                 refused. Set `agent` on the SOP or on the step to make it startable from the \
+                 dashboard.",
+                unowned
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return;
+    }
+
+    for step in unowned {
+        blocking.push(format!(
+            "Step {step}: no owning agent for headless trigger(s) [{}]. Set `agent` on the SOP or \
+             on the step; a headless run has no agent turn to inherit one from.",
+            sources.join(", ")
+        ));
+    }
+}
+
 /// Result of `validate_sop_strict`: `blocking` problems reject a save,
 /// `warnings` surface in editors but do not block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1328,6 +1480,7 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     }
 
     let mut warnings = Vec::new();
+    validate_headless_ownership(sop, &mut blocking, &mut warnings);
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
 
     let graph = SopGraph::from_sop(sop);
@@ -1611,6 +1764,65 @@ mod tests {
         assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
     }
 
+    /// A SOP whose directory is *namespaced* (dir name != declared `name` field,
+    /// e.g. `sops/harness-gov-mqtt-cb-1-permission-deadlock/` with
+    /// `name = "cb-1-permission-deadlock"`) must still be loadable by its
+    /// declared name. The web `/api/sops/{name}/graph` endpoint and the RPC
+    /// `sops/graph` method route through `load_sop_by_name`; without a
+    /// by-name-field fallback they 404 with "No such file or directory (os error 2)"
+    /// for every namespaced SOP, while the CLI (which scans + matches by `name`)
+    /// works. This test pins the unified behavior.
+    #[test]
+    fn load_sop_by_name_resolves_namespaced_dir_by_name_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First"), titled_step(2, "Second")]);
+
+        // Write the SOP under a namespaced directory whose name != the SOP's
+        // declared `name` ("authoring"), mirroring the chart's
+        // `<scope>-<domain>-<trigger>-<verb-noun>/` layout.
+        save_sop(dir.path(), &sop).unwrap();
+        let namespaced = "harness-gov-mqtt-authoring";
+        std::fs::rename(dir.path().join("authoring"), dir.path().join(namespaced))
+            .expect("rename to namespaced dir");
+        assert!(!dir.path().join("authoring").exists());
+        assert!(dir.path().join(namespaced).is_dir());
+
+        // Literal path `sops/authoring/` does not exist → must fall back to a
+        // scan that matches the declared `name` field.
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.name, "authoring");
+        assert_eq!(loaded.steps, sop.steps);
+    }
+
+    /// When BOTH a flat `sops/<name>/` and a namespaced dir declaring the same
+    /// `name` exist, the flat (literal) directory wins — deterministic fast
+    /// path, no scan ambiguity.
+    #[test]
+    fn load_sop_by_name_prefers_flat_dir_when_both_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = authoring_sop(vec![titled_step(1, "Flat-only step")]);
+        save_sop(dir.path(), &flat).unwrap(); // creates sops/authoring/
+
+        let mut namespaced = authoring_sop(vec![titled_step(1, "Namespaced-only step")]);
+        // Give the namespaced copy a distinct step so we can tell them apart.
+        save_sop(dir.path(), &namespaced).unwrap();
+        std::fs::rename(
+            dir.path().join("authoring"),
+            dir.path().join("harness-gov-mqtt-authoring"),
+        )
+        .unwrap();
+        // Re-save the flat one so both coexist.
+        namespaced.steps[0].title = "Re-saved flat step".into();
+        save_sop(dir.path(), &namespaced).unwrap();
+        assert!(dir.path().join("authoring").is_dir());
+        assert!(dir.path().join("harness-gov-mqtt-authoring").is_dir());
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.steps[0].title, "Re-saved flat step");
+    }
+
     #[test]
     fn step_pos_roundtrips_via_toml_and_stays_out_of_markdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -1694,6 +1906,143 @@ mod tests {
 
         let ok = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
         assert!(ok.is_ok());
+    }
+
+    fn cron_sop(steps: Vec<SopStep>, agent: Option<&str>) -> Sop {
+        Sop {
+            triggers: vec![SopTrigger::Cron {
+                expression: Some("* * * * *".into()),
+            }],
+            agent: agent.map(str::to_string),
+            ..authoring_sop(steps)
+        }
+    }
+
+    /// A headless trigger has no agent turn to inherit an owner from, so the
+    /// authoring gate must reject an unowned procedure rather than let it fire
+    /// on schedule and fail every run at dispatch.
+    #[test]
+    fn validate_sop_strict_blocks_unowned_headless_sop() {
+        let validation = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], None));
+
+        assert!(!validation.is_ok());
+        let blocking = validation
+            .blocking
+            .iter()
+            .find(|b| b.contains("no owning agent"))
+            .expect("missing owner should block, got {validation:?}");
+        assert!(
+            blocking.contains("cron"),
+            "the message should name the headless trigger, got {blocking:?}"
+        );
+    }
+
+    /// The owner may come from either level: the procedure's `agent`, or the
+    /// step's own override.
+    #[test]
+    fn validate_sop_strict_accepts_owned_headless_sop() {
+        let by_sop = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], Some("ops")));
+        assert!(by_sop.is_ok(), "{:?}", by_sop.blocking);
+
+        let mut step = titled_step(1, "a");
+        step.agent = Some("ops".into());
+        let by_step = validate_sop_strict(&cron_sop(vec![step], None));
+        assert!(by_step.is_ok(), "{:?}", by_step.blocking);
+    }
+
+    /// `Manual` is agent-initiated through `sop_execute`, so the calling turn
+    /// owns the run and no declared `agent` is required. Guards the rule
+    /// against over-blocking every ordinary procedure.
+    #[test]
+    fn validate_sop_strict_allows_unowned_manual_sop() {
+        let validation = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
+
+        assert!(validation.is_ok(), "{:?}", validation.blocking);
+    }
+
+    /// ...but a Manual SOP is also startable from the dashboard, which has no
+    /// agent turn behind it. That start is refused, so the author is warned
+    /// rather than left with a procedure that only works from one of its two
+    /// surfaces.
+    #[test]
+    fn validate_sop_strict_warns_that_an_unowned_manual_sop_is_not_dashboard_startable() {
+        let sop = authoring_sop(vec![titled_step(1, "a")]);
+
+        let validation = validate_sop_strict(&sop);
+
+        let warning = validation
+            .warnings
+            .iter()
+            .find(|w| w.contains("no owning agent"))
+            .unwrap_or_else(|| panic!("expected an ownership warning, got {validation:?}"));
+        assert!(
+            warning.contains("dashboard"),
+            "the warning should name the surface that refuses the start, got {warning:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(
+            !validate_sop_strict(&owned)
+                .warnings
+                .iter()
+                .any(|w| w.contains("no owning agent")),
+            "an owned procedure must not warn"
+        );
+    }
+
+    /// The refusal a headless start surface returns is derived from the same
+    /// rule the authoring gate uses, so a start can never be permitted on a
+    /// rule the executing driver does not share.
+    #[test]
+    fn headless_ownership_refusal_names_every_unowned_execute_step() {
+        let mut owned_step = titled_step(2, "b");
+        owned_step.agent = Some("ops".into());
+        let mut checkpoint = titled_step(3, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let sop = authoring_sop(vec![titled_step(1, "a"), owned_step, checkpoint]);
+
+        assert_eq!(unowned_execute_steps(&sop), vec![1]);
+        let refusal =
+            headless_ownership_refusal(&sop).expect("an unowned execute step must be refused");
+        assert!(
+            refusal.contains("[1]"),
+            "only the unowned execute step should be named — the owned step and the checkpoint \
+             carry their own exemption, got {refusal:?}"
+        );
+
+        let owned = Sop {
+            agent: Some("ops".into()),
+            ..sop
+        };
+        assert!(unowned_execute_steps(&owned).is_empty());
+        assert!(
+            headless_ownership_refusal(&owned).is_none(),
+            "a procedure whose SOP-level agent covers every step must start"
+        );
+    }
+
+    /// Only `execute` steps need an agent: checkpoints park for human approval
+    /// and capability steps run through the deterministic registry.
+    #[test]
+    fn validate_sop_strict_exempts_non_execute_steps_from_ownership() {
+        let mut checkpoint = titled_step(1, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let mut capability = titled_step(2, "compute");
+        capability.kind = SopStepKind::Capability;
+
+        let validation = validate_sop_strict(&cron_sop(vec![checkpoint, capability], None));
+
+        assert!(
+            !validation
+                .blocking
+                .iter()
+                .any(|b| b.contains("owning agent")),
+            "non-execute steps should not require an owner, got {:?}",
+            validation.blocking
+        );
     }
 
     #[test]

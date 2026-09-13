@@ -88,6 +88,10 @@ pub enum SopIngressOutcome {
 pub struct SopIngress<'a> {
     engine: Option<&'a Arc<Mutex<SopEngine>>>,
     audit: Option<&'a SopAuditLogger>,
+    /// When attached, every `Started` action this ingress produces is routed
+    /// into the shared driver supervisor instead of being logged and dropped
+    /// by `process_headless_results` (the channel half of the headless-driver gap).
+    driver_sink: Option<&'a crate::sop::executor::SopDriverSink>,
 }
 
 impl<'a> SopIngress<'a> {
@@ -96,7 +100,20 @@ impl<'a> SopIngress<'a> {
         engine: Option<&'a Arc<Mutex<SopEngine>>>,
         audit: Option<&'a SopAuditLogger>,
     ) -> Self {
-        Self { engine, audit }
+        Self {
+            engine,
+            audit,
+            driver_sink: None,
+        }
+    }
+
+    /// Attach the shared driver supervisor. Callers that omit this keep the
+    /// previous behavior; callers whose triggers can start auto-mode runs
+    /// (channel ingress) must attach it or their runs are created undriven.
+    #[must_use]
+    pub fn with_driver_sink(mut self, sink: &'a crate::sop::executor::SopDriverSink) -> Self {
+        self.driver_sink = Some(sink);
+        self
     }
 
     /// Lift one untrusted transport delivery into the shared SOP path.
@@ -108,6 +125,20 @@ impl<'a> SopIngress<'a> {
         target_sop: Option<&str>,
         dedup: Option<(String, bool)>,
     ) -> SopIngressOutcome {
+        // Span the unified SOP ingress so every untrusted trigger (MQTT,
+        // RPC, ...) is visible in OTel via the tracing-opentelemetry bridge.
+        // Target `zeroclaw_sop` is the future filter key (bridge-only-SOP).
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_sop",
+            "sop.ingress",
+            source = ?source,
+            topic = ?topic,
+        );
+        // Wrap the body in an instrumented async block (not an `.enter()`
+        // guard): an `Entered` guard held across `.await` makes the future
+        // non-Send, which would break `tokio::spawn` callers (the MQTT SOP
+        // listener). The span still covers every `.await` in the body.
+        let __dispatch_body = async move {
         let Some(engine) = self.engine else {
             let reason = if self.audit.is_some() {
                 SopIngressUnavailable::MissingEngine
@@ -142,21 +173,29 @@ impl<'a> SopIngress<'a> {
             return SopIngressOutcome::Unavailable(reason);
         };
 
-        SopIngressOutcome::Dispatched(
-            dispatch_untrusted_fan_in_inner(
-                engine,
-                audit,
-                PreparedSopIngress {
-                    source,
-                    topic,
-                    payload,
-                    target_sop,
-                    dedup,
-                    max_bytes,
-                },
-            )
-            .await,
+        let results = dispatch_untrusted_fan_in_inner(
+            engine,
+            audit,
+            PreparedSopIngress {
+                source,
+                topic,
+                payload,
+                target_sop,
+                dedup,
+                max_bytes,
+            },
         )
+        .await;
+        if let Some(sink) = self.driver_sink {
+            for result in &results {
+                if let DispatchResult::Started { action, .. } = result {
+                    sink.drive(action);
+                }
+            }
+        }
+        SopIngressOutcome::Dispatched(results)
+        };
+        ::zeroclaw_log::Instrument::instrument(__dispatch_body, span).await
     }
 }
 
@@ -254,6 +293,8 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Cancelled { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
+        // No run was created for a skipped (sidecar) SOP — there is no run_id.
+        SopRunAction::Skipped { .. } => "",
     }
 }
 
@@ -268,6 +309,7 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::Completed { .. } => "Completed",
         SopRunAction::Cancelled { .. } => "Cancelled",
         SopRunAction::Failed { .. } => "Failed",
+        SopRunAction::Skipped { .. } => "Skipped",
     }
 }
 
@@ -844,7 +886,7 @@ async fn dispatch_sop_event_filtered(
             let mut remaining = reservations.into_iter();
             for reservation in remaining.by_ref() {
                 let sop_name = reservation.sop_name().to_string();
-                match eng.activate_reserved_run(reservation, event.clone()) {
+                match eng.activate_reserved_run(reservation, event.clone(), None) {
                     Ok(action) => activated.push((sop_name, action)),
                     Err(e) => {
                         activation_failure = Some((sop_name, e.to_string()));
@@ -954,6 +996,9 @@ async fn dispatch_sop_event_filtered(
                 }
                 match eng.start_run(sop_name, event.clone()) {
                     Ok(action) => {
+                        // Skip-at-dispatch: a `Skipped` action means no run was
+                        // created (sidecar SOP). Do NOT drive or audit it as a
+                        // started run — surface it as a handled `Skipped` result.
                         let result =
                             record_started_run(&eng, sop_name, action, &mut pending_deterministic);
                         remember_dispatch_start(&mut eng, sop_name, dedup, &result);
@@ -1126,6 +1171,10 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                 SopRunAction::Failed { reason, .. } => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}"));
                 }
+                // A `Skipped` action never reaches `record_started_run` (it is
+                // surfaced as `DispatchResult::Skipped` upstream), so this arm is
+                // unreachable for a `Started` result; keep the match exhaustive.
+                SopRunAction::Skipped { .. } => {}
             },
             DispatchResult::Skipped { sop_name, reason } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: skipped '{sop_name}': {reason}"));
@@ -1179,6 +1228,26 @@ pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
 /// Compatibility wrapper for fan-in sources that already require concrete
 /// engine and audit handles. New or handle-optional sources should use
 /// [`SopIngress`] so missing handles and source-interest gating share one path.
+pub async fn dispatch_untrusted_fan_in_driven(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    driver_sink: Option<&crate::sop::executor::SopDriverSink>,
+    source: SopTriggerSource,
+    topic: Option<&str>,
+    payload: Option<&str>,
+    dedup: Option<(String, bool)>,
+) -> Vec<DispatchResult> {
+    let mut ingress = SopIngress::new(Some(engine), Some(audit));
+    if let Some(sink) = driver_sink {
+        ingress = ingress.with_driver_sink(sink);
+    }
+    match ingress.dispatch(source, topic, payload, None, dedup).await {
+        SopIngressOutcome::Dispatched(results) => results,
+        SopIngressOutcome::NotInterested => vec![DispatchResult::NoMatch],
+        SopIngressOutcome::Unavailable(_) => vec![],
+    }
+}
+
 pub async fn dispatch_untrusted_fan_in(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
@@ -1328,6 +1397,14 @@ impl SopCronCache {
         for sop in eng.sops() {
             for trigger in &sop.triggers {
                 if let super::types::SopTrigger::Cron { expression } = trigger {
+                    // A cron trigger with no `expression` is a declarative tag:
+                    // the schedule is owned by `config.toml` cron jobs, not the
+                    // SOP trigger. Skip it here — there is no SOP-level schedule
+                    // to build for this trigger.
+                    let expression = match expression {
+                        Some(e) => e,
+                        None => continue,
+                    };
                     // Normalize 5-field crontab to 6-field (prepend seconds)
                     let normalized = match crate::cron::normalize_expression(expression) {
                         Ok(n) => n,
@@ -2595,7 +2672,7 @@ mod tests {
         let sop = test_sop(
             "bad-cron",
             vec![SopTrigger::Cron {
-                expression: "not a valid cron".into(),
+                expression: Some("not a valid cron".into()),
             }],
         );
         let engine = test_engine(vec![sop]);
@@ -2608,7 +2685,7 @@ mod tests {
         let sop = test_sop(
             "valid-cron",
             vec![SopTrigger::Cron {
-                expression: "0 */5 * * *".into(),
+                expression: Some("0 */5 * * *".into()),
             }],
         );
         let engine = test_engine(vec![sop]);
@@ -2623,7 +2700,7 @@ mod tests {
         let sop = test_sop(
             "cron-sop",
             vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
         );
         let engine = test_engine(vec![sop]);
@@ -2646,7 +2723,7 @@ mod tests {
         let sop1 = test_sop(
             "every-min",
             vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
         );
         // An expression that won't fire in a 2-minute window from now:
@@ -2654,7 +2731,7 @@ mod tests {
         let sop2 = test_sop(
             "yearly",
             vec![SopTrigger::Cron {
-                expression: "0 0 1 1 *".into(),
+                expression: Some("0 0 1 1 *".into()),
             }],
         );
         let engine = test_engine(vec![sop1, sop2]);
@@ -2681,13 +2758,13 @@ mod tests {
         let sop1 = test_sop(
             "first",
             vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
         );
         let sop2 = test_sop(
             "second",
             vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
         );
         let engine = test_engine(vec![sop1, sop2]);
@@ -2713,7 +2790,7 @@ mod tests {
         let sop = test_sop(
             "every-min",
             vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
         );
         let engine = test_engine(vec![sop]);
@@ -2754,6 +2831,20 @@ mod tests {
         sop.execution_mode = SopExecutionMode::Deterministic;
         sop.deterministic = true;
         sop.max_concurrent = 1;
+        // Append a `noop` Capability step so the SOP is gateway-runnable and not
+        // skipped at dispatch (the headless drain under test fails the first
+        // Execute step driverlessly; the tail capability is never reached).
+        sop.steps.push(SopStep {
+            number: 2,
+            title: "Tail capability".into(),
+            body: "noop so the SOP is gateway-runnable".into(),
+            suggested_tools: vec![],
+            requires_confirmation: false,
+            kind: crate::sop::SopStepKind::Capability,
+            schema: None,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        });
         sop
     }
 

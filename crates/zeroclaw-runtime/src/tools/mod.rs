@@ -14,6 +14,8 @@ pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
+#[cfg(feature = "channel-mqtt")]
+pub mod mqtt_publish;
 pub mod read_skill;
 mod runtime_command_error;
 pub mod schedule;
@@ -137,6 +139,8 @@ pub use deliver_file::{
 };
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
+#[cfg(feature = "channel-mqtt")]
+pub use mqtt_publish::MqttPublishTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
@@ -962,6 +966,11 @@ pub fn all_tools_with_runtime(
         Arc::new(TodoWriteTool::new()),
     ];
 
+    // mqtt_publish — event-bus publisher for the event-driven swarm engine.
+    // Only available when the channel-mqtt feature is compiled in.
+    #[cfg(feature = "channel-mqtt")]
+    tool_arcs.push(Arc::new(MqttPublishTool::new()));
+
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
     // model out from under the parent (the switch signal is process-wide).
@@ -1539,7 +1548,9 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
@@ -1550,7 +1561,9 @@ pub fn all_tools_with_runtime(
                     .with_audit(Arc::clone(sop_audit)),
             ));
         } else {
-            tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+            ));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),

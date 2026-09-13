@@ -647,7 +647,7 @@ pub async fn run(
         || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -797,6 +797,7 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
             cert_audit,
         }))
@@ -3285,6 +3286,7 @@ mod tests {
                 max_retries: None,
                 retry_base_delay_ms: None,
                 retry_max_delay_ms: None,
+                signature_header: "X-Hub-Signature-256".to_string(),
             },
         );
         assert!(has_supervised_channels(&config));

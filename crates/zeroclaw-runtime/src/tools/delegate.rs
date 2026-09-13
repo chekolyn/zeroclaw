@@ -69,6 +69,179 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// R4: project this task belongs to (for the MQTT topic hierarchy).
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// R4: milestone within the project.
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    /// R4: chain ID linking a sequence of delegations (v1: manual follow-up).
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// R4: time-to-live in seconds (default 300). Used by the stuck-watchdog
+    /// SOP to detect stuck tasks.
+    #[serde(default = "default_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// R4: originating session ID (optional, for cross-session correlation).
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Default TTL for background delegate tasks (5 minutes).
+fn default_ttl_seconds() -> u64 {
+    300
+}
+
+/// R4: Event-driven delegate args parsed from the tool's JSON arguments.
+/// Used to thread project/milestone/chain metadata into the MQTT topic
+/// hierarchy and the `BackgroundDelegateResult`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegateEventArgs {
+    pub project_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub chain_id: Option<String>,
+    pub ttl_seconds: u64,
+    pub session_id: Option<String>,
+}
+
+/// Parse the event-driven args from a tool's JSON argument value.
+/// Returns a `DelegateEventArgs` with defaults applied (ttl_seconds=300).
+pub fn parse_delegate_event_args(args: &serde_json::Value) -> DelegateEventArgs {
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let milestone_id = args
+        .get("milestone_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let chain_id = args
+        .get("chain_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ttl_seconds = args
+        .get("ttl_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_ttl_seconds());
+    let session_id = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    DelegateEventArgs {
+        project_id,
+        milestone_id,
+        chain_id,
+        ttl_seconds,
+        session_id,
+    }
+}
+
+// ── M2 Part B: typed Task* event helpers ──────────────────────────
+//
+// Pure functions that build the fixed-topic, IDs-in-payload event
+// envelopes matching the sidecar `zc_engine.core.schemas.events.task_events`
+// pydantic models (T6a). Extracted so they are unit-testable without a
+// live MQTT broker (`mqtt_bus::publish` is a free function, not mockable).
+//
+// Contract: non-retained, fixed topics, single canonical `timestamp`,
+// `status` enum (no lossy Cancelled→failed mapping). Publishing is skipped
+// entirely when `project_id` or `milestone_id` is `None` — the sidecar
+// schemas require both as non-empty strings.
+
+/// Fixed MQTT topic for task-started events.
+pub fn task_started_topic() -> &'static str {
+    "zeroclaw/tasks/started"
+}
+
+/// Fixed MQTT topic for task-completed events (success and cancel).
+pub fn task_completed_topic() -> &'static str {
+    "zeroclaw/tasks/completed"
+}
+
+/// Fixed MQTT topic for task-failed events.
+pub fn task_failed_topic() -> &'static str {
+    "zeroclaw/tasks/failed"
+}
+
+/// Build the `TaskStarted` payload (sidecar schema: `TaskStarted`).
+///
+/// Fields: `project_id`, `milestone_id`, `task_id`, `timestamp` (required),
+/// plus optional `chain_id`, `session_id`, `ttl_seconds`. No `agent` field
+/// (it lives in the delegate result file, not the event payload).
+pub fn build_task_started_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+    ttl_seconds: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+        "ttl_seconds": ttl_seconds,
+    })
+}
+
+/// Build the `TaskCompleted` payload (sidecar schema: `TaskCompleted`).
+///
+/// `status` must be `"completed"` or `"cancelled"`. Failures go to the
+/// `failed` topic via [`build_task_failed_payload`], not here.
+pub fn build_task_completed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    status: &str,
+    result: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "status": status,
+        "result": result,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
+}
+
+/// Build the `TaskFailed` payload (sidecar schema: `TaskFailed`).
+///
+/// `reason` is a short failure label (min 1 char). `error` is the longer
+/// error detail, if available.
+pub fn build_task_failed_payload(
+    project_id: &str,
+    milestone_id: &str,
+    task_id: &str,
+    reason: &str,
+    error: Option<&str>,
+    timestamp: &str,
+    chain_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "milestone_id": milestone_id,
+        "task_id": task_id,
+        "reason": reason,
+        "error": error,
+        "timestamp": timestamp,
+        "chain_id": chain_id,
+        "session_id": session_id,
+    })
 }
 
 /// Status of a background delegate task.
@@ -1007,8 +1180,17 @@ impl DelegateTool {
     }
 
     /// Directory where background delegate results are stored.
+    ///
+    /// The subdir is resolved from `DelegateToolConfig.results_dir` (configurable
+    /// via `[delegate] results_dir = "..."`), defaulting to `"delegate_results"`
+    /// to preserve upstream behavior. The path is relative to the agent workspace.
     fn results_dir(&self) -> PathBuf {
-        self.workspace_dir.join("delegate_results")
+        let subdir = self
+            .delegate_config
+            .results_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("delegate_results"));
+        self.workspace_dir.join(subdir)
     }
 
     async fn write_result_atomic(
@@ -1131,6 +1313,32 @@ impl Tool for DelegateTool {
                     "minimum": 0,
                     "maximum": Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis(),
                     "description": "Maximum milliseconds for await_sessions to wait before returning partial results. Capped at 120000."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Project ID for the event-driven topic hierarchy \
+                                    (zeroclaw/projects/{project_id}/...). Optional."
+                },
+                "milestone_id": {
+                    "type": "string",
+                    "description": "Milestone ID within the project for the topic hierarchy. \
+                                    Optional; use with project_id."
+                },
+                "chain_id": {
+                    "type": "string",
+                    "description": "Chain ID linking a sequence of delegations for manual \
+                                    follow-up (v1; no auto-dispatch). Optional."
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "description": "Time-to-live in seconds for the background task. Used by \
+                                    the stuck-watchdog SOP to detect stuck tasks. Default: 300.",
+                    "default": 300
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Originating session ID for cross-session correlation. \
+                                    Optional."
                 }
             },
             "required": []
@@ -1594,6 +1802,10 @@ impl DelegateTool {
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
 
+        // R4: parse event-driven args (project/milestone/chain/ttl/session) from
+        // the tool args, for the MQTT topic hierarchy and the result struct.
+        let event_args = parse_delegate_event_args(args);
+
         // Write initial "running" status
         let initial_result = BackgroundDelegateResult {
             task_id: task_id.clone(),
@@ -1603,9 +1815,41 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
+            project_id: event_args.project_id.clone(),
+            milestone_id: event_args.milestone_id.clone(),
+            chain_id: event_args.chain_id.clone(),
+            ttl_seconds: event_args.ttl_seconds,
+            session_id: event_args.session_id.clone(),
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
+
+        // R2: publish 'started' event to the MQTT bus for the event-driven swarm
+        // engine. No-op when mqtt unconfigured. Uses a FIXED topic with IDs in
+        // the payload (M2 Part B). Non-retained. Skipped when project_id or
+        // milestone_id is None — the sidecar schema requires both as non-empty
+        // strings, so there is no 'unassigned' placeholder.
+        #[cfg(feature = "channel-mqtt")]
+        if let (Some(proj), Some(ms)) =
+            (event_args.project_id.as_deref(), event_args.milestone_id.as_deref())
+        {
+            let topic = task_started_topic().to_string();
+            let payload = build_task_started_payload(
+                proj,
+                ms,
+                &task_id,
+                &started_at,
+                event_args.chain_id.as_deref(),
+                event_args.session_id.as_deref(),
+                Some(event_args.ttl_seconds),
+            )
+            .to_string();
+            tokio::spawn(async move {
+                let _ = crate::mqtt_bus::publish(
+                    &topic, payload.into_bytes(), false,
+                ).await;
+            });
+        }
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
         // spawn, so a crash between here and the spawn is recoverable by the reaper. A
@@ -1635,6 +1879,7 @@ impl DelegateTool {
 
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
+        let event_args = event_args.clone();
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
         // Monotonic descent: was `self.depth` (verbatim copy), which left the
@@ -1665,10 +1910,18 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Captured here and restored inside the task: a background delegation
+        // leaves the caller's task, and with it the SOP step scope this call was
+        // made under. Backgrounding the work must not widen what it may do.
+        let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            scope_delegate_session_key(
+                parent_session_key,
+                crate::sop::active_scope::with_inherited_headless_step_scope(
+                    parent_step_scope,
+                    async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1730,6 +1983,11 @@ impl DelegateTool {
                         error: None,
                         started_at,
                         finished_at: Some(finished_at),
+                        project_id: event_args.project_id.clone(),
+                        milestone_id: event_args.milestone_id.clone(),
+                        chain_id: event_args.chain_id.clone(),
+                        ttl_seconds: event_args.ttl_seconds,
+                        session_id: event_args.session_id.clone(),
                     },
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
@@ -1745,6 +2003,11 @@ impl DelegateTool {
                             error: Some(err),
                             started_at,
                             finished_at: Some(finished_at),
+                            project_id: event_args.project_id.clone(),
+                            milestone_id: event_args.milestone_id.clone(),
+                            chain_id: event_args.chain_id.clone(),
+                            ttl_seconds: event_args.ttl_seconds,
+                            session_id: event_args.session_id.clone(),
                         }
                     }
                 };
@@ -1774,11 +2037,84 @@ impl DelegateTool {
                         .await;
                 }
 
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
-            })
+                        // R3: publish terminal event to the MQTT bus for the
+                        // event-driven swarm engine. No-op when mqtt unconfigured.
+                        // Uses FIXED topics with IDs in the payload (M2 Part B),
+                        // non-retained. `status` is an enum — cancel maps to the
+                        // completed topic with status='cancelled', NOT to failed.
+                        // Skipped when project_id or milestone_id is None.
+                        #[cfg(feature = "channel-mqtt")]
+                        if let (Some(proj), Some(ms)) =
+                            (final_result.project_id.as_deref(), final_result.milestone_id.as_deref())
+                        {
+                            let timestamp = final_result
+                                .finished_at
+                                .clone()
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                            let chain = final_result.chain_id.as_deref();
+                            let session = final_result.session_id.as_deref();
+                            let (topic, payload) = match final_result.status {
+                                BackgroundTaskStatus::Completed
+                                | BackgroundTaskStatus::Running => {
+                                    let topic = task_completed_topic().to_string();
+                                    let payload = build_task_completed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        "completed",
+                                        final_result.output.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
+                                BackgroundTaskStatus::Cancelled => {
+                                    let topic = task_completed_topic().to_string();
+                                    let payload = build_task_completed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        "cancelled",
+                                        final_result.output.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
+                                BackgroundTaskStatus::Failed => {
+                                    let topic = task_failed_topic().to_string();
+                                    let payload = build_task_failed_payload(
+                                        proj,
+                                        ms,
+                                        &task_id_clone,
+                                        final_result.error.as_deref().unwrap_or("failed"),
+                                        final_result.error.as_deref(),
+                                        &timestamp,
+                                        chain,
+                                        session,
+                                    )
+                                    .to_string();
+                                    (topic, payload)
+                                }
+                            };
+                            tokio::spawn(async move {
+                                let _ = crate::mqtt_bus::publish(
+                                    &topic, payload.into_bytes(), false,
+                                ).await;
+                            });
+                        }
+
+                        // Drop the live cancel token now the task has settled.
+                        Self::background_task_cancels()
+                            .lock()
+                            .remove(&task_id_clone);
+                    }
+                )
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
@@ -1884,6 +2220,11 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        // Captured once here and restored inside every worker: each fan-out
+        // target runs on its own spawned task, which does not inherit the SOP
+        // step scope this call was made under. Fanning work out must not widen
+        // it any more than backgrounding it does.
+        let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1916,6 +2257,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let step_scope = parent_step_scope.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1943,14 +2285,17 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
-                            })
-                            .await
-                    })
+                    let result = crate::sop::active_scope::with_inherited_headless_step_scope(
+                        step_scope,
+                        scope_delegate_session_key(session_key, async move {
+                            crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope, async move {
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                        .await
+                                })
+                                .await
+                        }),
+                    )
                     .await;
                     (agent_name_for_return, result)
                 }
@@ -2643,6 +2988,7 @@ impl DelegateTool {
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
         let sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
+
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
@@ -2753,6 +3099,22 @@ impl DelegateTool {
                 assembled_bounded.registry
             }
         };
+
+        // A delegation from inside a headless SOP step carries that step's tool
+        // boundary onto the target. Both modes reach it: bounded starts from the
+        // caller's registry, independent assembles the target's own, and neither
+        // knows about the step. Handing work to another agent is not a way to
+        // run what the step denied — including the SOP control tools, which
+        // would otherwise let the target drive the very run it is a step of.
+        if let Some(scope) = crate::sop::active_scope::active_headless_step_scope() {
+            let names: Vec<String> = sub_tools.iter().map(|t| t.name().to_string()).collect();
+            let excluded = scope.excluded(&names);
+            sub_tools.retain(|tool| {
+                !excluded
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
+            });
+        }
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
         let native_tools = model_provider
@@ -3281,6 +3643,11 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            project_id: None,
+            milestone_id: None,
+            chain_id: None,
+            ttl_seconds: 300,
+            session_id: None,
         }
     }
 
@@ -4898,6 +5265,69 @@ mod tests {
         assert!(result.output.contains("tool count matched: 1"));
     }
 
+    /// A delegation made from inside a headless SOP step carries that step's
+    /// tool boundary onto the target. Both modes converge on the same assembled
+    /// target registry, so neither bounded (which starts from the caller's
+    /// tools) nor independent (which builds the target's own) can hand the
+    /// target something the step gave up.
+    #[tokio::test]
+    async fn execute_agentic_narrows_the_target_to_the_active_sop_step_scope() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        // Control: outside a step, the target keeps the one admitted tool.
+        let unscoped = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &ToolCountModelProvider { expected_tools: 1 },
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(unscoped.success, "got: {:?}", unscoped.error);
+
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["read_file".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        };
+
+        // Under a step that allows only `read_file`, the delegated target must
+        // not receive `echo_tool` either.
+        let scoped = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(scoped.success, "got: {:?}", scoped.error);
+    }
+
     #[tokio::test]
     async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
         // Memory tools are stateful even when they come from the parent registry.
@@ -4964,6 +5394,112 @@ mod tests {
                 .contains("memory workflow done")
         );
         assert_stored_for_target_only(&fixture, "background-key").await;
+    }
+
+    /// Chat server that records each request body and answers with a final
+    /// message, so a test can assert which tool specs a delegated target was
+    /// actually offered.
+    struct ToolCapturingChatServer {
+        uri: String,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start_tool_capturing_chat_server(exchanges: usize) -> ToolCapturingChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&requests);
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..exchanges {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                sink.lock()
+                    .expect("request sink lock")
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                write_json_response(
+                    &mut socket,
+                    serde_json::json!({
+                        "choices": [{ "message": { "content": "parallel done" } }]
+                    }),
+                )
+                .await;
+            }
+        });
+
+        ToolCapturingChatServer {
+            uri,
+            requests,
+            _task: task,
+        }
+    }
+
+    /// A parallel fan-out runs every target on its own spawned task, and a
+    /// tokio task-local does not cross that boundary. Without capturing and
+    /// restoring the step scope per worker, a step allowed to call `delegate`
+    /// could use the `parallel` form to hand a target the tools the step
+    /// excluded — the same escape the direct and background paths close.
+    #[tokio::test]
+    async fn parallel_delegate_workers_inherit_the_active_sop_step_scope() {
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["memory_recall".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        };
+
+        // Control: outside a step, the target is offered the tools its own
+        // policy admits.
+        let server = start_tool_capturing_chat_server(1).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let unscoped = fixture
+            .tool
+            .execute(json!({"parallel": ["target"], "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(unscoped.success, "parallel delegate failed: {unscoped:?}");
+        let unscoped_request = server.requests.lock().unwrap().first().cloned().unwrap();
+        assert!(
+            unscoped_request.contains("memory_store"),
+            "control: the target should be offered memory_store, got {unscoped_request}"
+        );
+
+        let scoped_server = start_tool_capturing_chat_server(1).await;
+        let scoped_fixture = delegate_memory_fixture(Some(scoped_server.uri.clone())).await;
+        let scoped = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            scoped_fixture
+                .tool
+                .execute(json!({"parallel": ["target"], "prompt": "run"})),
+        )
+        .await
+        .unwrap();
+        assert!(scoped.success, "parallel delegate failed: {scoped:?}");
+        let scoped_request = scoped_server
+            .requests
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap();
+        assert!(
+            !scoped_request.contains("memory_store"),
+            "a parallel worker must not be offered a tool the step denies, got {scoped_request}"
+        );
+        assert!(
+            scoped_request.contains("memory_recall"),
+            "the step's allowed tool must survive into the worker, got {scoped_request}"
+        );
     }
 
     #[tokio::test]
@@ -7031,6 +7567,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn results_dir_defaults_to_delegate_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_default_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "default results_dir should be delegate_results (upstream behavior)"
+        );
+    }
+
+    #[test]
+    fn results_dir_config_override_honored() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_results_dir_override_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = DelegateToolConfig {
+            results_dir: Some("event_engine/tasks".into()),
+            ..DelegateToolConfig::default()
+        };
+        let tool =
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_delegate_config(cfg)
+                .with_workspace_dir(workspace.clone());
+        assert_eq!(
+            tool.results_dir(),
+            workspace.join("event_engine/tasks"),
+            "results_dir should honor the config override, not delegate_results"
+        );
+        assert_ne!(
+            tool.results_dir(),
+            workspace.join("delegate_results"),
+            "overridden results_dir must NOT fall back to delegate_results"
+        );
     }
 
     // ── Background and Parallel execution tests ─────────────────────
@@ -10372,6 +10950,203 @@ command = "rm independent-delegate-marker"
         );
     }
 
+    // ── R4: event-driven arg parsing tests ─────────────────────────
+
+    #[test]
+    fn parse_delegate_event_args_with_all_fields() {
+        let args = serde_json::json!({
+            "project_id": "p1",
+            "milestone_id": "m1",
+            "chain_id": "c1",
+            "ttl_seconds": 600,
+            "session_id": "s1",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id.as_deref(), Some("p1"));
+        assert_eq!(parsed.milestone_id.as_deref(), Some("m1"));
+        assert_eq!(parsed.chain_id.as_deref(), Some("c1"));
+        assert_eq!(parsed.ttl_seconds, 600);
+        assert_eq!(parsed.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn parse_delegate_event_args_defaults_when_absent() {
+        let args = serde_json::json!({});
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None);
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.ttl_seconds, 300, "default ttl_seconds should be 300");
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_empty_strings_become_none() {
+        let args = serde_json::json!({
+            "project_id": "",
+            "milestone_id": "",
+            "chain_id": "",
+            "session_id": "",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.project_id, None, "empty string should map to None");
+        assert_eq!(parsed.milestone_id, None);
+        assert_eq!(parsed.chain_id, None);
+        assert_eq!(parsed.session_id, None);
+    }
+
+    #[test]
+    fn parse_delegate_event_args_ttl_falls_back_to_default() {
+        let args = serde_json::json!({
+            "ttl_seconds": "not_a_number",
+        });
+        let parsed = parse_delegate_event_args(&args);
+        assert_eq!(parsed.ttl_seconds, 300);
+    }
+
+    #[cfg(feature = "channel-mqtt")]
+    #[test]
+    fn task_event_topics_are_fixed() {
+        // M2 Part B: task events use FIXED topics (no parameterized hierarchy).
+        assert_eq!(task_started_topic(), "zeroclaw/tasks/started");
+        assert_eq!(task_completed_topic(), "zeroclaw/tasks/completed");
+        assert_eq!(task_failed_topic(), "zeroclaw/tasks/failed");
+    }
+
+    #[test]
+    fn build_task_started_payload_fields() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+            Some(600),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        assert_eq!(payload["ttl_seconds"], 600);
+        // No 'agent' field — it lives in the delegate result file.
+        assert!(payload.get("agent").is_none(), "agent must not be in the payload");
+        // No 'started_at' field — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none(), "started_at must not be in the payload");
+    }
+
+    #[test]
+    fn build_task_started_payload_optionals_null() {
+        let payload = build_task_started_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "2026-08-29T12:00:00Z",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:00:00Z");
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+        assert_eq!(payload["ttl_seconds"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_completed_payload_completed() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "completed",
+            Some("task output here"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["result"], "task output here");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'started_at'/'finished_at' — single canonical 'timestamp'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+        // No 'error' field on the completed topic.
+        assert!(payload.get("error").is_none());
+    }
+
+    #[test]
+    fn build_task_completed_payload_cancelled() {
+        let payload = build_task_completed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "cancelled",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["result"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_task_failed_payload_fields() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "timeout",
+            Some("full error detail"),
+            "2026-08-29T12:05:00Z",
+            Some("chain-1"),
+            Some("sess-1"),
+        );
+        assert_eq!(payload["project_id"], "proj-1");
+        assert_eq!(payload["milestone_id"], "ms-1");
+        assert_eq!(payload["task_id"], "task-1");
+        assert_eq!(payload["reason"], "timeout");
+        assert_eq!(payload["error"], "full error detail");
+        assert_eq!(payload["timestamp"], "2026-08-29T12:05:00Z");
+        assert_eq!(payload["chain_id"], "chain-1");
+        assert_eq!(payload["session_id"], "sess-1");
+        // No 'status' field on the failed topic — the topic itself signals failure.
+        assert!(payload.get("status").is_none());
+        // No 'started_at'/'finished_at'.
+        assert!(payload.get("started_at").is_none());
+        assert!(payload.get("finished_at").is_none());
+    }
+
+    #[test]
+    fn build_task_failed_payload_minimal() {
+        let payload = build_task_failed_payload(
+            "proj-1",
+            "ms-1",
+            "task-1",
+            "failed",
+            None,
+            "2026-08-29T12:05:00Z",
+            None,
+            None,
+        );
+        assert_eq!(payload["reason"], "failed");
+        assert_eq!(payload["error"], serde_json::Value::Null);
+        assert_eq!(payload["chain_id"], serde_json::Value::Null);
+        assert_eq!(payload["session_id"], serde_json::Value::Null);
+    }
+
     #[test]
     fn resolve_brain_non_oauth_fallback_preserved() {
         let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
@@ -10401,6 +11176,28 @@ command = "rm independent-delegate-marker"
             Some("sk-ant-global-coordinator-key"),
             "non-OAuth target without api_key must fall back to global credential"
         );
+    }
+
+    #[test]
+    fn parameter_schema_includes_event_args() {
+        // Verify the 5 new args are present in the parameter schema.
+        let tool = DelegateTool::new(
+            sample_agents(),
+            None,
+            test_security(),
+        );
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["project_id"].is_object(),
+            "project_id should be in parameter schema");
+        assert!(schema["properties"]["milestone_id"].is_object(),
+            "milestone_id should be in parameter schema");
+        assert!(schema["properties"]["chain_id"].is_object(),
+            "chain_id should be in parameter schema");
+        assert!(schema["properties"]["ttl_seconds"].is_object(),
+            "ttl_seconds should be in parameter schema");
+        assert!(schema["properties"]["session_id"].is_object(),
+            "session_id should be in parameter schema");
+        assert_eq!(schema["properties"]["ttl_seconds"]["default"], 300);
     }
 }
 

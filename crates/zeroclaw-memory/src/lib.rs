@@ -902,6 +902,34 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
     });
 }
 
+/// The permissive operator policy for one-shot migration imports: writes are
+/// scanned + logged, but flagged rows are persisted (not rejected) so a bulk
+/// import never stops partway through, and read-time withholding is disabled
+/// so `memory list` / `get` show every stored row for inspection + removal.
+/// Shared by the builder paths (sqlite/lucid/markdown, via `&policy`) AND the
+/// storage-and-routes path (postgres/qdrant, via `memory_config_for_migration`).
+fn migration_operator_policy() -> MemoryPolicyConfig {
+    MemoryPolicyConfig {
+        threat_scan_on_hit: "block-on-read".into(),
+        threat_scan_load_time: false,
+        ..MemoryPolicyConfig::default()
+    }
+}
+
+/// Build the `[memory]` config for a migration import, overriding the
+/// configured `[memory.policy]` with the permissive operator policy. Used by
+/// the storage-and-routes path (postgres/qdrant), which cannot receive the
+/// policy directly the way the builder paths (sqlite/lucid/markdown) pass
+/// `&policy` to `wrap_scanned_and_audit`/`create_memory_with_builders`.
+/// Without this override the storage-and-routes path inherits the configured
+/// policy (default "reject") and `migrate openclaw` aborts on the first flagged
+/// row — inconsistent with the builder paths that persist flagged rows.
+fn memory_config_for_migration(config: &Config) -> MemoryConfig {
+    let mut mem = config.memory.clone();
+    mem.policy = migration_operator_policy();
+    mem
+}
+
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
@@ -918,11 +946,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     // (`create_memory_with_storage_and_routes`) applies the configured
     // `[memory.policy]`, so flagged rows remain withheld from recall
     // wherever `threat_scan_load_time` is enabled.
-    let policy = MemoryPolicyConfig {
-        threat_scan_on_hit: "block-on-read".into(),
-        threat_scan_load_time: false,
-        ..MemoryPolicyConfig::default()
-    };
+    let policy = migration_operator_policy();
 
     // Migration writes bypass the audit trail: the imported rows are bulk
     // history, not live memory operations.
@@ -933,6 +957,29 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
             &policy,
             &config.data_dir,
             false,
+        );
+    }
+
+    // Storage-backed backends (postgres, qdrant) are only constructible via
+    // the storage-and-routes factory — the builders path cannot resolve their
+    // storage config and bails with "postgres backend requires storage config".
+    // Mirror `reindex_memory_backend` so `migrate openclaw` can WRITE to these
+    // backends (the import step), not just read the source. The permissive
+    // operator policy (`memory_config_for_migration`) applies so flagged rows
+    // are persisted for operator review instead of aborting the import; the
+    // `memory.get` existing-key check is handled by the backend's ON CONFLICT
+    // upsert on duplicates.
+    if matches!(
+        classify_memory_backend(&backend),
+        MemoryBackendKind::Postgres | MemoryBackendKind::Qdrant
+    ) {
+        return create_memory_with_storage_and_routes(
+            &memory_config_for_migration(config),
+            &config.embedding_routes,
+            config.resolve_active_storage(),
+            &config.data_dir,
+            None,
+            Some(&config.providers.models),
         );
     }
 
@@ -2214,6 +2261,61 @@ store_timeout_ms = 40000
         let runtime = create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap();
         assert!(runtime.get("imported").await.unwrap().is_none());
         assert!(operator.forget("imported").await.unwrap());
+    }
+
+    /// The permissive operator policy for one-shot migration imports: writes are
+    /// scanned + logged, but flagged rows are persisted (not rejected) so a bulk
+    /// import never stops partway through. Read-time withholding is disabled so
+    /// `memory list` / `get` show every stored row for inspection + removal.
+    /// Shared by the builder paths (sqlite/lucid/markdown) AND the
+    /// storage-and-routes path (postgres/qdrant) so the policy is consistent
+    /// across backends.
+    #[test]
+    fn migration_operator_policy_is_permissive_for_bulk_import() {
+        let p = migration_operator_policy();
+        assert_eq!(
+            p.threat_scan_on_hit,
+            "block-on-read",
+            "operator policy persists flagged rows (not reject) so imports complete"
+        );
+        assert!(
+            !p.threat_scan_load_time,
+            "operator policy disables read-time withholding so flagged rows are visible"
+        );
+    }
+
+    /// Regression: the postgres/qdrant storage-and-routes path must use the
+    /// permissive operator policy (persist flagged rows, don't bail), NOT the
+    /// configured `[memory.policy]` (which defaults to "reject" and aborted
+    /// `migrate openclaw` mid-import on the first flagged row). The fix routes
+    /// the postgres path through `memory_config_for_migration`, which overrides
+    /// the configured policy with the permissive operator policy — consistent
+    /// with the sqlite/lucid builder paths that already pass `&policy`.
+    #[test]
+    fn memory_config_for_migration_overrides_configured_policy_for_storage_backends() {
+        let config = Config {
+            memory: MemoryConfig {
+                backend: "postgres.test".into(),
+                policy: MemoryPolicyConfig {
+                    threat_scan: "strict".into(),
+                    threat_scan_on_hit: "reject".into(),
+                    ..MemoryPolicyConfig::default()
+                },
+                ..MemoryConfig::default()
+            },
+            ..Config::default()
+        };
+        let mem = memory_config_for_migration(&config);
+        assert_eq!(
+            mem.policy.threat_scan_on_hit, "block-on-read",
+            "postgres migrate path must persist flagged rows (block-on-read), not the configured reject"
+        );
+        assert!(
+            !mem.policy.threat_scan_load_time,
+            "postgres migrate path must disable read-time withholding for operator review"
+        );
+        // Non-policy fields are preserved from the configured memory.
+        assert_eq!(mem.backend, "postgres.test");
     }
 
     #[test]

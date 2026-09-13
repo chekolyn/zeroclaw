@@ -292,7 +292,7 @@ provider-gitea = ["zeroclaw-channels/provider-gitea"]
 channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
-channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
+channel-mqtt = ["zeroclaw-channels/channel-mqtt", "zeroclaw-runtime/channel-mqtt"]
 channel-filesystem = ["zeroclaw-channels/channel-filesystem"]
 channel-amqp = ["zeroclaw-channels/channel-amqp"]
 channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-linq"]
@@ -319,7 +319,7 @@ observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
     "zeroclaw-gateway/observability-prometheus",
 ]
-observability-otel = ["zeroclaw-runtime/observability-otel"]
+observability-otel = ["zeroclaw-runtime/observability-otel", "zeroclaw-log/otel-bridge"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 # Forwards `zeroclaw-hardware/dev-sim`: extends the serial allow-list with

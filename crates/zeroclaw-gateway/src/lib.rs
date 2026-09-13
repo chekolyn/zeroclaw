@@ -476,6 +476,18 @@ pub struct AppState {
     pub mem: Arc<dyn Memory>,
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
+    /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
+    pub webhook_secret_hash: Option<Arc<str>>,
+    /// Generic webhook channel secrets keyed by listen_path (e.g., "/webhook/github" -> secret).
+    /// For dynamic route registration from [channels.webhook.*] config.
+    #[cfg(feature = "channel-webhook")]
+    pub generic_webhook_secrets: HashMap<String, Arc<str>>,
+    /// Maps listen_path to channel alias for agent routing.
+    #[cfg(feature = "channel-webhook")]
+    pub generic_webhook_aliases: HashMap<String, String>,
+    /// Maps listen_path to signature header name (e.g., "X-Hub-Signature-256").
+    #[cfg(feature = "channel-webhook")]
+    pub generic_webhook_signature_headers: HashMap<String, String>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -566,10 +578,14 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
+// One parameter per daemon-owned dependency; a bundling struct would only
+// move the list. Matches the existing allowance on the runtime spawn paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -586,6 +602,9 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon generation's driver supervisor set: approval surfaces
+    // register resumed headless drivers here so reload drains them.
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -1524,6 +1543,50 @@ pub async fn run_gateway(
         None
     };
 
+    // Build generic webhook channel secrets and alias maps for dynamic route registration
+    #[cfg(feature = "channel-webhook")]
+    let generic_webhook_secrets: HashMap<String, Arc<str>> = config
+        .channels
+        .webhook
+        .iter()
+        .filter(|(_, wh)| wh.enabled)
+        .filter_map(|(_, wh)| {
+            let secret = wh
+                .secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)?;
+            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            Some((path, Arc::from(secret)))
+        })
+        .collect();
+
+    #[cfg(feature = "channel-webhook")]
+    let generic_webhook_aliases: HashMap<String, String> = config
+        .channels
+        .webhook
+        .iter()
+        .filter(|(_, wh)| wh.enabled)
+        .filter_map(|(alias, wh)| {
+            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            Some((path, alias.clone()))
+        })
+        .collect();
+
+    #[cfg(feature = "channel-webhook")]
+    let generic_webhook_signature_headers: HashMap<String, String> = config
+        .channels
+        .webhook
+        .iter()
+        .filter(|(_, wh)| wh.enabled)
+        .map(|(_, wh)| {
+            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            let header = wh.signature_header.clone();
+            (path, header)
+        })
+        .collect();
+
     let state = AppState {
         config: config_state,
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1552,6 +1615,12 @@ pub async fn run_gateway(
         nextcloud_talk_webhook_secret,
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
+        #[cfg(feature = "channel-webhook")]
+        generic_webhook_secrets: generic_webhook_secrets,
+        #[cfg(feature = "channel-webhook")]
+        generic_webhook_aliases: generic_webhook_aliases,
+        #[cfg(feature = "channel-webhook")]
+        generic_webhook_signature_headers: generic_webhook_signature_headers,
         observer: state_observer,
         tools_registry,
         tools_registry_by_agent,
@@ -1574,6 +1643,7 @@ pub async fn run_gateway(
         tui_registry,
         sop_engine,
         sop_audit,
+        sop_driver_handles,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1601,7 +1671,7 @@ pub async fn run_gateway(
     };
 
     // Build router with middleware
-    let inner = Router::new()
+    let mut inner = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -1616,10 +1686,47 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+<<<<<<< HEAD
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
+=======
+        .merge(optional_channel_routes());
+
+    // ── Dynamic generic webhook routes from [channels.webhook.*] config ──
+    #[cfg(feature = "channel-webhook")]
+    {
+        for (path_str, secret) in &state.generic_webhook_secrets {
+            let secret = secret.clone();
+            let path_str = path_str.clone();
+            let signature_header = state
+                .generic_webhook_signature_headers
+                .get(path_str.as_str())
+                .cloned()
+                .unwrap_or_else(|| "X-Hub-Signature-256".to_string());
+            let path_for_route = path_str.clone();
+            let path_for_handler = path_str;
+            inner = inner.route(
+                &path_for_route,
+                post(move |state, peer_addr, headers, body| {
+                    handle_generic_webhook(state, peer_addr, headers, body, secret, path_for_handler, signature_header)
+                }),
+            );
+        }
+        if !state.generic_webhook_secrets.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"paths": state.generic_webhook_secrets.keys().collect::<Vec<_>>()})),
+                &format!("Registered {} dynamic webhook route(s)", state.generic_webhook_secrets.len())
+            );
+        }
+    }
+
+    // ── Claude Code runner hooks ──
+    inner = inner.route("/hooks/claude-code", post(api::handle_claude_code_hook))
+>>>>>>> cheknet-patched-v0.8.4
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/version/check", get(version::handle_version_check))
@@ -3125,6 +3232,153 @@ async fn handle_webhook(
     }
 }
 
+#[cfg(feature = "channel-webhook")]
+/// POST /<configured-path> — generic webhook endpoint for dynamic routes registered from [channels.webhook.*] config.
+async fn handle_generic_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+    secret: Arc<str>,
+    path: String,
+    signature_header: String,
+) -> impl IntoResponse {
+    // Rate limiting
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!("webhook {} rate limit exceeded", path)
+        );
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // Verify HMAC-SHA256 signature using configured header
+    if !secret.is_empty() {
+        let signature = headers
+            .get(signature_header.as_str())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if signature.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("webhook {}: missing {} header", path, signature_header)
+            );
+            let err = serde_json::json!({"error": format!("Missing {} header", signature_header)});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+
+        if !verify_hmac_sha256(&secret, &body, signature) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("webhook {}: invalid signature", path)
+            );
+            let err = serde_json::json!({"error": "Invalid signature"});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    // Parse JSON body
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("webhook {} JSON parse error", path)
+            );
+            let err = serde_json::json!({
+                "error": format!("Invalid JSON: {}", e)
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // Extract GitHub event type if present
+    let event_type = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    // Build message for agent dispatch
+    let message = format!(
+        "Generic webhook received on {}\nEvent: {}\nPayload: {}",
+        path,
+        event_type,
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+
+    // Determine target agent from channel alias
+    let channel_alias = state
+        .generic_webhook_aliases
+        .get(path.as_str())
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    // Dispatch to agent (reuse existing logic)
+    let session_id = None::<String>;
+    let agent_override = Some(channel_alias);
+
+    match run_gateway_chat_with_tools(&state, &message, session_id.as_deref(), agent_override.as_deref()).await {
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        }) => {
+            let body = serde_json::json!({
+                "status": "ok",
+                "response": response,
+                "model": state.model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": sanitized})),
+                &format!("webhook {} agent dispatch error", path)
+            );
+            let err = serde_json::json!({"error": "Agent dispatch failed"});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// Verify HMAC-SHA256 signature (supports "sha256=<hex>" or raw hex)
+fn verify_hmac_sha256(secret: &str, body: &[u8], signature: &str) -> bool {
+    let expected_hex = signature.strip_prefix("sha256=").unwrap_or(signature);
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let computed = hex::encode(mac.finalize().into_bytes());
+    constant_time_eq(expected_hex, &computed)
+}
+
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
 pub struct WhatsAppVerifyQuery {
@@ -4384,6 +4638,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -4967,6 +5222,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5035,6 +5291,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5081,6 +5338,7 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -5152,6 +5410,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
                 Some(readiness),
             )
             .await
@@ -5215,6 +5474,7 @@ path = "{trigger_path}"
             "127.0.0.1",
             0,
             config,
+            None,
             None,
             None,
             None,
@@ -5293,6 +5553,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5379,6 +5640,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6052,6 +6314,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6958,6 +7221,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7077,6 +7341,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7176,6 +7441,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7381,6 +7647,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7467,6 +7734,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7558,6 +7826,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7654,6 +7923,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7746,6 +8016,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7995,6 +8266,7 @@ path = "{trigger_path}"
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -8875,6 +9147,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -8960,6 +9233,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -9570,6 +9844,7 @@ path = "{trigger_path}"
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

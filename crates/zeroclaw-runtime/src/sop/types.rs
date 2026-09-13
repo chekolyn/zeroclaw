@@ -159,8 +159,12 @@ pub enum SopTrigger {
     /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
     #[trigger(display = "expression")]
     Cron {
-        /// Cron expression evaluated over the run window.
-        expression: String,
+        /// Cron expression evaluated over the run window. Optional: when the
+        /// schedule is owned by `config.toml` (cron jobs), this is `None` and the
+        /// SOP trigger is a declarative tag only — `SopCronCache` skips it and
+        /// scheduling is config-driven.
+        #[serde(default)]
+        expression: Option<String>,
     },
     /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
     #[trigger(display = "board/signal")]
@@ -231,6 +235,23 @@ pub enum SopTrigger {
 impl SopTrigger {
     pub fn source(&self) -> SopTriggerSource {
         SopTriggerSource::from(self)
+    }
+
+    /// True when this trigger can *only* start a run with no ambient agent turn.
+    ///
+    /// Every fan-in source except `Manual` fires from a listener, poller, or
+    /// the maintenance tick, none of which carry an agent identity a step could
+    /// borrow, so a procedure reachable by one must declare its own owning
+    /// agent (see [`Sop::agent`]).
+    ///
+    /// `Manual` is false because it is reachable from both sides: through the
+    /// `sop_execute` tool the calling turn's agent owns the run, while the
+    /// dashboard run endpoint emits the same event from outside any agent turn.
+    /// The trigger alone cannot tell those apart, so ownership for a Manual
+    /// start is enforced by the surface that starts it
+    /// (`sop::headless_ownership_refusal`) rather than by this flag.
+    pub fn is_headless(&self) -> bool {
+        !matches!(self, Self::Manual)
     }
 }
 
@@ -791,6 +812,17 @@ pub struct SopStepResult {
 pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
+    /// The agent whose turn started this run, for runs that began inside one
+    /// (`sop_execute`). A headless trigger has no initiating turn and leaves it
+    /// `None`.
+    ///
+    /// Persisted because it has to outlive the thing it came from: an unowned
+    /// at an approval resumes on the headless driver — possibly in a later
+    /// daemon generation — with that turn long gone. `#[serde(default)]` so runs
+    /// persisted before this field restore as `None` rather than failing to
+    /// load.
+    #[serde(default)]
+    pub initiating_agent: Option<String>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -836,7 +868,6 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
         &self.sop_name
     }
 }
-
 /// Lightweight projection of a run for list surfaces (Runs page). Carries
 /// just enough to render a row and open the per-run overlay, without the
 /// full step-result payload.
@@ -978,6 +1009,12 @@ pub enum SopRunAction {
         sop_name: String,
         reason: String,
     },
+    /// No gateway-runnable (Capability) step — the SOP is handled externally
+    /// (sidecar). No run was created; the reservation was released.
+    Skipped {
+        sop_name: String,
+        reason: String,
+    },
 }
 
 /// Exhaustive sample builder: one representative `SopTrigger` per source.
@@ -994,7 +1031,7 @@ pub(crate) fn sample_trigger(source: SopTriggerSource) -> SopTrigger {
             path: "/hook".into(),
         },
         SopTriggerSource::Cron => SopTrigger::Cron {
-            expression: "* * * * *".into(),
+            expression: Some("* * * * *".into()),
         },
         SopTriggerSource::Peripheral => SopTrigger::Peripheral {
             board: "b".into(),
@@ -1423,6 +1460,7 @@ path = "/sop/test"
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1456,5 +1494,44 @@ path = "/sop/test"
         assert_eq!(parsed.status, SopRunStatus::Running);
         assert_eq!(parsed.step_results.len(), 1);
         assert_eq!(parsed.step_results[0].status, SopStepStatus::Completed);
+    }
+
+    // T1: cron SOPs with the schedule owned by config.toml.j2 author
+    // `[[triggers]] type = "cron"` with NO `expression`. The SOP trigger's
+    // `expression` must be optional so these SOPs load.
+    #[test]
+    fn cron_trigger_without_expression_loads() {
+        let toml_str = r#"type = "cron""#;
+        let trigger: SopTrigger =
+            toml::from_str(toml_str).expect("cron trigger without expression must load");
+        assert!(
+            matches!(trigger, SopTrigger::Cron { ref expression } if expression.is_none()),
+            "cron trigger without expression must load with expression = None"
+        );
+    }
+
+    #[test]
+    fn cron_trigger_with_expression_loads() {
+        let toml_str = r#"
+type = "cron"
+expression = "*/5 * * * *"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Cron { ref expression } if expression.as_deref() == Some("*/5 * * * *")),
+            "cron trigger with expression must preserve it as Some"
+        );
+    }
+
+    #[test]
+    fn cron_trigger_display_handles_none_and_some() {
+        // No expression: the source name is used as a placeholder suffix.
+        let none = SopTrigger::Cron { expression: None };
+        assert_eq!(none.to_string(), "cron:cron");
+
+        let some = SopTrigger::Cron {
+            expression: Some("*/5 * * * *".into()),
+        };
+        assert_eq!(some.to_string(), "cron:*/5 * * * *");
     }
 }
