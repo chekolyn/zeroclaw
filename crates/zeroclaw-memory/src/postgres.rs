@@ -715,6 +715,8 @@ impl Memory for PostgresMemory {
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
         let aid = agent_id.map(str::to_string);
+        let ns = namespace.map(str::to_string).unwrap_or_else(|| "default".to_string());
+        let imp = importance.unwrap_or(0.5);
 
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
@@ -738,8 +740,6 @@ impl Memory for PostgresMemory {
             );
 
             let id = Uuid::new_v4().to_string();
-            let ns = namespace.map(str::to_string).unwrap_or_else(|| "default".to_string());
-            let imp = importance.unwrap_or(0.5);
             client.execute(
                 &stmt,
                 &[&id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp],
