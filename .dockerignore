@@ -81,3 +81,10 @@ apps/*
 # its full source is needed for workspace resolution and the relay build.
 !apps/zerorelay/
 scripts/
+
+# Build artifacts + worktrees (not needed in Docker context)
+target/
+.worktrees/
+.cache/
+*.tar.gz
+*.tar
