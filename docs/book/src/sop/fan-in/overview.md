@@ -19,14 +19,12 @@ Every SOP trigger type, its fields, and its dispatch status, projected directly 
 
 {{#sop-trigger-index}}
 
-Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener or authenticated gateway request) start runs as events arrive; cron triggers are dispatched by the daemon's periodic SOP maintenance tick; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); the remaining defined-but-unwired sources (peripheral and calendar) validate and match but have no live event source routing into the dispatcher yet.
+Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener) start runs as events arrive; cron triggers are dispatched by the daemon's periodic SOP maintenance tick; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); the remaining defined-but-unwired sources (webhook, peripheral, calendar) validate and match but have no live event source routing into the dispatcher yet.
 
 ## Security defaults
 
 | Concern | Mechanism |
 |---|---|
-| **Webhook authentication** | Gateway pairing bearer authentication plus optional `gateway.webhook_secret`/`X-Webhook-Secret`; `/sop/*` and `/webhook` share the same rate limiter. At least one control must be configured for SOP dispatch, and every configured control must pass. The separate `[channels.webhook]` alias secrets never authorize these routes |
-| **Webhook replay protection** | Optional `X-Idempotency-Key`, namespaced per SOP path as well as separately between `/sop/*` and `/webhook`. Keys are reserved before dispatch and mean at-most-once attempt, not proof that a prior run started |
 | **MQTT transport** | `mqtts://` with `use_tls = true` for TLS transport |
 | **Filesystem roots** | Broad roots (`/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, `/tmp`) rejected at config validation unless `allow_broad_roots`; include/exclude globs scope events |
 | **Filesystem symlinks** | Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |

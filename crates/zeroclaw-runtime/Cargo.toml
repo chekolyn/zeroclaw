@@ -87,6 +87,7 @@ webpki-roots = "1.0.6"
 which = "8.0"
 zeroize = { version = "1.8", features = ["alloc"] }
 zeroclaw-macros.workspace = true
+rumqttc = { version = "0.25", optional = true }
 
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
@@ -107,8 +108,9 @@ process-wrap = { version = "=9.0.0", default-features = false, features = ["job-
 
 [features]
 default = ["observability-prometheus", "schema-export"]
+channel-mqtt = ["dep:rumqttc"]
 observability-prometheus = ["dep:prometheus"]
-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "zeroclaw-log/otel-bridge"]
 sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
 

@@ -804,6 +804,7 @@ mod tests {
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Cancelled { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
+            SopRunAction::Skipped { .. } => "",
         }
     }
 
