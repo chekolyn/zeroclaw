@@ -97,6 +97,19 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Native extended thinking (Anthropic-style `thinking.budget_tokens`).
+    /// Sent to OpenAI-compatible providers that accept it (e.g. Crusoe GLM-5.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingBody>,
+}
+
+/// Serializes as `{"type": "enabled", "budget_tokens": N}` — the Anthropic-style
+/// thinking param accepted by Crusoe's GLM-5.3 (+ other reasoning models).
+#[derive(Debug, Serialize)]
+struct ThinkingBody {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -575,6 +588,10 @@ impl ModelProvider for OpenAiModelProvider {
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
+            thinking: request.thinking.as_ref().map(|t| ThinkingBody {
+                type_: "enabled",
+                budget_tokens: t.budget_tokens,
+            }),
         };
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -677,6 +694,7 @@ impl ModelProvider for OpenAiModelProvider {
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
+            thinking: None,
         };
 
         let response = self

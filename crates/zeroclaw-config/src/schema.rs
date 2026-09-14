@@ -4799,7 +4799,7 @@ pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
 fn normalize_reasoning_effort(value: &str) -> std::result::Result<String, String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(normalized),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(normalized),
         _ => Err(format!(
             "reasoning_effort {value:?} is invalid (expected one of: minimal, low, medium, high, xhigh)"
         )),
