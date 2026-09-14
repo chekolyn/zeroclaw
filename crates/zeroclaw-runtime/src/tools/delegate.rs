@@ -34,7 +34,7 @@ use zeroclaw_config::schema::{
     ResolvedRuntime, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
 };
 use zeroclaw_log::Instrument as _;
-use zeroclaw_memory::Memory;
+use zeroclaw_memory::{Memory, RecallExcludes};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 
 fn current_tool_loop_session_key() -> Option<String> {
@@ -1823,6 +1823,7 @@ impl DelegateTool {
         kinds: &[crate::tools::NativeMemoryKind],
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
+        excludes: RecallExcludes,
     ) -> (
         HashMap<crate::tools::NativeMemoryKind, Arc<dyn Tool>>,
         std::sync::Weak<crate::tools::NativeMemoryBinding>,
@@ -1837,7 +1838,10 @@ impl DelegateTool {
                 .last()
                 .is_some_and(|policy| Arc::ptr_eq(policy, &security))
         );
-        let binding = Arc::new(crate::tools::NativeMemoryBinding::new(memory, security));
+        let binding = Arc::new(
+            crate::tools::NativeMemoryBinding::new(memory, security)
+                .with_recall_excludes(excludes),
+        );
         let mut replacements = HashMap::new();
         for &kind in kinds {
             // The caller supplies first-occurrence admitted kinds. Guard against
@@ -5757,10 +5761,24 @@ impl DelegateTool {
                     None
                 };
                 let target_memory_tools = target_memory.as_ref().map(|memory| {
+                    // Thread the config-sourced three-axis excludes into the
+                    // target's recall tool so specialist subagents filter
+                    // telemetry by default — matching the main agent runtime
+                    // (tools/mod.rs). Configless builders fall back to an
+                    // empty (no-op) exclude set.
+                    let recall_excludes = match self.root_config.as_deref() {
+                        Some(config) => RecallExcludes {
+                            namespaces: config.memory.exclude_namespaces.clone(),
+                            categories: config.memory.exclude_categories.clone(),
+                            key_prefixes: config.memory.exclude_key_prefixes.clone(),
+                        },
+                        None => RecallExcludes::default(),
+                    };
                     self.memory_tools_for_target(
                         &memory_kinds,
                         Arc::clone(memory),
                         Arc::clone(&target_policy),
+                        recall_excludes,
                     )
                 });
                 let mut bounded_base_tools = Vec::with_capacity(inherited.len() + 1);
@@ -6377,7 +6395,7 @@ mod tests {
         DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
         DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig, ModelRouteConfig,
     };
-    use zeroclaw_memory::{AgentScopedMemory, MemoryCategory, SqliteMemory};
+    use zeroclaw_memory::{AgentScopedMemory, MemoryCategory, RecallExcludes, SqliteMemory};
     use zeroclaw_providers::{
         ChatRequest, ChatResponse, ReliableProviderTerminalFailure,
         ReliableProviderTerminalFailureKind, ToolCall,
@@ -12305,6 +12323,52 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("requires approval"))
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_tools_for_target_threads_config_excludes_into_recall() {
+        // The bounded delegate path builds the target's memory tools via
+        // `memory_tools_for_target`. It must thread the config-sourced
+        // `RecallExcludes` into `MemoryRecallTool` so specialist subagents
+        // filter telemetry by default — matching the main agent runtime
+        // (tools/mod.rs). This asserts the wiring directly: an excluded
+        // category is dropped from the target's recall, while a non-excluded
+        // core entry is still returned.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let inner = Arc::new(SqliteMemory::new("excl-test", &data_dir).unwrap());
+        let agent_id = inner.ensure_agent_uuid("target").await.unwrap();
+        let memory = scoped_sqlite_memory(inner, &agent_id);
+
+        memory.store(
+            "sop:1",
+            "SOP runbook",
+            MemoryCategory::Custom("sop".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        memory.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let excludes = RecallExcludes {
+            categories: vec!["sop".into()],
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tools = DelegateTool::memory_tools_for_target(memory, security, excludes);
+        let recall = tools
+            .iter()
+            .find(|t| t.name() == "memory_recall")
+            .expect("memory_recall tool present in target memory tools");
+        let result = recall.execute(json!({})).await.unwrap();
+        assert!(result.success, "recall failed: {result:?}");
+        assert!(result.output.contains("Rust"), "non-excluded core entry must be recalled");
+        assert!(
+            !result.output.contains("SOP runbook"),
+            "delegate target recall must apply config excludes (drop telemetry by default)"
         );
     }
 

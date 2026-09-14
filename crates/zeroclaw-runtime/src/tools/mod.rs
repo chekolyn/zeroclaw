@@ -870,6 +870,11 @@ pub(crate) struct NativeMemoryBinding {
     security: Arc<SecurityPolicy>,
     routed: std::sync::OnceLock<Arc<dyn Memory>>,
     operation_started: parking_lot::Mutex<bool>,
+    /// Config-sourced three-axis recall excludes (zeroclaw cheknet patch:
+    /// exclude_namespaces/exclude_categories/exclude_key_prefixes). Empty
+    /// set = no filtering; threaded into the Recall tool built from this
+    /// binding so specialist subagents filter telemetry by default.
+    recall_excludes: RecallExcludes,
 }
 
 impl NativeMemoryBinding {
@@ -879,7 +884,16 @@ impl NativeMemoryBinding {
             security,
             routed: std::sync::OnceLock::new(),
             operation_started: parking_lot::Mutex::new(false),
+            recall_excludes: RecallExcludes::default(),
         }
+    }
+
+    /// Thread config-sourced recall excludes into this binding (cheknet
+    /// three-axis recall patch): the Recall tool constructed from this
+    /// binding filters by the given namespaces/categories/key_prefixes.
+    fn with_recall_excludes(mut self, excludes: RecallExcludes) -> Self {
+        self.recall_excludes = excludes;
+        self
     }
 
     fn selected(&self) -> &Arc<dyn Memory> {
@@ -1349,7 +1363,12 @@ impl NativeMemoryOrigins {
             .map(|chain| chain.weak_policy_observations());
         let actual: Arc<dyn Tool> = match kind {
             NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
-            NativeMemoryKind::Recall => Arc::new(MemoryRecallTool::new(memory)),
+            NativeMemoryKind::Recall => {
+                Arc::new(MemoryRecallTool::new_with_excludes(
+                    memory,
+                    binding.recall_excludes.clone(),
+                ))
+            }
             NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
             NativeMemoryKind::Export => Arc::new(MemoryExportTool::new(memory)),
             NativeMemoryKind::Purge => Arc::new(MemoryPurgeTool::new(memory, security)),
