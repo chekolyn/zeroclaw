@@ -1,6 +1,28 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Three-axis exclusion set for recall filtering (cheknet patch completion).
+///
+/// `recall_filtered` drops any entry matching at least one axis:
+/// - `namespaces` use prefix matching (so `"telemetry"` excludes
+///   `"telemetry_sop"` and `"telemetry_heartbeat"`);
+/// - `categories` use exact string comparison against the entry's
+///   [`MemoryCategory`] (via its `Display` form, e.g. `"core"`, `"sop"`);
+/// - `key_prefixes` use prefix matching on the entry `key`.
+///
+/// Empty vectors mean "no exclusion on this axis"; an empty `RecallExcludes`
+/// is a no-op filter, so callers without config can construct it with
+/// `Default::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecallExcludes {
+    /// Namespace prefixes to exclude (prefix match on `entry.namespace`).
+    pub namespaces: Vec<String>,
+    /// Category names to exclude (exact match on `entry.category.to_string()`).
+    pub categories: Vec<String>,
+    /// Key prefixes to exclude (prefix match on `entry.key`).
+    pub key_prefixes: Vec<String>,
+}
+
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportFilter {
@@ -486,6 +508,61 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         let filtered: Vec<MemoryEntry> = entries
             .into_iter()
             .filter(|e| e.namespace == namespace)
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// Recall memories with three-axis exclusion filtering applied
+    /// post-fetch. Mirrors [`recall_namespaced`](Self::recall_namespaced):
+    /// fetches a wider candidate set (limit × 2) then drops entries
+    /// matching ANY exclude axis in [`RecallExcludes`].
+    ///
+    /// - `excludes.namespaces`: prefix match on `entry.namespace`;
+    /// - `excludes.categories`: exact match on `entry.category.to_string()`;
+    /// - `excludes.key_prefixes`: prefix match on `entry.key`.
+    ///
+    /// An empty `RecallExcludes` is a no-op (returns up to `limit` entries),
+    /// so callers without config can pass `&RecallExcludes::default()`.
+    /// Backends with native exclusion support can override for efficiency.
+    async fn recall_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        excludes: &RecallExcludes,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .recall(query, limit.saturating_mul(2), session_id, since, until)
+            .await?;
+        let filtered: Vec<MemoryEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                if excludes
+                    .namespaces
+                    .iter()
+                    .any(|ns| e.namespace.starts_with(ns.as_str()))
+                {
+                    return false;
+                }
+                if excludes
+                    .categories
+                    .iter()
+                    .any(|c| e.category.to_string() == c.as_str())
+                {
+                    return false;
+                }
+                if excludes
+                    .key_prefixes
+                    .iter()
+                    .any(|p| e.key.starts_with(p.as_str()))
+                {
+                    return false;
+                }
+                true
+            })
             .take(limit)
             .collect();
         Ok(filtered)
@@ -990,5 +1067,234 @@ mod tests {
             err.to_string()
                 .contains("does not support agent-attributed StoreOptions")
         );
+    }
+
+    // ── recall_filtered (three-axis exclude) tests ───────────────────────
+
+    /// Stub backend returning a fixed result set from `recall` so the
+    /// `recall_filtered` default impl's post-fetch filter can be exercised
+    /// without a real database. Only `recall` is exercised; the other trait
+    /// methods are no-ops/stubs.
+    struct FilterEchoMemory(Vec<MemoryEntry>);
+
+    impl crate::attribution::Attributable for FilterEchoMemory {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Memory(crate::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "filter-echo"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for FilterEchoMemory {
+        fn name(&self) -> &str {
+            "filter-echo"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            // Return a clone of the seeded set; the default `recall_filtered`
+            // requests limit*2 but the stub ignores the limit argument.
+            Ok(self.0.clone())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    fn filtered_entry(id: &str, ns: &str, category: MemoryCategory, key: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.into(),
+            key: key.into(),
+            content: format!("content {id}"),
+            category,
+            timestamp: "2026-02-16T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: ns.into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn filtered_seed() -> Vec<MemoryEntry> {
+        vec![
+            filtered_entry("sop1", "telemetry_sop", MemoryCategory::Custom("sop".into()), "sop:1"),
+            filtered_entry("hb1", "telemetry_heartbeat", MemoryCategory::Custom("heartbeat".into()), "hb:1"),
+            filtered_entry("core1", "default", MemoryCategory::Core, "core:1"),
+            filtered_entry("ws1", "ws", MemoryCategory::Daily, "ws:infra:id:1"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_empty_excludes_is_noop() {
+        let mem = FilterEchoMemory(filtered_seed());
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &RecallExcludes::default())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_namespace_prefix_excludes() {
+        let mem = FilterEchoMemory(filtered_seed());
+        // "telemetry" is a prefix of both telemetry_sop and telemetry_heartbeat.
+        let excludes = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            ..Default::default()
+        };
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["core1", "ws1"]);
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_category_exact_excludes() {
+        let mem = FilterEchoMemory(filtered_seed());
+        // Exact category match: "sop" excludes only the sop entry, not heartbeat.
+        let excludes = RecallExcludes {
+            categories: vec!["sop".into()],
+            ..Default::default()
+        };
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["hb1", "core1", "ws1"]);
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_category_is_exact_not_prefix() {
+        let mem = FilterEchoMemory(filtered_seed());
+        // "heart" must NOT match category "heartbeat" (exact, not prefix).
+        let excludes = RecallExcludes {
+            categories: vec!["heart".into()],
+            ..Default::default()
+        };
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 4, "exact category match must not prefix-match");
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_key_prefix_excludes() {
+        let mem = FilterEchoMemory(filtered_seed());
+        let excludes = RecallExcludes {
+            key_prefixes: vec!["ws:".into()],
+            ..Default::default()
+        };
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["sop1", "hb1", "core1"]);
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_three_axes_combine() {
+        let mem = FilterEchoMemory(filtered_seed());
+        // Exclude telemetry namespaces AND the core category AND ws: key prefix.
+        let excludes = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            categories: vec!["core".into()],
+            key_prefixes: vec!["ws:".into()],
+        };
+        let out = mem
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .unwrap();
+        // Everything is excluded.
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_filtered_respects_limit_after_filter() {
+        let mem = FilterEchoMemory(filtered_seed());
+        let out = mem
+            .recall_filtered("q", 2, None, None, None, &RecallExcludes::default())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "limit caps the post-filter result count");
     }
 }

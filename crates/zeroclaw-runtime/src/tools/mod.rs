@@ -174,6 +174,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
+use zeroclaw_memory::RecallExcludes;
 
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
@@ -928,7 +929,14 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryRecallTool::new_with_excludes(
+            memory.clone(),
+            RecallExcludes {
+                namespaces: root_config.memory.exclude_namespaces.clone(),
+                categories: root_config.memory.exclude_categories.clone(),
+                key_prefixes: root_config.memory.exclude_key_prefixes.clone(),
+            },
+        )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),

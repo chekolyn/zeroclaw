@@ -3,16 +3,31 @@ use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
-use zeroclaw_memory::Memory;
+use zeroclaw_memory::{Memory, RecallExcludes};
 
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
+    /// Three-axis exclude set sourced from `[memory] exclude_namespaces /
+    /// exclude_categories / exclude_key_prefixes`. Applied when the caller
+    /// does not opt out via `scope = "all"` (the audit/debug escape hatch).
+    excludes: RecallExcludes,
 }
 
 impl MemoryRecallTool {
     pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            excludes: RecallExcludes::default(),
+        }
+    }
+
+    /// Construct with the config-sourced three-axis excludes. Used by the
+    /// agent runtime where the live `MemoryConfig` is available; the bare
+    /// [`new`](Self::new) constructor is kept for tests and config-less
+    /// callers (empty excludes → no-op filter).
+    pub fn new_with_excludes(memory: Arc<dyn Memory>, excludes: RecallExcludes) -> Self {
+        Self { memory, excludes }
     }
 
     /// Handle prefix recall mode: list all entries whose key starts with `prefix`.
@@ -169,7 +184,22 @@ impl Tool for MemoryRecallTool {
             return self.handle_prefix_recall(prefix, limit).await;
         }
 
-        match self.memory.recall(query, limit, None, since, until).await {
+        // `scope = "all"` is the audit/debug escape hatch: skip the
+        // config-sourced excludes and recall verbatim. Default ("filtered")
+        // applies the three-axis excludes via `recall_filtered`.
+        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("filtered");
+        let skip_excludes = scope.eq_ignore_ascii_case("all");
+        let recall_result = if skip_excludes {
+            self.memory
+                .recall(query, limit, None, since, until)
+                .await
+        } else {
+            self.memory
+                .recall_filtered(query, limit, None, since, until, &self.excludes)
+                .await
+        };
+
+        match recall_result {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found.".into(),
@@ -558,5 +588,88 @@ mod tests {
         assert!(enum_values.contains(&json!("bm25")));
         assert!(enum_values.contains(&json!("embedding")));
         assert!(enum_values.contains(&json!("hybrid")));
+    }
+
+    #[tokio::test]
+    async fn filtered_scope_applies_config_excludes() {
+        let (_tmp, mem) = seeded_mem();
+        // telemetry entry should be excluded by namespace prefix "telemetry".
+        mem.store_with_metadata(
+            "sop:1",
+            "SOP runbook",
+            MemoryCategory::Custom("sop".into()),
+            None,
+            Some("telemetry_sop"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let excludes = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            ..Default::default()
+        };
+        let tool = MemoryRecallTool::new_with_excludes(mem, excludes);
+        // Default scope is "filtered" → telemetry_sop entry is dropped.
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Rust"));
+        assert!(!result.output.contains("SOP runbook"));
+    }
+
+    #[tokio::test]
+    async fn scope_all_bypasses_config_excludes() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store_with_metadata(
+            "sop:1",
+            "SOP runbook",
+            MemoryCategory::Custom("sop".into()),
+            None,
+            Some("telemetry_sop"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let excludes = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            ..Default::default()
+        };
+        let tool = MemoryRecallTool::new_with_excludes(mem, excludes);
+        // scope=all is the audit escape hatch: excludes are NOT applied.
+        let result = tool.execute(json!({"scope": "all"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Rust"));
+        assert!(
+            result.output.contains("SOP runbook"),
+            "scope=all must return the excluded entry for audit/debug"
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_scope_category_exclude_exact_match() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("sop:1", "SOP runbook", MemoryCategory::Custom("sop".into()), None)
+            .await
+            .unwrap();
+        mem.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let excludes = RecallExcludes {
+            categories: vec!["sop".into()],
+            ..Default::default()
+        };
+        let tool = MemoryRecallTool::new_with_excludes(mem, excludes);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Rust"));
+        assert!(!result.output.contains("SOP runbook"));
     }
 }

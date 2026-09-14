@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use postgres::{Client, NoTls, Row};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -57,6 +58,11 @@ pub struct PostgresMemory {
     client: DropOnThread<Arc<Mutex<Client>>>,
     qualified_table: String,
     qualified_agents: String,
+    /// Category → namespace map applied at write time (`memory.category_namespaces`).
+    /// When a memory is stored with a category present in this map, the mapped
+    /// namespace overrides the default. Enables granular namespaces excluded
+    /// from recall via `exclude_namespaces` prefix matching.
+    category_namespaces: HashMap<String, String>,
 }
 
 impl PostgresMemory {
@@ -105,7 +111,19 @@ impl PostgresMemory {
             client: DropOnThread::new(Arc::new(Mutex::new(client))),
             qualified_table,
             qualified_agents,
+            category_namespaces: HashMap::new(),
         })
+    }
+
+    /// Apply the `[memory] category_namespaces` config so writes auto-tag the
+    /// namespace from the category. Builder-style: consumes and returns `self`.
+    /// Called once at backend construction from `build_postgres_memory`.
+    pub fn with_category_namespaces(
+        mut self,
+        category_namespaces: HashMap<String, String>,
+    ) -> Self {
+        self.category_namespaces = category_namespaces;
+        self
     }
 
     fn initialize_client(
@@ -386,7 +404,11 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        self.store_with_agent(key, content, category, session_id, None, None, None)
+        // Apply `[memory] category_namespaces`: if the category maps to a
+        // namespace, store under that namespace instead of the default.
+        let category_key = Self::category_to_str(&category);
+        let ns = self.category_namespaces.get(&category_key).map(String::as_str);
+        self.store_with_agent(key, content, category, session_id, ns, None, None)
             .await
     }
 
