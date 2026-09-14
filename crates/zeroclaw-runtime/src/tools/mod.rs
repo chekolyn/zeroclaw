@@ -216,6 +216,7 @@ use zeroclaw_api::memory_traits::{
 };
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
+use zeroclaw_memory::RecallExcludes;
 
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
@@ -2520,7 +2521,17 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(CronRunsTool::new(config.clone(), agent_alias))
     );
     register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
-    register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
+    register_tool!(
+        "memory_recall",
+        Arc::new(MemoryRecallTool::new_with_excludes(
+            memory.clone(),
+            RecallExcludes {
+                namespaces: root_config.memory.exclude_namespaces.clone(),
+                categories: root_config.memory.exclude_categories.clone(),
+                key_prefixes: root_config.memory.exclude_key_prefixes.clone(),
+            },
+        ))
+    );
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
     register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
     register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
