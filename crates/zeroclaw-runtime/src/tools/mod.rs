@@ -212,6 +212,7 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
+use zeroclaw_memory::RecallExcludes;
 
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
@@ -1722,7 +1723,14 @@ fn all_tools_with_runtime_on_thread(
     );
     register_tool!(
         "memory_recall",
-        Arc::new(MemoryRecallTool::new(memory.clone()))
+        Arc::new(MemoryRecallTool::new_with_excludes(
+            memory.clone(),
+            RecallExcludes {
+                namespaces: root_config.memory.exclude_namespaces.clone(),
+                categories: root_config.memory.exclude_categories.clone(),
+                key_prefixes: root_config.memory.exclude_key_prefixes.clone(),
+            },
+        ))
     );
     register_tool!(
         "memory_forget",

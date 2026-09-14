@@ -12877,6 +12877,13 @@ pub struct MemoryConfig {
     /// Default namespace for memory entries.
     #[serde(default = "default_namespace")]
     pub default_namespace: String,
+    /// Map categories → namespace at write time (auto-tags telemetry). When a
+    /// memory is stored with a category in this map, the namespace is set to the
+    /// mapped value instead of default_namespace. Enables granular namespaces
+    /// (e.g. {sop = "telemetry_sop", heartbeat = "telemetry_heartbeat"}) excluded
+    /// from recall via exclude_namespaces with prefix matching ("telemetry").
+    #[serde(default)]
+    pub category_namespaces: HashMap<String, String>,
 
     // ── Conflict Resolution ─────────────────────────────────────
     /// Cosine similarity threshold for conflict detection (0.0–1.0).
@@ -13386,6 +13393,7 @@ impl Default for MemoryConfig {
             fts_early_return_score: default_fts_early_return_score(),
             recall_date_stamp: true,
             default_namespace: default_namespace(),
+            category_namespaces: HashMap::new(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),
             dedup_on_write: false,
