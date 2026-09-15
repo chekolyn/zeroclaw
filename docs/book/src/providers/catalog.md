@@ -540,16 +540,7 @@ model   = "deepseek-ai/DeepSeek-V4-Flash"   # bare Crusoe catalog ID; see /v1/mo
 api_key = "..."
 ```
 
-The `crusoe` slot uses `https://api.inference.crusoecloud.com/v1` by default and sends
-`Authorization: Bearer <api_key>`. Model IDs are the vendor-prefixed catalog IDs served
-by Crusoe (e.g. `zai/GLM-5.2`, `nvidia/Nemotron-3-Super-120B-A12B`, `deepseek-ai/DeepSeek-V4-Pro`);
-the `crusoe/` prefix some tools use is NOT sent; ZeroClaw passes the `model` field
-verbatim. The slot has no public model index, so the model picker stays empty until you
-paste a credential; once a key is set, ZeroClaw lists models from Crusoe's live
-`/v1/models` endpoint. Credentials come only from config (`api_key`); there is no
-per-provider `CRUSOE_API_KEY` environment variable. To bridge an existing
-`CRUSOE_API_KEY` shell variable into ZeroClaw's schema-mirror env surface, set
-`ZEROCLAW_providers__models__crusoe__default__api_key="$CRUSOE_API_KEY"`.
+The `crusoe` slot uses `https://api.inference.crusoecloud.com/v1` by default and sends `Authorization: Bearer <api_key>`. Model IDs are the vendor-prefixed catalog IDs returned by Crusoe's authenticated `/v1/models` endpoint; use that live result to select an available model. The `crusoe/` prefix some tools use is not sent; ZeroClaw passes the `model` field verbatim. The slot has no public model index, so the model picker stays empty until you paste a credential; once a key is set, ZeroClaw lists models from Crusoe's live `/v1/models` endpoint. Credentials come only from config (`api_key`); there is no per-provider `CRUSOE_API_KEY` environment variable. To bridge an existing `CRUSOE_API_KEY` shell variable into ZeroClaw's schema-mirror env surface, set `ZEROCLAW_providers__models__crusoe__default__api_key="$CRUSOE_API_KEY"`.
 
 ---
 
