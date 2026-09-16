@@ -11520,6 +11520,10 @@ pub struct PostgresStorageConfig {
     pub table: String,
     /// Optional connection timeout in seconds.
     pub connect_timeout_secs: Option<u64>,
+    /// Optional per-operation timeout in seconds. Bounds every query on this
+    /// backend's connection (server-side `statement_timeout`) and the
+    /// client-side await of each memory operation. Unset = 30s.
+    pub op_timeout_secs: Option<u64>,
     /// Enable pgvector extension for hybrid vector+keyword recall.
     pub vector_enabled: bool,
     /// Vector dimensions for pgvector embeddings.
@@ -11533,6 +11537,7 @@ impl Default for PostgresStorageConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            op_timeout_secs: None,
             vector_enabled: false,
             vector_dimensions: default_pgvector_dimensions(),
         }
