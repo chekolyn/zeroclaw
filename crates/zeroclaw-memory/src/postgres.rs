@@ -16,6 +16,12 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// Default per-operation timeout (seconds) bounding each memory query.
+const DEFAULT_OP_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum allowed per-operation timeout (seconds).
+const POSTGRES_OP_TIMEOUT_CAP_SECS: u64 = 300;
+
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
 impl<T: Send + 'static> DropOnThread<T> {
@@ -63,6 +69,7 @@ pub struct PostgresMemory {
     /// namespace overrides the default. Enables granular namespaces excluded
     /// from recall via `exclude_namespaces` prefix matching.
     category_namespaces: HashMap<String, String>,
+    op_timeout: Duration,
 }
 
 impl PostgresMemory {
@@ -72,6 +79,7 @@ impl PostgresMemory {
         schema: &str,
         table: &str,
         connect_timeout_secs: Option<u64>,
+        op_timeout_secs: Option<u64>,
         pgvector_enabled: Option<bool>,
         pgvector_dimensions: Option<usize>,
     ) -> Result<Self> {
@@ -89,9 +97,16 @@ impl PostgresMemory {
             None
         };
 
+        let op_timeout = Duration::from_secs(
+            op_timeout_secs
+                .unwrap_or(DEFAULT_OP_TIMEOUT_SECS)
+                .min(POSTGRES_OP_TIMEOUT_CAP_SECS),
+        );
+
         let (client, pgvector_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
+            op_timeout,
             schema_ident.clone(),
             qualified_table.clone(),
             pgvector,
@@ -112,6 +127,7 @@ impl PostgresMemory {
             qualified_table,
             qualified_agents,
             category_namespaces: HashMap::new(),
+            op_timeout,
         })
     }
 
@@ -129,6 +145,7 @@ impl PostgresMemory {
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
+        op_timeout: Duration,
         schema_ident: String,
         qualified_table: String,
         pgvector: Option<usize>,
@@ -145,9 +162,21 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
+                config.keepalives(true);
+                config.keepalives_idle(Duration::from_secs(15));
+                config.keepalives_retries(3);
+
                 let mut client = config
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL memory backend")?;
+
+                let timeout_ms = op_timeout.as_millis();
+                client
+                    .batch_execute(&format!(
+                        "SET statement_timeout = {timeout_ms}; \
+                         SET idle_in_transaction_session_timeout = {timeout_ms};"
+                    ))
+                    .context("failed to apply PostgreSQL session timeouts")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
                 zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
@@ -323,7 +352,7 @@ impl PostgresMemory {
     }
 }
 
-async fn run_on_os_thread<F, T>(f: F) -> Result<T>
+async fn run_on_os_thread<F, T>(op_timeout: Duration, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -338,7 +367,23 @@ where
         })
         .context("failed to spawn PostgreSQL operation thread")?;
 
-    rx.await.map_err(|_| {
+    let awaited = match tokio::time::timeout(op_timeout, rx).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "PostgreSQL memory operation exceeded its timeout; the operation thread was abandoned"
+            );
+            anyhow::bail!(
+                "PostgreSQL memory operation exceeded {}s timeout",
+                op_timeout.as_secs()
+            );
+        }
+    };
+
+    awaited.map_err(|_| {
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -429,7 +474,7 @@ impl Memory for PostgresMemory {
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);
 
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
@@ -479,7 +524,7 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
 
-        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Option<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -504,7 +549,7 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
-        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Option<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -533,7 +578,7 @@ impl Memory for PostgresMemory {
         let category = category.map(Self::category_to_str);
         let sid = session_id.map(str::to_string);
 
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -561,7 +606,7 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
-        run_on_os_thread(move || -> Result<bool> {
+        run_on_os_thread(self.op_timeout, move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
             let deleted = client.execute(&stmt, &[&key])?;
@@ -576,7 +621,7 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
-        run_on_os_thread(move || -> Result<bool> {
+        run_on_os_thread(self.op_timeout, move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
             let deleted = client.execute(&stmt, &[&key, &agent_id])?;
@@ -591,7 +636,7 @@ impl Memory for PostgresMemory {
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
 
-        run_on_os_thread(move || -> Result<usize> {
+        run_on_os_thread(self.op_timeout, move || -> Result<usize> {
             let mut client = client.lock();
             let stmt =
                 format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
@@ -607,7 +652,7 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
-        run_on_os_thread(move || -> Result<usize> {
+        run_on_os_thread(self.op_timeout, move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!(
                 "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
@@ -624,7 +669,7 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -650,7 +695,7 @@ impl Memory for PostgresMemory {
         let from = from.to_string();
         let to = to.to_string();
 
-        run_on_os_thread(move || -> Result<usize> {
+        run_on_os_thread(self.op_timeout, move || -> Result<usize> {
             let mut client = client.lock();
             let mut tx = client.transaction()?;
             let to_rows: i64 = tx
@@ -685,7 +730,7 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
-        run_on_os_thread(move || -> Result<usize> {
+        run_on_os_thread(self.op_timeout, move || -> Result<usize> {
             let mut client = client.lock();
             // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
             // residue is the presence of that alias row (0 or 1), NOT the memory-
@@ -702,7 +747,7 @@ impl Memory for PostgresMemory {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
 
-        run_on_os_thread(move || -> Result<usize> {
+        run_on_os_thread(self.op_timeout, move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
@@ -715,9 +760,11 @@ impl Memory for PostgresMemory {
 
     async fn health_check(&self) -> bool {
         let client = self.client.get().clone();
-        run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
-            .await
-            .unwrap_or(false)
+        run_on_os_thread(self.op_timeout, move || {
+            Ok(client.lock().simple_query("SELECT 1").is_ok())
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn store_with_agent(
@@ -741,7 +788,7 @@ impl Memory for PostgresMemory {
         let ns = namespace.map(str::to_string).unwrap_or_else(|| "default".to_string());
         let imp = importance.unwrap_or(0.5);
 
-        run_on_os_thread(move || -> Result<()> {
+        run_on_os_thread(self.op_timeout, move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
             let stmt = format!(
@@ -797,7 +844,7 @@ impl Memory for PostgresMemory {
         let until_owned = until.map(str::to_string);
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
@@ -848,7 +895,7 @@ impl Memory for PostgresMemory {
         let client = self.client.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
-        run_on_os_thread(move || -> Result<String> {
+        run_on_os_thread(self.op_timeout, move || -> Result<String> {
             let mut client = client.lock();
             let candidate = Uuid::new_v4().to_string();
             client.execute(
@@ -986,6 +1033,7 @@ mod tests {
                 Some(1),
                 None,
                 None,
+                None,
             )
         });
 
@@ -1005,6 +1053,7 @@ mod tests {
                 "public",
                 "memories",
                 Some(1),
+                None,
                 Some(true),
                 Some(4),
             )
@@ -1075,6 +1124,7 @@ mod tests {
                 &schema.name,
                 "memories",
                 Some(5),
+                None,
                 Some(true),
                 Some(4),
             )
@@ -1177,6 +1227,25 @@ mod tests {
         assert!(
             second.is_empty(),
             "re-running the plan over the rewritten value yields no further rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn op_thread_timeout_bounds_hung_operations() {
+        let started = std::time::Instant::now();
+        let result = run_on_os_thread(Duration::from_millis(50), move || {
+            std::thread::sleep(Duration::from_millis(2_000));
+            Ok(())
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "a hung operation must resolve into an error"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "the await must unblock at the timeout, not wait out the operation: {:?}",
+            started.elapsed()
         );
     }
 }
