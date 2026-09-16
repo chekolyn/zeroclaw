@@ -1060,19 +1060,38 @@ fn backend_fingerprint(
     Ok(hasher.finish())
 }
 
+/// Construct the inner backend for `config` off the async runtime.
+///
+/// `create_memory_from_config` blocks its caller — the postgres backend
+/// joins its initializer thread — so constructing on a Tokio worker
+/// stalls that worker for the whole connect + schema-init duration.
+async fn backend_off_runtime(
+    config: &zeroclaw_config::schema::Config,
+    api_key: Option<&str>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    let owned_config = config.clone();
+    let owned_api_key = api_key.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        create_memory_from_config(&owned_config, owned_api_key.as_deref())
+    })
+    .await
+    .context("memory backend construction task cancelled")?
+}
+
 /// Construct or reuse the shared inner memory backend for `config`.
 ///
 /// With `[memory] backend_cache = true` (the default) the inner backend is
 /// constructed once per distinct configuration and shared across callers;
 /// any config change produces a fresh instance. With `backend_cache =
 /// false`, every call constructs a fresh backend, preserving the
-/// pre-cache behavior.
+/// pre-cache behavior. Construction in both paths runs on the blocking
+/// thread pool, never on an async worker.
 pub async fn backend_from_config_cached(
     config: &zeroclaw_config::schema::Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
     if !config.memory.backend_cache {
-        let inner = create_memory_from_config(config, api_key)?;
+        let inner = backend_off_runtime(config, api_key).await?;
         return Ok(Arc::from(inner));
     }
 
@@ -1085,7 +1104,7 @@ pub async fn backend_from_config_cached(
         return Ok(Arc::clone(cached));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
+    let inner = backend_off_runtime(config, api_key).await?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
     if cache.len() >= MAX_CACHED_BACKENDS {
         cache.pop_front();
@@ -3108,6 +3127,27 @@ store_timeout_ms = 40000
         assert!(
             !Arc::ptr_eq(&a, &b),
             "backend_cache = false must construct a fresh backend per call"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_cache_works_on_current_thread_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+
+        let handle = backend_from_config_cached(&config, None).await.unwrap();
+        handle
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a current-thread runtime must construct, cache, and serve memory ops"
         );
     }
 }
