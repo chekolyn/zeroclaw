@@ -1007,37 +1007,58 @@ fn backend_fingerprint(
     Ok(hasher.finish())
 }
 
+/// Hard upper bound on backend construction. Generous enough to cover the
+/// 300s postgres `connect_timeout` cap; a construction that cannot finish
+/// within it is a hang (unreachable host with no connect timeout set,
+/// OS-level SYN blackhole) and must fail the caller rather than park it.
+const MAX_CONSTRUCTION_SECS: u64 = 300;
+
 /// Construct the inner backend for `config` off the async runtime.
 ///
 /// `create_memory_from_config` blocks its caller — the postgres backend
 /// joins its initializer thread — so constructing on a Tokio worker
 /// stalls that worker for the whole connect + schema-init duration.
+/// The `spawn_blocking` await is bounded by [`MAX_CONSTRUCTION_SECS`].
 async fn backend_off_runtime(
     config: &zeroclaw_config::schema::Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let owned_config = config.clone();
     let owned_api_key = api_key.map(str::to_string);
-    tokio::task::spawn_blocking(move || {
-        create_memory_from_config(&owned_config, owned_api_key.as_deref())
-    })
-    .await
-    .context("memory backend construction task cancelled")?
+    let joined = tokio::time::timeout(
+        std::time::Duration::from_secs(MAX_CONSTRUCTION_SECS),
+        tokio::task::spawn_blocking(move || {
+            create_memory_from_config(&owned_config, owned_api_key.as_deref())
+        }),
+    )
+    .await;
+    let handle_result = match joined {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            anyhow::bail!("memory backend construction exceeded {MAX_CONSTRUCTION_SECS}s")
+        }
+    };
+    handle_result.context("memory backend construction task cancelled")?
 }
 
 /// Construct or reuse the shared inner memory backend for `config`.
 ///
-/// With `[memory] backend_cache = true` (the default) the inner backend is
-/// constructed once per distinct configuration and shared across callers;
-/// any config change produces a fresh instance. With `backend_cache =
-/// false`, every call constructs a fresh backend, preserving the
-/// pre-cache behavior. Construction in both paths runs on the blocking
-/// thread pool, never on an async worker.
+/// `[memory] backend_cache` is tri-state: `true` shares one backend per
+/// distinct configuration across all backend kinds; `false` constructs fresh
+/// on every call; unset (default) shares only the postgres backend — the
+/// backend whose per-message construction cost (TCP connect + schema DDL +
+/// migration checks) this cache exists to amortize. Any config change
+/// produces a fresh instance. Construction in every path runs on the
+/// blocking thread pool, never on an async worker.
 pub async fn backend_from_config_cached(
     config: &zeroclaw_config::schema::Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Memory>> {
-    if !config.memory.backend_cache {
+    let cache_enabled = match config.memory.backend_cache {
+        Some(explicit) => explicit,
+        None => backend_kind_from_dotted(&config.memory.backend) == "postgres",
+    };
+    if !cache_enabled {
         let inner = backend_off_runtime(config, api_key).await?;
         return Ok(Arc::from(inner));
     }
@@ -2980,7 +3001,8 @@ store_timeout_ms = 40000
     #[tokio::test]
     async fn backend_cache_shares_instance_for_identical_config() {
         let tmp = TempDir::new().unwrap();
-        let config = agent_config(&tmp);
+        let mut config = agent_config(&tmp);
+        config.memory.backend_cache = Some(true);
 
         let a = backend_from_config_cached(&config, None).await.unwrap();
         let b = backend_from_config_cached(&config, None).await.unwrap();
@@ -2994,11 +3016,13 @@ store_timeout_ms = 40000
     #[tokio::test]
     async fn backend_cache_rebuilds_on_config_change() {
         let tmp = TempDir::new().unwrap();
-        let config = agent_config(&tmp);
+        let mut config = agent_config(&tmp);
+        config.memory.backend_cache = Some(true);
         let a = backend_from_config_cached(&config, None).await.unwrap();
 
         let mut changed = agent_config(&tmp);
         changed.data_dir = tmp.path().join("data-elsewhere");
+        changed.memory.backend_cache = Some(true);
 
         let b = backend_from_config_cached(&changed, None).await.unwrap();
         assert!(
@@ -3011,7 +3035,7 @@ store_timeout_ms = 40000
     async fn backend_cache_disabled_constructs_fresh_instances() {
         let tmp = TempDir::new().unwrap();
         let mut config = agent_config(&tmp);
-        config.memory.backend_cache = false;
+        config.memory.backend_cache = Some(false);
 
         let a = backend_from_config_cached(&config, None).await.unwrap();
         let b = backend_from_config_cached(&config, None).await.unwrap();
@@ -3019,6 +3043,20 @@ store_timeout_ms = 40000
         assert!(
             !Arc::ptr_eq(&a, &b),
             "backend_cache = false must construct a fresh backend per call"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_cache_auto_scopes_to_postgres_backend() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+
+        let a = backend_from_config_cached(&config, None).await.unwrap();
+        let b = backend_from_config_cached(&config, None).await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "unset backend_cache must not share non-postgres backends; sqlite constructs fresh per call"
         );
     }
 
