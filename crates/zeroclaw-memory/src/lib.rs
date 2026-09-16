@@ -1019,6 +1019,81 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
     ))
 }
 
+/// Shared inner backends, keyed by config fingerprint.
+///
+/// Constructing a backend is expensive for SQL stores — the postgres
+/// backend performs a TCP connect, schema DDL, and migration checks — and
+/// [`create_memory_for_agent`] runs on every processed message, so a
+/// per-message construction both hammers the database and blocks the
+/// caller. Entries are keyed by fingerprint: hits clone the `Arc`, misses
+/// construct while holding the lock, so concurrent first-callers
+/// single-flight instead of racing. The FIFO cap bounds how many
+/// historical configurations keep a live connection after config
+/// reloads.
+type SharedBackendMap = tokio::sync::Mutex<std::collections::VecDeque<(u64, Arc<dyn Memory>)>>;
+
+static SHARED_BACKENDS: std::sync::OnceLock<SharedBackendMap> = std::sync::OnceLock::new();
+
+/// Maximum distinct configurations retaining a live cached backend.
+const MAX_CACHED_BACKENDS: usize = 16;
+
+fn backend_fingerprint(
+    config: &zeroclaw_config::schema::Config,
+    api_key: Option<&str>,
+) -> anyhow::Result<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    // Hash the exact inputs create_memory_from_config consumes.
+    // data_dir and config_path are #[serde(skip)] on Config, so they are
+    // hashed explicitly — a whole-Config fingerprint would alias two
+    // installs that share a config file but write to different data dirs.
+    let canonical = serde_json::to_string(&(
+        &config.memory,
+        &config.storage,
+        &config.embedding_routes,
+        &config.providers,
+    ))
+    .context("failed to serialize config for the memory backend fingerprint")?;
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    config.data_dir.hash(&mut hasher);
+    api_key.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+/// Construct or reuse the shared inner memory backend for `config`.
+///
+/// With `[memory] backend_cache = true` (the default) the inner backend is
+/// constructed once per distinct configuration and shared across callers;
+/// any config change produces a fresh instance. With `backend_cache =
+/// false`, every call constructs a fresh backend, preserving the
+/// pre-cache behavior.
+pub async fn backend_from_config_cached(
+    config: &zeroclaw_config::schema::Config,
+    api_key: Option<&str>,
+) -> anyhow::Result<Arc<dyn Memory>> {
+    if !config.memory.backend_cache {
+        let inner = create_memory_from_config(config, api_key)?;
+        return Ok(Arc::from(inner));
+    }
+
+    let fingerprint = backend_fingerprint(config, api_key)?;
+    let cache_slot =
+        SHARED_BACKENDS.get_or_init(|| tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut cache = cache_slot.lock().await;
+
+    if let Some((_, cached)) = cache.iter().find(|(fp, _)| *fp == fingerprint) {
+        return Ok(Arc::clone(cached));
+    }
+
+    let inner = create_memory_from_config(config, api_key)?;
+    let inner_arc: Arc<dyn Memory> = Arc::from(inner);
+    if cache.len() >= MAX_CACHED_BACKENDS {
+        cache.pop_front();
+    }
+    cache.push_back((fingerprint, Arc::clone(&inner_arc)));
+    Ok(inner_arc)
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -1127,8 +1202,7 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
-    let inner_arc: Arc<dyn Memory> = Arc::from(inner);
+    let inner_arc = backend_from_config_cached(config, api_key).await?;
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
     let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
@@ -2987,6 +3061,53 @@ store_timeout_ms = 40000
             after.len(),
             2,
             "a handle must see its own writes even with the cache on"
+        );
+    }
+
+    // -- backend_from_config_cached ---------------------------------
+
+    #[tokio::test]
+    async fn backend_cache_shares_instance_for_identical_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+
+        let a = backend_from_config_cached(&config, None).await.unwrap();
+        let b = backend_from_config_cached(&config, None).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "two handles for the same config must share the inner backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_cache_rebuilds_on_config_change() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+        let a = backend_from_config_cached(&config, None).await.unwrap();
+
+        let mut changed = agent_config(&tmp);
+        changed.data_dir = tmp.path().join("data-elsewhere");
+
+        let b = backend_from_config_cached(&changed, None).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "a config change must produce a fresh backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_cache_disabled_constructs_fresh_instances() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.backend_cache = false;
+
+        let a = backend_from_config_cached(&config, None).await.unwrap();
+        let b = backend_from_config_cached(&config, None).await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "backend_cache = false must construct a fresh backend per call"
         );
     }
 }

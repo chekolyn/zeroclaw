@@ -11659,6 +11659,13 @@ pub struct MemoryConfig {
     /// disable persistence entirely.
     #[serde(default = "default_memory_backend")]
     pub backend: String,
+    /// Reuse one shared backend instance (and its connections) across all
+    /// agents and repeated backend constructions with identical config,
+    /// instead of building a fresh backend (and, for SQL backends, a fresh
+    /// connection) per call. The instance is rebuilt automatically whenever
+    /// any config input changes.
+    #[serde(default = "default_backend_cache")]
+    pub backend_cache: bool,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
     pub auto_save: bool,
@@ -12222,6 +12229,10 @@ fn default_embedding_provider() -> String {
 fn default_auto_save() -> bool {
     true
 }
+
+fn default_backend_cache() -> bool {
+    true
+}
 fn default_hygiene_enabled() -> bool {
     true
 }
@@ -12273,6 +12284,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: "sqlite".into(),
+            backend_cache: default_backend_cache(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
