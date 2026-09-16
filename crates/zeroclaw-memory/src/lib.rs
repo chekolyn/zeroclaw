@@ -100,6 +100,7 @@ fn build_postgres_memory(
         &storage.schema,
         &storage.table,
         storage.connect_timeout_secs,
+        storage.op_timeout_secs,
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
     )
