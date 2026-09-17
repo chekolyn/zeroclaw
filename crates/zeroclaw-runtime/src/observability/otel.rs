@@ -12,7 +12,8 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use zeroclaw_config::schema::OtelContentPolicy;
 
@@ -72,80 +73,156 @@ pub struct OtelObserver {
     active_agent_spans: Mutex<HashMap<String, ActiveAgentSpan>>,
 }
 
+/// Process-global OTel export pipeline: exporters, providers, and the global
+/// registrations. `create_observer` runs per agent-loop construction and the
+/// daemon holds those observers for the loop's lifetime; before this
+/// singleton each construction built and pinned a full export stack
+/// (batch-processor + periodic-reader threads, a reqwest pool) and re-swapped
+/// the global providers — one leaked stack per long-lived observer, provider
+/// churn under load, and metric aggregation fragmented across providers that
+/// never export. First construction wins; later observers share the
+/// pipeline; a failed first construction is retried on the next observer.
+struct OtelPipeline {
+    tracer_provider: SdkTracerProvider,
+    meter_provider: SdkMeterProvider,
+    endpoint: String,
+}
+
+static PIPELINE_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn pipeline_construction_count() -> usize {
+    PIPELINE_CONSTRUCTIONS.load(Ordering::Relaxed)
+}
+
+/// Returns the process's one [`OtelPipeline`], building it on first use.
+/// Observability config is process-global (`[observability]`); when a later
+/// caller requests a different endpoint the existing pipeline wins and the
+/// disagreement is surfaced as a warning.
+fn shared_pipeline(
+    endpoint: Option<&str>,
+    service_name: Option<&str>,
+    headers: Option<HashMap<String, String>>,
+) -> Result<Arc<OtelPipeline>, String> {
+    static PIPELINE: Mutex<Option<Arc<OtelPipeline>>> = Mutex::new(None);
+    let mut slot = PIPELINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pipeline) = slot.as_ref() {
+        if endpoint.unwrap_or("http://localhost:4318") != pipeline.endpoint {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "requested": endpoint.unwrap_or("http://localhost:4318"),
+                        "active": pipeline.endpoint
+                    })),
+                "OTel pipeline already initialized; keeping the existing endpoint"
+            );
+        }
+        return Ok(Arc::clone(pipeline));
+    }
+    let pipeline = Arc::new(build_pipeline(endpoint, service_name, headers)?);
+    PIPELINE_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+    *slot = Some(Arc::clone(&pipeline));
+    Ok(pipeline)
+}
+
+/// Builds the pipeline's exporters and providers, registers them globally,
+/// and installs the W3C propagator and the tracing bridge. HTTP/protobuf
+/// transport; falls back to `http://localhost:4318` when no endpoint is
+/// provided.
+fn build_pipeline(
+    endpoint: Option<&str>,
+    service_name: Option<&str>,
+    headers: Option<HashMap<String, String>>,
+) -> Result<OtelPipeline, String> {
+    let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
+    let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
+    let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
+    let service_name = service_name.unwrap_or("zeroclaw");
+
+    // ── Trace exporter ──────────────────────────────────────
+    let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(&traces_endpoint);
+    if let Some(ref h) = headers {
+        span_builder = span_builder.with_headers(h.clone());
+    }
+    let span_exporter = span_builder
+        .build()
+        .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name.to_string())
+                .build(),
+        )
+        .build();
+
+    global::set_tracer_provider(tracer_provider.clone());
+
+    // Install the W3C TraceContext + Baggage composite propagator so
+    // `traceparent` + `baggage` carry across HTTP/MQTT boundaries. Runs once
+    // per process now that the pipeline is a singleton.
+    install_w3c_propagator();
+
+    // The OTel bridge (a `tracing-opentelemetry` `OpenTelemetryLayer` wired
+    // through a `ReloadLayer` slot in `install_global_subscriber`) was
+    // installed with a no-op tracer (the provider wasn't set yet). Now
+    // that the provider is set, swap the real bridge in so gateway
+    // `tracing` spans (cron, SOP engine, channels, providers) export to
+    // OTel alongside this observer's agent-loop spans. One activation per
+    // process — previously this ran per observer construction.
+    zeroclaw_log::activate_otel_bridge();
+
+    // ── Metric exporter ─────────────────────────────────────
+    let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_endpoint(&metrics_endpoint);
+    if let Some(ref h) = headers {
+        metric_builder = metric_builder.with_headers(h.clone());
+    }
+    let metric_exporter = metric_builder
+        .build()
+        .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+
+    let metric_reader =
+        opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(metric_reader)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(service_name.to_string())
+                .build(),
+        )
+        .build();
+
+    global::set_meter_provider(meter_provider.clone());
+
+    Ok(OtelPipeline {
+        tracer_provider,
+        meter_provider,
+        endpoint: base_endpoint.to_string(),
+    })
+}
+
 impl OtelObserver {
-    /// Create a new OTel observer exporting to the given OTLP endpoint.
-    /// Uses HTTP/protobuf transport (port 4318 by default).
-    /// Falls back to `http://localhost:4318` if no endpoint is provided.
+    /// Create an observer attached to the process-global OTel pipeline (see
+    /// [`shared_pipeline`]). The instruments are per-observer; the exporters,
+    /// providers, and global registrations are constructed once per process
+    /// and shared.
     pub(crate) fn new(
         endpoint: Option<&str>,
         service_name: Option<&str>,
         headers: Option<HashMap<String, String>>,
         content_config: OtelContentConfig,
     ) -> Result<Self, String> {
-        let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
-        let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
-        let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
-        let service_name = service_name.unwrap_or("zeroclaw");
-
-        // ── Trace exporter ──────────────────────────────────────
-        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint);
-        if let Some(ref h) = headers {
-            span_builder = span_builder.with_headers(h.clone());
-        }
-        let span_exporter = span_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
-
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
-
-        global::set_tracer_provider(tracer_provider.clone());
-
-        // Install the W3C TraceContext + Baggage composite propagator so
-        // `traceparent` + `baggage` carry across HTTP/MQTT boundaries.
-        install_w3c_propagator();
-
-        // The OTel bridge (a `tracing-opentelemetry` `OpenTelemetryLayer` wired
-        // through a `ReloadLayer` slot in `install_global_subscriber`) was
-        // installed with a no-op tracer (the provider wasn't set yet). Now
-        // that the provider is set, swap the real bridge in so gateway
-        // `tracing` spans (cron, SOP engine, channels, providers) export to
-        // OTel alongside this observer's agent-loop spans.
-        zeroclaw_log::activate_otel_bridge();
-
-        // ── Metric exporter ─────────────────────────────────────
-        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint);
-        if let Some(ref h) = headers {
-            metric_builder = metric_builder.with_headers(h.clone());
-        }
-        let metric_exporter = metric_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
-
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
-
-        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
-
-        let meter_provider_clone = meter_provider.clone();
-        global::set_meter_provider(meter_provider);
+        let pipeline = shared_pipeline(endpoint, service_name, headers)?;
 
         // ── Create metric instruments ────────────────────────────
         let meter = global::meter("zeroclaw");
@@ -253,8 +330,8 @@ impl OtelObserver {
 
         Ok(Self {
             content_config,
-            tracer_provider,
-            meter_provider: meter_provider_clone,
+            tracer_provider: pipeline.tracer_provider.clone(),
+            meter_provider: pipeline.meter_provider.clone(),
             agent_starts,
             agent_duration,
             llm_calls,
@@ -1276,6 +1353,90 @@ mod tests {
             }],
             system_instructions: Some("You are helpful.".into()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_otel_threads() -> usize {
+        let entries =
+            std::fs::read_dir("/proc/self/task").expect("/proc/self/task must be readable");
+        let mut otel = 0;
+        for entry in entries {
+            let entry = entry.expect("procfs entry");
+            if let Ok(name) = std::fs::read_to_string(entry.path().join("comm")) {
+                if name.trim().starts_with("OpenTelemetry") {
+                    otel += 1;
+                }
+            }
+        }
+        otel
+    }
+    /// Given: the OTel observer factory. When: five observers are created from
+    /// the same config and HELD — the real call pattern, since `create_observer`
+    /// runs per agent-loop construction and the daemon keeps those observers
+    /// alive for the loop's lifetime. Then: the process must not accumulate a
+    /// new export stack (batch-processor + periodic-reader threads, reqwest
+    /// pools, a global provider swap) per observer; the pipeline is
+    /// process-global. The warm-up construction legitimately starts the one
+    /// pipeline; the held repeats must add nothing. (Observers that are
+    /// dropped immediately self-clean via the provider's drop-shutdown, which
+    /// is why they must be held here to mirror the daemon.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn otel_pipeline_threads_stay_singleton_when_observers_repeat() {
+        let warmup = OtelObserver::new(
+            Some("http://127.0.0.1:14319"),
+            Some("singleton-warmup"),
+            None,
+            all_off_config(),
+        )
+        .expect("warm-up observer construction must succeed");
+
+        let before = count_otel_threads();
+
+        let repeats: Vec<_> = (0..5)
+            .map(|_| {
+                OtelObserver::new(
+                    Some("http://127.0.0.1:14319"),
+                    Some("singleton-repeat"),
+                    None,
+                    all_off_config(),
+                )
+                .expect("repeat observer construction must succeed")
+            })
+            .collect();
+        assert!(!repeats.is_empty());
+
+        let after = count_otel_threads();
+        let _keep_alive = (warmup, repeats);
+        assert_eq!(
+            before,
+            after,
+            "creating 5 more observers added {} OTel threads — the pipeline must be constructed once per process",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// Given: the OTel observer factory. When: three observers are created
+    /// (held, mirroring the daemon's per-agent-loop retention). Then: at most
+    /// one pipeline construction serves them all — first construction wins,
+    /// order-independent of any test that ran before in this process.
+    #[test]
+    fn otel_pipeline_construction_is_at_most_once_per_process() {
+        let before = pipeline_construction_count();
+        let observers: Vec<_> = (0..3)
+            .map(|_| {
+                OtelObserver::new(Some("http://127.0.0.1:14319"), None, None, all_off_config())
+                    .expect("observer construction must succeed")
+            })
+            .collect();
+        assert!(!observers.is_empty());
+
+        let constructed = pipeline_construction_count() - before;
+        assert!(
+            constructed <= 1,
+            "three observers constructed the pipeline {constructed} times; \
+             first construction must win"
+        );
     }
 
     #[test]
