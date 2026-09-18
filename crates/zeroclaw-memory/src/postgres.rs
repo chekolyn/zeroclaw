@@ -391,6 +391,35 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
     }
 }
 
+/// INSERT/UPSERT used by [`Memory::store_with_agent`].
+///
+/// The `importance` placeholder must carry an explicit `::FLOAT8` annotation
+/// (both the parameter and the fallback literal). Without it, PostgreSQL
+/// infers `$10` as `NUMERIC` from the untyped `0.5` literal, and the Rust
+/// `f64` bind — which only implements `ToSql` for `FLOAT8` — fails with
+/// "error serializing parameter 9" (0-based bind index of the 10th
+/// parameter). The column itself is `REAL`; the `FLOAT8` result is
+/// assignment-cast on INSERT (`float8 → real` context 'a').
+fn store_insert_sql(qualified_table: &str, qualified_agents: &str) -> String {
+    format!(
+        "
+        INSERT INTO {qualified_table}
+            (id, key, content, category, created_at, updated_at, session_id, agent_id, namespace, importance)
+        VALUES
+            ($1, $2, $3, $4, $5, $6, $7,
+             COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+             COALESCE($9, 'default'), COALESCE($10::FLOAT8, 0.5::FLOAT8))
+        ON CONFLICT (agent_id, key) DO UPDATE SET
+            content = EXCLUDED.content,
+            category = EXCLUDED.category,
+            updated_at = EXCLUDED.updated_at,
+            session_id = EXCLUDED.session_id,
+            namespace = EXCLUDED.namespace,
+            importance = EXCLUDED.importance
+        "
+    )
+}
+
 #[async_trait]
 impl Memory for PostgresMemory {
     fn name(&self) -> &str {
@@ -437,7 +466,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
                        (
                          CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
@@ -482,7 +511,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1
@@ -507,7 +536,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1 AND m.agent_id = $2
@@ -536,7 +565,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($1::TEXT IS NULL OR m.category = $1)
@@ -627,7 +656,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
@@ -743,23 +772,7 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
-            let stmt = format!(
-                "
-                INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id, agent_id, namespace, importance)
-                VALUES
-                    ($1, $2, $3, $4, $5, $6, $7,
-                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
-                     COALESCE($9, 'default'), COALESCE($10, 0.5))
-                ON CONFLICT (agent_id, key) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id,
-                    namespace = EXCLUDED.namespace,
-                    importance = EXCLUDED.importance
-                "
-            );
+            let stmt = store_insert_sql(&qualified_table, &qualified_agents);
 
             let id = Uuid::new_v4().to_string();
             client.execute(
@@ -805,7 +818,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
                        (
                          CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
@@ -911,6 +924,28 @@ mod tests {
                 recall_time_filter(since, until, first_placeholder),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn store_insert_sql_types_importance_as_float8() {
+        let sql = store_insert_sql("memory.memories", "memory.agents");
+
+        // Regression: the importance parameter ($10, 0-based bind index 9)
+        // must be explicitly FLOAT8. Without the annotation, PostgreSQL
+        // infers $10 as NUMERIC and the f64 bind fails with
+        // "error serializing parameter 9" (f64 implements ToSql for FLOAT8
+        // only). Verified against the live backend: untyped COALESCE($10,
+        // 0.5) → numeric(1700); COALESCE($10::FLOAT8, 0.5::FLOAT8) →
+        // float8(701).
+        assert!(
+            sql.contains("COALESCE($10::FLOAT8, 0.5::FLOAT8)"),
+            "importance placeholder must be annotated ::FLOAT8, got: {sql}"
+        );
+        assert!(!sql.contains("COALESCE($10, 0.5)"));
+        // Ten parameters bound by store_with_agent.
+        for n in 1..=10 {
+            assert!(sql.contains(&format!("${n}")), "missing ${n} in: {sql}");
         }
     }
 
