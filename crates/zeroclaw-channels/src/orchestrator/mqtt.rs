@@ -68,7 +68,14 @@ pub async fn run_mqtt_sop_listener(
 
     loop {
         match eventloop.poll().await {
-            Ok(Event::Incoming(Packet::Publish(msg))) => {
+            Ok(event) => {
+                // Every completed poll proves the loop is alive — stamp the
+                // health component (see record_poll_alive for the defect-#2
+                // rationale). This includes the idle case: the broker's
+                // keepalive PingResp polls every keep_alive_secs.
+                record_poll_alive();
+                match event {
+                    Event::Incoming(Packet::Publish(msg)) => {
                 let payload_raw = String::from_utf8_lossy(&msg.payload);
                 let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
                 if let Some(sink) = driver_sink.as_ref() {
@@ -84,16 +91,17 @@ pub async fn run_mqtt_sop_listener(
                     )
                     .await;
             }
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                zeroclaw_runtime::health::mark_component_ok("mqtt");
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "MQTT SOP listener: connected to broker"
-                );
-            }
-            Ok(_) => {
-                // Other events (PingResp, SubAck, etc.) — ignore
+                    Event::Incoming(Packet::ConnAck(_)) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                            "MQTT SOP listener: connected to broker"
+                        );
+                    }
+                    // Other events (PingResp, SubAck, outgoing) — alive,
+                    // already stamped by the per-poll record above.
+                    _ => {}
+                }
             }
             Err(e) => {
                 zeroclaw_runtime::health::mark_component_error("mqtt", e.to_string());
@@ -307,5 +315,70 @@ mod tests {
     #[test]
     fn broker_port_defaults_8883_for_mqtts() {
         assert_eq!(broker_port("mqtts://secure.example.com"), 8883);
+    }
+}
+
+
+/// Records that the MQTT event loop completed a poll successfully — the
+/// steady-state proof of channel life. Called for EVERY Ok poll outcome:
+/// PingResp arrives every `keep_alive_secs` (30s) even when the wire is
+/// idle, Publishes and outgoing packets likewise prove the loop is running.
+///
+/// Defect #2 (the 2026-09-27 flap root cause): the loop previously stamped
+/// the health component ONLY on ConnAck — a healthy persistent connection
+/// receives ConnAck exactly once at boot, so `mqtt.last_ok` froze at boot
+/// and the staleness liveness probe (the 2026-09-23 wire-death interim,
+/// 900s threshold) killed every healthy gateway instance at ~18 min uptime
+/// (12 kills/4h observed on prod, 14 on canary, `restart_count: 0`
+/// throughout). Stamping per poll makes `last_ok` a true liveness-of-loop
+/// metric: a healthy-but-quiet wire refreshes every keepalive; a genuinely
+/// hung loop (the original 2026-09-23 wire death) goes stale and the probe
+/// fires — the interim mitigation restored to its intended semantics.
+fn record_poll_alive() {
+    zeroclaw_runtime::health::mark_component_ok("mqtt");
+}
+
+#[cfg(test)]
+mod loop_liveness_stamp_tests {
+    use super::*;
+
+    /// Defect #2 (the flap, root-caused 2026-09-27): the mqtt event loop
+    /// stamped `last_ok` ONLY on ConnAck — a healthy persistent connection
+    /// receives ConnAck exactly once at boot, so `last_ok` froze at boot and
+    /// the staleness liveness probe (the 2026-09-23 wire-death interim,
+    /// threshold 900s) killed EVERY healthy gateway instance at ~18 min
+    /// uptime (12 kills/4h prod, 14 canary; `restart_count: 0` throughout —
+    /// the client never died; the probe's commit premise "last_ok updates on
+    /// message consumption" was false). The fix: every successful
+    /// `eventloop.poll()` stamps `last_ok` — PingResp arrives every
+    /// `keep_alive_secs` (30s) even when idle, Publishes and outgoing
+    /// packets likewise prove the loop is alive, so a healthy-but-quiet wire
+    /// never trips the probe and a genuinely hung loop (the original
+    /// 2026-09-23 wire-death) goes stale and is killed — the interim
+    /// mitigation restored to its intended semantics.
+    #[test]
+    fn successful_poll_stamps_mqtt_last_ok() {
+        zeroclaw_runtime::health::mark_component_starting("mqtt");
+        // A completed poll (any outcome the loop returns Ok for — e.g. the
+        // 30-second keepalive PingResp) must stamp the component healthy.
+        record_poll_alive();
+        let snap = zeroclaw_runtime::health::snapshot_json();
+        let m = &snap["components"]["mqtt"];
+        assert!(
+            m["last_ok"].is_string(),
+            "a successful poll must stamp mqtt.last_ok (the staleness probe keys on its age); got {m}"
+        );
+        assert_eq!(m["status"], "ok", "a successful poll must mark the component ok");
+    }
+
+    #[test]
+    fn starting_state_has_no_last_ok_to_stale() {
+        zeroclaw_runtime::health::mark_component_starting("mqtt");
+        let snap = zeroclaw_runtime::health::snapshot_json();
+        let m = &snap["components"]["mqtt"];
+        assert!(
+            m["last_ok"].is_null(),
+            "the starting state must clear last_ok so a fresh incarnation cannot inherit stale health; got {m}"
+        );
     }
 }

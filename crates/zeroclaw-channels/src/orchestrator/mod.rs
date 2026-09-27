@@ -25673,6 +25673,7 @@ api_key = "anthropic-key"
             model_provider,
             model_provider_ref: Arc::new(model_provider_ref.to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
+            sop_driver_sink: None,
             agent_cfg: Arc::new(agent_cfg),
             memory: Arc::new(NoopMemory),
             memory_strategy: Arc::new(
