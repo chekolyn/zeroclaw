@@ -1,7 +1,8 @@
-# Patches Log for `cheknet-patched-v0.8.4` Branch
+# Patches Log for the `cheknet-patched-v*` Branches
 
-This branch carries local custom patches on top of upstream ZeroClaw v0.8.4
-for the home-lab deployment. Base upstream tag: `v0.8.4` (`a56c345d`).
+The patched branches carry local custom patches on top of the pinned upstream
+ZeroClaw tags for the home-lab deployment. v0.8.4 base: `a56c345d`; the current
+branch `cheknet-patched-v0.8.5` pins upstream v0.8.5.
 
 ## Upstreamed fixes (already in v0.8.4, NOT replayed here)
 
@@ -37,3 +38,8 @@ v0.8.4 and were intentionally dropped from the replay set to avoid conflicts:
 - NOTE: built with thin-LTO / 16 codegen-units (mirrors upstream `[profile.ci]`)
   to fit a low-memory build host; the binary is functionally identical to a
   fat-LTO release. A size-optimal fat-LTO rebuild needs a ≥8GiB build VM.
+
+## Applied patches — cheknet-patched-v0.8.5
+
+- **Lever-2b: the engine-side completion-notification directive** (`7a3640776`, quorum PROCEED 3/3 — `delegate-bg-notify-injection`, debops-cheknet 2026-09-27): `delegate.rs execute_background` gains `apply_bg_notify_directive` — the dedup-guarded append of the notify instruction to every background child's prompt. Idempotency + explicit-re-target-wins: any `sessions_send` already in the dispatcher's prompt (either form) → the injection yields. `execute_sync` untouched. 4 unit tests; the spec: `debops-cheknet/docs/proposals/2026-09-27-delegate-bg-notify-injection-design.md`.
+- **Test-target debt repair** (rides the same commit): the loop_.rs test helper mints its registry via the sanctioned `ScopedToolRegistry::assemble` seam; `rpc/context.rs::minimal_with_cert_audit` gains `sop_driver_handles: None`; the engine test's nonexistent `terminal_run_count()` replaced with the `SopRunStore::load_terminal_runs` trait call. The 5 remaining `sop::engine` test failures are pre-existing drift (they never ran before — the lib-test target did not compile).
