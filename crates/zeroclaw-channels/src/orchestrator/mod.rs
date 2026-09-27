@@ -15414,6 +15414,7 @@ temperature = 0.3
             owners,
             None,
             None,
+            None,
         );
 
         let resolved_alpha = router.resolve(&alpha_msg).expect("alpha owner");
@@ -15517,6 +15518,7 @@ temperature = 0.3
         let router = AgentRouter::multi(
             HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
             owners,
+            None,
             None,
             None,
         );
@@ -18063,6 +18065,7 @@ api_key = "anthropic-key"
             model_provider,
             model_provider_ref: Arc::new(model_provider_ref.to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
+            sop_driver_sink: None,
             agent_cfg: Arc::new(agent_cfg),
             memory: Arc::new(NoopMemory),
             memory_strategy: Arc::new(

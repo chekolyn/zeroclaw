@@ -902,7 +902,8 @@ mod tests {
             alias: alias.into(),
             engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),
             audit: Arc::new(SopAuditLogger::new(memory)),
-        })
+        
+            driver_sink: None,})
     }
 
     /// Regression for the blocking `std::sync::mpsc::Receiver::recv()` in the
