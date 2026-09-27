@@ -721,22 +721,25 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id, agent_id)
+                    (id, key, content, category, created_at, updated_at, session_id, agent_id, namespace, importance)
                 VALUES
                     ($1, $2, $3, $4, $5, $6, $7,
-                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
+                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                     COALESCE($9, 'default'), COALESCE($10::FLOAT8, 0.5::FLOAT8))
                 ON CONFLICT (agent_id, key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
                     updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
+                    session_id = EXCLUDED.session_id,
+                    namespace = EXCLUDED.namespace,
+                    importance = EXCLUDED.importance
                 "
             );
 
             let id = Uuid::new_v4().to_string();
             client.execute(
                 &stmt,
-                &[&id, &key, &content, &category, &now, &now, &sid, &aid],
+                &[&id, &key, &content, &category, &now, &now, &sid, &aid, &namespace, &importance],
             )?;
             Ok(())
         })
