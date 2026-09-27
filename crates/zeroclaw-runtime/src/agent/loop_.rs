@@ -7272,10 +7272,48 @@ mod tests {
             ]))),
             offered: Arc::clone(&offered),
         };
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
             activated: Arc::clone(&activated),
             activates: "late_tool".to_string(),
         })];
+        let built = crate::tools::AllToolsResult {
+            tools,
+            delegate_handle: None,
+            ask_user_handle: None,
+            channel_room_handle: None,
+            reaction_handle: std::sync::Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            poll_handle: None,
+            escalate_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            delegate_tool: None,
+        };
+        // Test-target debt repair (pre-existing): mint the sealed registry via
+        // the sanctioned `ScopedToolRegistry::assemble` seam (the scoped.rs test
+        // pattern) — the ToolLoop carrier takes only the sealed type.
+        let assembled_config = zeroclaw_config::schema::Config::default();
+        let assembled_security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &assembled_config,
+                agent_alias: "default",
+                security: &assembled_security,
+                built,
+                skills: &[],
+                runtime: std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+        )
+        .await
+        .registry;
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("activate then use"),

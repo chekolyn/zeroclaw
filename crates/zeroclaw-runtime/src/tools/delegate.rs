@@ -1701,6 +1701,33 @@ impl DelegateTool {
 impl DelegateTool {
     // ── Background Execution ────────────────────────────────────────
 
+    /// Lever-2b: the engine-side completion-notification directive — the hard
+    /// backstop (quorum PROCEED 3/3, `delegate-bg-notify-injection`, cycle 6).
+    /// The identity layer teaches the same instruction (the §4 bg-notification
+    /// law) but the prod eval proved the prompt-pass is soft for the current
+    /// model fleet (three consecutive eval FAILs: 2026-09-27T05:28Z 0/5,
+    /// 06:34Z, 07:14Z). The tool guarantees what the prompt cannot: every
+    /// background child is told to notify.
+    ///
+    /// Idempotency + explicit-re-target-wins: ANY `sessions_send` already in
+    /// the dispatcher's prompt (the `sessions_current()` form OR an explicit
+    /// alternate-target session id — the §4 re-delegation case) means the
+    /// dispatcher already handled the notification routing — append nothing;
+    /// the tool never overrides a deliberate routing choice.
+    fn apply_bg_notify_directive(full_prompt: String) -> String {
+        if full_prompt.contains("sessions_send") {
+            return full_prompt;
+        }
+        format!(
+            "{full_prompt}\n\n[Completion notification — required]\n\
+              Before returning, report your outcome to the dispatcher: call \
+              `sessions_send(sessions_current(), \"<summary>\")` — the gateway \
+              scopes your session to the originating (dispatching) session, so \
+              this wakes the dispatcher with your result. Do this whether you \
+              succeeded, failed, or were cancelled. Format: ✅/❌/🔄 <one-line outcome>."
+        )
+    }
+
     /// Spawn a sub-agent in a background tokio task. Returns a task_id immediately.
     /// The result is persisted to `workspace/delegate_results/{task_id}.json`.
     async fn execute_background(
@@ -1799,6 +1826,9 @@ impl DelegateTool {
         } else {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
+        // Lever-2b: the engine-side completion-notification directive (the hard
+        // backstop; quorum PROCEED 3/3, delegate-bg-notify-injection cycle 6).
+        let full_prompt = Self::apply_bg_notify_directive(full_prompt);
 
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
@@ -11406,5 +11436,51 @@ mod tool_arc_ref_spec_tests {
                 .any(|t| t == "send this to"),
             "wrapped trigger vocabulary must survive bounded delegation"
         );
+    }
+}
+
+#[cfg(test)]
+mod lever2b_bg_notify_directive_tests {
+    use super::*;
+
+    /// Lever-2b (delegate-bg-notify-injection, quorum PROCEED 3/3): the
+    /// background child's prompt receives the completion-notification
+    /// directive; the sync path never does (a synchronous delegate blocks the
+    /// dispatcher — no notification needed); the dedup guard never
+    /// double-prompts a law-abiding dispatcher; the injected text names the
+    /// §4 v2 contract's exact call shape.
+
+    #[test]
+    fn bg_directive_appended_to_plain_prompt() {
+        let out = DelegateTool::apply_bg_notify_directive("Run the tests.".to_string());
+        assert!(out.starts_with("Run the tests."), "append-only: the original prompt leads");
+        assert!(out.contains("[Completion notification — required]"));
+        assert!(out.contains("sessions_send(sessions_current(), \"<summary>\")"));
+    }
+
+    #[test]
+    fn bg_directive_appended_after_context_task_composition() {
+        let composed = format!("[Context]\nctx\n\n[Task]\n{}", "do work");
+        let out = DelegateTool::apply_bg_notify_directive(composed);
+        assert!(out.contains("[Task]\ndo work"), "composition preserved");
+        let task_pos = out.find("[Task]\ndo work").unwrap();
+        let directive_pos = out.find("[Completion notification — required]").unwrap();
+        assert!(directive_pos > task_pos, "the directive appends AFTER the composition");
+    }
+
+    #[test]
+    fn bg_directive_yields_when_parent_already_instructs_sessions_send_current() {
+        let parent = "Do the work; on completion call sessions_send(sessions_current(), \"done\").";
+        let out = DelegateTool::apply_bg_notify_directive(parent.to_string());
+        assert_eq!(out, parent, "idempotency: a law-abiding parent is not double-prompted");
+    }
+
+    #[test]
+    fn bg_directive_yields_when_parent_specifies_alternate_notify_target() {
+        // The §4 re-delegation case: the dispatcher routes the notification to a
+        // DIFFERENT session (the explicit target session id in the prompt).
+        let parent = "Re-dispatch this; notify the original owner via sessions_send(ses_abc123, \"done\").";
+        let out = DelegateTool::apply_bg_notify_directive(parent.to_string());
+        assert_eq!(out, parent, "explicit-re-target-wins: the tool never overrides a deliberate routing choice");
     }
 }

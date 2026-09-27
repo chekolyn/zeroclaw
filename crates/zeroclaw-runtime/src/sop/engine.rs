@@ -13093,7 +13093,7 @@ mod tests {
             "in-memory finished_runs must cap at max_finished_runs"
         );
         assert_eq!(
-            engine.terminal_run_count(),
+            engine.store.load_terminal_runs(100).unwrap().len(),
             2,
             "persisted run store must also be pruned to max_finished_runs on finish"
         );

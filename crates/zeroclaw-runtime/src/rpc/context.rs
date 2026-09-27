@@ -276,6 +276,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            sop_driver_handles: None,
             cert_audit,
         })
     }
