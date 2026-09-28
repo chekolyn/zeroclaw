@@ -691,6 +691,14 @@ pub enum EscalationViolation {
     /// (parent) to `false`, bypassing the human-in-the-loop step the
     /// parent required.
     RequireApprovalDisabledByChild,
+    /// Child exempts a `(command, arg)` argument-deny pair the parent
+    /// did not exempt. Allowlist direction (child ⊆ parent): a subagent
+    /// may narrow the operator-granted deny-guard carve-outs but
+    /// never widen them.
+    ArgDenyExemptionExpandedByChild {
+        command: String,
+        arg: String,
+    },
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -746,6 +754,10 @@ impl std::fmt::Display for EscalationViolation {
             Self::RequireApprovalDisabledByChild => write!(
                 f,
                 "subagent attempts to set require_approval_for_medium_risk=false but the parent enforces it"
+            ),
+            Self::ArgDenyExemptionExpandedByChild { command, arg } => write!(
+                f,
+                "subagent arg_deny_exemptions entry {arg:?} for command {command:?} is not present on the parent's arg_deny_exemptions"
             ),
         }
     }
@@ -3531,6 +3543,23 @@ impl SecurityPolicy {
             }
         }
 
+        // arg_deny_exemptions is an allowlist of deny-guard carve-outs
+        // (child ⊆ parent, like the shell_env_passthrough list above —
+        // NOT the forbidden_paths direction): every (command, arg)
+        // pair the child exempts must already be exempted by the
+        // parent, per pair.
+        for (command, args) in &self.arg_deny_exemptions {
+            let parent_args = parent.arg_deny_exemptions.get(command);
+            for arg in args {
+                if !parent_args.is_some_and(|parent_args| parent_args.iter().any(|p| p == arg)) {
+                    return Err(EscalationViolation::ArgDenyExemptionExpandedByChild {
+                        command: command.clone(),
+                        arg: arg.clone(),
+                    });
+                }
+            }
+        }
+
         if self.max_actions_per_hour > parent.max_actions_per_hour {
             return Err(EscalationViolation::MaxActionsExceeded {
                 child: self.max_actions_per_hour,
@@ -3636,9 +3665,7 @@ impl SecurityPolicy {
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
-            // Threading from `RiskProfileConfig` lands with the follow-up
-            // commits of this patch; empty until then (today's behavior).
-            arg_deny_exemptions: HashMap::new(),
+            arg_deny_exemptions: risk_profile.arg_deny_exemptions.clone(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -4161,7 +4188,12 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
-            arg_deny_exemptions: HashMap::new(),
+            arg_deny_exemptions: [
+                ("python".into(), vec!["-c".into(), "-m".into()]),
+                ("git".into(), vec!["config".into()]),
+            ]
+            .into_iter()
+            .collect(),
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
@@ -4210,6 +4242,16 @@ mod tests {
             policy.firejail_args,
             vec!["--net=none".to_string()],
             "firejail_args"
+        );
+        let expected_exemptions: HashMap<String, Vec<String>> = [
+            ("python".into(), vec!["-c".into(), "-m".into()]),
+            ("git".into(), vec!["config".into()]),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            policy.arg_deny_exemptions, expected_exemptions,
+            "arg_deny_exemptions must reach the policy"
         );
     }
 
@@ -7772,6 +7814,83 @@ mod tests {
             err,
             EscalationViolation::ShellEnvPassthroughExpanded { ref variable }
             if variable == "AWS_SECRET_ACCESS_KEY"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_arg_deny_exemption_pair() {
+        // Command-level expansion: the parent exempts nothing, so the
+        // child's whole (python, -c) carve-out is new.
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into()])].into_iter().collect(),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child exempting a deny pair the parent did not must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ArgDenyExemptionExpandedByChild { ref command, ref arg }
+            if command == "python" && arg == "-c"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_same_or_subset_arg_deny_exemptions() {
+        let parent = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into(), "-m".into()])]
+                .into_iter()
+                .collect(),
+            ..parent_policy_for_escalation_tests()
+        };
+        // Identical pairs.
+        let same = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into(), "-m".into()])]
+                .into_iter()
+                .collect(),
+            ..parent.clone()
+        };
+        assert!(same.ensure_no_escalation_beyond(&parent).is_ok());
+
+        // Strict subset: the child narrows to fewer args.
+        let subset = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into()])].into_iter().collect(),
+            ..parent.clone()
+        };
+        assert!(subset.ensure_no_escalation_beyond(&parent).is_ok());
+
+        // Dropped key: a child exempting nothing is the maximal
+        // narrowing. Allowlist direction (child ⊆ parent) — NOT the
+        // forbidden_paths direction, where dropping is the violation.
+        let dropped = SecurityPolicy {
+            arg_deny_exemptions: HashMap::new(),
+            ..parent.clone()
+        };
+        assert!(dropped.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_arg_under_exempted_command() {
+        // Arg-level expansion: the parent exempts python -c but not -m,
+        // so the added pair is new even though the command key exists.
+        let parent = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into()])].into_iter().collect(),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            arg_deny_exemptions: [("python".into(), vec!["-c".into(), "-m".into()])]
+                .into_iter()
+                .collect(),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child adding -m under the parent's python carve-out must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ArgDenyExemptionExpandedByChild { ref command, ref arg }
+            if command == "python" && arg == "-m"
         ));
     }
 
