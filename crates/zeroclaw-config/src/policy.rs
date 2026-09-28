@@ -2641,55 +2641,38 @@ impl SecurityPolicy {
 
     fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
-        match base.as_str() {
-            "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
-            }
-            "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
-                    && !args.iter().any(|arg| {
-                        arg == "config"
-                            || arg.starts_with("config.")
-                            || arg == "alias"
-                            || arg.starts_with("alias.")
-                    })
-            }
-            "python" | "python3" => !args
-                .iter()
-                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
-            "node" => {
-                // -e/--eval evaluates argument as JavaScript
-                // -p/--print same as --eval but prints the result
-                // starts_with covers glued form: node -e'code' (one whitespace token)
-                // Ref: https://nodejs.org/api/cli.html
-                !args.iter().any(|arg| {
-                    arg.starts_with("-e")
-                        || arg.starts_with("--eval")
-                        || arg.starts_with("-p")
-                        || arg.starts_with("--print")
+        // Argument denies are table-driven: `deny_entries_for` reifies the
+        // per-command arms (token — predicate — case domain) as the single
+        // source of truth shared with config validation, so an exemption that
+        // validated as live can never silently no-op here. Commands with no
+        // table entry carry no argument denials.
+        let Some(entries) = deny_entries_for(&base) else {
+            return true;
+        };
+        // `arg_deny_exemptions` subtracts by clause-equality: a value
+        // string-equals (case-sensitively, against the entry token as
+        // stored) exactly one entry's token and removes that entry alone —
+        // so exempting `-c` passes every argv token the entry's predicate
+        // would have caught, glued forms included. Compound entries are
+        // independent (`config` vs `config.`), keys bind to the lowercased
+        // basename (`python`/`python3` distinct), and an absent/empty map
+        // keeps byte-for-byte today's behavior.
+        let exempted = self.arg_deny_exemptions.get(&base);
+        !entries
+            .iter()
+            .filter(|entry| {
+                exempted.is_none_or(|values| !values.iter().any(|value| *value == entry.token))
+            })
+            .any(|entry| {
+                // The git `-c` entry compares against the case-preserved
+                // args (`git -C` stays allowed); every other entry against
+                // the lowercased ones.
+                let candidate_args = if entry.cased { args_cased } else { args };
+                candidate_args.iter().any(|arg| match entry.predicate {
+                    DenyPredicate::Exact => arg == entry.token,
+                    DenyPredicate::StartsWith => arg.starts_with(entry.token),
                 })
-            }
-            "pip" | "pip3" => {
-                // install/download fetch external packages; setup.py runs arbitrary code
-                // Ref: https://blog.phylum.io/python-package-installation-attacks/
-                !args.iter().any(|arg| arg == "install" || arg == "download")
-            }
-            "npm" => {
-                // exec can fetch+run remote packages (npx behavior)
-                // install fetches external packages; lifecycle scripts run arbitrary code
-                // Ref: https://cheatsheetseries.owasp.org/cheatsheets/NPM_Security_Cheat_Sheet.html
-                !args.iter().any(|arg| {
-                    arg == "exec" || arg == "install" || arg == "i" || arg == "add" || arg == "ci"
-                })
-            }
-            "cargo" => {
-                // install fetches+builds external crate; build.rs executes arbitrary code
-                // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
-                !args.iter().any(|arg| arg == "install")
-            }
-            _ => true,
-        }
+            })
     }
 
     /// Scan `command` for forbidden path arguments against a specific shell
@@ -3830,7 +3813,6 @@ pub(crate) enum DenyPredicate {
 
 /// One hardcoded argument-deny rule of [`SecurityPolicy::is_args_safe`]'s
 /// per-command arms, reified as table data.
-#[allow(dead_code)] // fields are first read by the schema-validation / is_args_safe consults
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DenyEntry {
     /// The deny token as stored in the arm. Case-sensitive: the cased `git`
@@ -3844,9 +3826,10 @@ pub(crate) struct DenyEntry {
     pub(crate) cased: bool,
 }
 
-/// The per-command argument-deny table: the hardcoded arms of
-/// [`SecurityPolicy::is_args_safe`], keyed by the command's lowercased
-/// basename. `None` means the command carries no argument denials.
+/// The per-command argument-deny table: what
+/// [`SecurityPolicy::is_args_safe`] actually enforces, keyed by the
+/// command's lowercased basename. `None` means the command carries no
+/// argument denials.
 ///
 /// The table is the single source of truth for the `arg_deny_exemptions`
 /// mechanism: config validation (keys must name table commands; values must
@@ -5767,6 +5750,114 @@ mod tests {
         p.arg_deny_exemptions = [("python".into(), vec!["-c".into()])].into_iter().collect();
         assert!(p.is_command_allowed("python -c 'x'"));
         assert!(!p.is_command_allowed("python3 -c 'x'")); // corpus-dominant form stays denied
+    }
+
+    // Both dialect entry points route through the same `is_args_safe`
+    // consult; these two tests pin that routing. Rows mirror F1's deny
+    // corpus (every table arm's tokens), with rows the bounded PowerShell
+    // grammar rejects for NON-arg-deny reasons elided from the shared
+    // loop — `;`/`$`/backtick rows (POSIX-shell constructs) and the glued
+    // `-c'code'` form (a mixed quoted/unquoted token the PowerShell lexer
+    // rejects before `is_args_safe` runs). The glued form is pinned
+    // separately below via the POSIX entry point.
+    #[test]
+    fn deny_matrix_holds_through_both_dialect_entry_points() {
+        let p = default_policy();
+        for (command, expect_allowed) in [
+            // find: exact -exec / -ok
+            ("find . -exec rm {}", false),
+            ("find . -ok rm {}", false),
+            ("find . -name notes.txt", true),
+            // git: exact CASED -c; exact config/alias; prefix config./alias.
+            ("git -c x.y=true status", false),
+            ("git config user.name evil", false),
+            ("git config.local path", false),
+            ("git alias.st status", false),
+            ("git -C /tmp status", true),
+            ("git status", true),
+            // python/python3: starts_with -c / -m, glued forms included
+            ("python -c 'print(1)'", false),
+            ("python3 -m http.server", false),
+            ("python3 -m pip install evil", false),
+            ("python script.py", true),
+            // node: starts_with -e / --eval / -p / --print
+            ("node -e 'process.exit()'", false),
+            ("node --eval=process.exit()", false),
+            ("node -p 'process.env'", false),
+            ("node --print=process.env", false),
+            ("node app.js", true),
+            // pip/pip3: exact install / download
+            ("pip install evil-package", false),
+            ("pip download evil-package", false),
+            ("pip3 install evil-package", false),
+            ("pip3 download evil-package", false),
+            ("pip list", true),
+            // npm: exact exec / install / i / add / ci
+            ("npm exec -- malicious-pkg", false),
+            ("npm install malicious-pkg", false),
+            ("npm i malicious-pkg", false),
+            ("npm add malicious-pkg", false),
+            ("npm ci", false),
+            ("npm test", true),
+            // cargo: exact install
+            ("cargo install malicious-crate", false),
+            ("cargo build", true),
+        ] {
+            assert_eq!(
+                p.is_posix_like_command_allowed(command, ShellDialect::Posix),
+                expect_allowed,
+                "posix dialect disagrees on {command:?}"
+            );
+            assert_eq!(
+                p.is_simple_powershell_command_allowed(command),
+                expect_allowed,
+                "powershell dialect disagrees on {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exemption_matrix_lifts_through_both_dialect_entry_points() {
+        let p = exempt_policy();
+        for (command, expect_allowed) in [
+            // -c lifted on python AND python3 (both keys exempted); the
+            // starts_with blast radius covers quoted-arg forms
+            ("python -c 'print(1)'", true),
+            ("python3 -c 'import sqlite3'", true),
+            // clause-equality: -m survives untouched
+            ("python3 -m http.server", false),
+            // known false positive: inert trailing -m keeps the deny
+            ("python -c 'x' -m junk", false),
+            // every other arm unchanged
+            ("git -c x.y=true status", false),
+            ("git -C /tmp status", true),
+            ("node -e 'process.exit()'", false),
+            ("pip install evil-package", false),
+            ("npm install malicious-pkg", false),
+            ("cargo install malicious-crate", false),
+            ("find . -exec rm {}", false),
+            // safe rows stay safe
+            ("python script.py", true),
+            ("git status", true),
+        ] {
+            assert_eq!(
+                p.is_posix_like_command_allowed(command, ShellDialect::Posix),
+                expect_allowed,
+                "posix dialect disagrees on {command:?}"
+            );
+            assert_eq!(
+                p.is_simple_powershell_command_allowed(command),
+                expect_allowed,
+                "powershell dialect disagrees on {command:?}"
+            );
+        }
+        // The glued form (`-c'code'`, one whitespace token) is the stated
+        // starts_with blast radius of lifting `-c` — pinned through the
+        // POSIX entry point. The bounded PowerShell grammar rejects the
+        // mixed quoted/unquoted token class before `is_args_safe` runs,
+        // so it stays denied there regardless of exemptions.
+        assert!(p.is_posix_like_command_allowed("python3 -c'import os'", ShellDialect::Posix));
+        assert!(!p.is_simple_powershell_command_allowed("python3 -c'import os'"));
     }
 
     #[test]
