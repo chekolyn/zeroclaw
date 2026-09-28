@@ -376,6 +376,13 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Per-command argument-deny exemptions, subtracted (clause-equality: a
+    /// value string-equals one deny entry of the keyed arm and removes it)
+    /// from the hardcoded arg-deny arms in `is_args_safe`. Keys bind to the
+    /// invoked command's lowercased basename — `python` and `python3` are
+    /// distinct keys requiring distinct entries. Absent/empty map is
+    /// byte-for-byte today's behavior.
+    pub arg_deny_exemptions: HashMap<String, Vec<String>>,
     pub tracker: PerSenderTracker,
 }
 
@@ -774,6 +781,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            arg_deny_exemptions: HashMap::new(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -3628,6 +3636,9 @@ impl SecurityPolicy {
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
+            // Threading from `RiskProfileConfig` lands with the follow-up
+            // commits of this patch; empty until then (today's behavior).
+            arg_deny_exemptions: HashMap::new(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -3781,6 +3792,165 @@ impl SecurityPolicy {
         );
 
         out
+    }
+}
+
+/// How a deny-entry token is compared against a candidate argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenyPredicate {
+    /// The argument must equal the token exactly.
+    Exact,
+    /// The argument must start with the token (glued forms included).
+    StartsWith,
+}
+
+/// One hardcoded argument-deny rule of [`SecurityPolicy::is_args_safe`]'s
+/// per-command arms, reified as table data.
+#[allow(dead_code)] // fields are first read by the schema-validation / is_args_safe consults
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DenyEntry {
+    /// The deny token as stored in the arm. Case-sensitive: the cased `git`
+    /// `-c` entry never matches `-C`.
+    pub(crate) token: &'static str,
+    /// How a candidate argument is compared against `token`.
+    pub(crate) predicate: DenyPredicate,
+    /// `true` compares against the case-preserved argument list; `false`
+    /// compares against the lowercased one. The `git` `-c` entry is the
+    /// table's only cased entry.
+    pub(crate) cased: bool,
+}
+
+/// The per-command argument-deny table: the hardcoded arms of
+/// [`SecurityPolicy::is_args_safe`], keyed by the command's lowercased
+/// basename. `None` means the command carries no argument denials.
+///
+/// The table is the single source of truth for the `arg_deny_exemptions`
+/// mechanism: config validation (keys must name table commands; values must
+/// string-equal an entry token of the keyed arm) and the exemption
+/// subtraction in `is_args_safe` both derive from it, and the
+/// `deny_entry_table_invariant` test pins the key set so upstream arm drift
+/// fails the build instead of rotting silently.
+#[allow(dead_code)] // only the invariant test reads this until the is_args_safe consult lands
+pub(crate) fn deny_entries_for(base: &str) -> Option<&'static [DenyEntry]> {
+    match base {
+        "find" => Some(&[
+            DenyEntry {
+                token: "-exec",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "-ok",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+        ]),
+        "git" => Some(&[
+            DenyEntry {
+                token: "-c",
+                predicate: DenyPredicate::Exact,
+                cased: true,
+            },
+            DenyEntry {
+                token: "config",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "config.",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+            DenyEntry {
+                token: "alias",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "alias.",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+        ]),
+        "python" | "python3" => Some(&[
+            DenyEntry {
+                token: "-c",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+            DenyEntry {
+                token: "-m",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+        ]),
+        "node" => Some(&[
+            DenyEntry {
+                token: "-e",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+            DenyEntry {
+                token: "--eval",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+            DenyEntry {
+                token: "-p",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+            DenyEntry {
+                token: "--print",
+                predicate: DenyPredicate::StartsWith,
+                cased: false,
+            },
+        ]),
+        "pip" | "pip3" => Some(&[
+            DenyEntry {
+                token: "install",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "download",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+        ]),
+        "npm" => Some(&[
+            DenyEntry {
+                token: "exec",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "install",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "i",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "add",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+            DenyEntry {
+                token: "ci",
+                predicate: DenyPredicate::Exact,
+                cased: false,
+            },
+        ]),
+        "cargo" => Some(&[DenyEntry {
+            token: "install",
+            predicate: DenyPredicate::Exact,
+            cased: false,
+        }]),
+        _ => None,
     }
 }
 
@@ -5515,6 +5685,67 @@ mod tests {
         assert!(p.is_command_allowed("cargo build"));
         assert!(p.is_command_allowed("cargo test"));
         assert!(p.is_command_allowed("cargo run"));
+    }
+
+    // ── Argument-deny exemptions ─────────────────────────
+
+    // Built on the real `default_policy()` helper (whose allowlist includes
+    // python/python3) so the exemption consult is exercised against the live
+    // guards. NEVER a "*" + block_high_risk_commands=false helper: the
+    // wildcard escape skips all guards and turns these tests vacuously
+    // green.
+    fn exempt_policy() -> SecurityPolicy {
+        let mut p = default_policy();
+        p.arg_deny_exemptions = [
+            ("python".into(), vec!["-c".into()]),
+            ("python3".into(), vec!["-c".into()]),
+        ]
+        .into_iter()
+        .collect();
+        p
+    }
+
+    #[test]
+    fn exemptions_absent_current_behavior() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("python -c 'print(1)'"));
+        assert!(!p.is_command_allowed("python3 -m pytest"));
+        assert!(p.is_command_allowed("python script.py"));
+    }
+
+    #[test]
+    fn exemption_lifts_dash_c_only() {
+        let p = exempt_policy();
+        assert!(p.is_command_allowed("python -c 'print(1)'"));
+        assert!(p.is_command_allowed("python3 -c 'import sqlite3'"));
+        assert!(!p.is_command_allowed("python3 -m pytest")); // -m survives
+        assert!(!p.is_command_allowed("python -c 'x' -m junk")); // inert trailing -m false positive
+    }
+
+    #[test]
+    fn python_key_binding_is_distinct() {
+        let mut p = default_policy();
+        p.arg_deny_exemptions = [("python".into(), vec!["-c".into()])].into_iter().collect();
+        assert!(p.is_command_allowed("python -c 'x'"));
+        assert!(!p.is_command_allowed("python3 -c 'x'")); // corpus-dominant form stays denied
+    }
+
+    #[test]
+    fn deny_entry_table_invariant() {
+        let table_keys = [
+            "find", "git", "python", "python3", "node", "pip", "pip3", "npm", "cargo",
+        ];
+        for k in table_keys {
+            assert!(deny_entries_for(k).is_some(), "table missing {k}");
+        }
+        assert!(deny_entries_for("ls").is_none());
+    }
+
+    #[test]
+    fn git_cased_dash_c_preserved() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("git -C /tmp status"));
+        assert!(!p.is_command_allowed("git -c x.y=true status"));
     }
 
     #[test]
