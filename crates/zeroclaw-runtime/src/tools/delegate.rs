@@ -2088,11 +2088,21 @@ impl DelegateTool {
             }
         };
 
-        // Build the message
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
+        // Build the message, injecting the completion-notification directive
+        // at the [Context]/[Task] seam. The directive is dedup-guarded: if the
+        // prompt already carries a sessions_send for this session, skip injection
+        // to avoid double-prompting a law-abiding parent.
+        let has_directive = prompt.contains("sessions_send(sessions_current(),")
+            || context.contains("sessions_send(sessions_current(),");
+        let directive = if has_directive {
+            String::new()
         } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+            "\n\n[Directive]\nsessions_send(sessions_current(), ✅ background-delegate-completed task_id={task_id} agent={agent_name})".to_string()
+        };
+        let full_prompt = if context.is_empty() {
+            format!("{prompt}{directive}")
+        } else {
+            format!("[Context]\n{context}\n\n[Task]\n{prompt}{directive}")
         };
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
