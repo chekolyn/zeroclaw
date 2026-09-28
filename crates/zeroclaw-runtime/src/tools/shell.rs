@@ -282,9 +282,10 @@ impl Tool for ShellTool {
                 // `arg_deny_exemptions` lifts the python `-c` deny may
                 // suggest `-c`; an exemption-less profile gets only the
                 // temp-script route. Every other gate (no shell access,
-                // high-risk block, approval prompts, forbidden paths)
-                // already names itself and flows through unchanged: for
-                // those the classifier returns `Ok`, keeping `reason`.
+                // read-only autonomy, high-risk block, approval prompts,
+                // forbidden paths) already names itself or stays opaque
+                // byte-for-byte, and flows through unchanged: for those
+                // the classifier returns `Ok`, keeping `reason`.
                 let error = match self
                     .security
                     .classify_command_allowed_for_shell(command, self.runtime.shell_dialect())
@@ -1161,6 +1162,33 @@ mod tests {
         assert!(
             !error.contains("-c"),
             "an exemption-less profile must never claim -c is allowed: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_denial_on_read_only_profile_keeps_the_opaque_message() {
+        // Read-only autonomy denies every command — allowlisted forms
+        // equally — so the denial must NOT append an allowlist suggestion:
+        // it would misdirect the agent into retrying forms the same profile
+        // rejects. The message stays byte-identical to today's.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let tool = ShellTool::new(security.clone(), runtime);
+
+        let result = tool
+            .execute(json!({"command": "sleep 5"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        let error = result.error.expect("rejection must carry an error");
+        assert_eq!(
+            error, "Command not allowed by security policy: sleep 5",
+            "the read-only denial must stay byte-identical to today's — no suggestion appended"
         );
     }
 

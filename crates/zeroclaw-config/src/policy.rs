@@ -2481,24 +2481,30 @@ impl SecurityPolicy {
     /// Classify the command allowlist layer, threading the rejection reason.
     ///
     /// This is the reason-threading sibling of the allowlist check inside
-    /// [`validate_command_execution_for_shell`](Self::validate_command_execution_for_shell):
-    /// `Ok(())` exactly when
-    /// [`is_command_allowed_for_shell`](Self::is_command_allowed_for_shell)
-    /// returns `true` for a live dialect, and otherwise the rejection names
-    /// the rule that denied the command, so a caller can render an
-    /// actionable message via [`CommandRejection::suggestion`] — which is
-    /// computed from the live policy state. The allow/deny verdicts are
-    /// byte-for-byte those of the bool guards; only the reason is new.
+    /// [`validate_command_execution_for_shell`](Self::validate_command_execution_for_shell).
+    /// For a live dialect on a profile above `ReadOnly`, `Ok(())` exactly
+    /// when [`is_command_allowed_for_shell`](Self::is_command_allowed_for_shell)
+    /// returns `true`, and otherwise the rejection names the rule that
+    /// denied the command, so a caller can render an actionable message via
+    /// [`CommandRejection::suggestion`] — which is computed from the live
+    /// policy state. The allow/deny verdicts are byte-for-byte those of the
+    /// bool guards; only the reason is new.
     ///
-    /// The `None` dialect returns `Ok(())`: a shell-less runtime has no
-    /// allowlist verdict — its rejection ("no shell access") belongs to
-    /// `validate_command_execution_for_shell`'s own first gate and must not
-    /// be reworded here.
+    /// Two rejections belong to other gates, so the classifier returns
+    /// `Ok(())` and callers keep the gate's own message: `ReadOnly` autonomy
+    /// denies EVERY command at the bool guards' autonomy short-circuit with
+    /// no allowlist rule to name — a suggestion would misdirect an agent
+    /// into retrying allowlisted forms the same profile rejects — and the
+    /// `None` dialect's rejection ("no shell access") is
+    /// `validate_command_execution_for_shell`'s own first gate.
     pub fn classify_command_allowed_for_shell(
         &self,
         command: &str,
         dialect: ShellDialect,
     ) -> Result<(), CommandRejection> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Ok(());
+        }
         match dialect {
             ShellDialect::PowerShell => self.classify_simple_powershell_command_allowed(command),
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
@@ -6190,6 +6196,30 @@ mod tests {
             suggestion.contains("backtick"),
             "the construct must be named: {suggestion}"
         );
+    }
+
+    #[test]
+    fn read_only_denial_names_no_allowlist_rule() {
+        // Under `ReadOnly` autonomy the bool guards deny every command —
+        // allowlisted forms equally — so the classifier must return `Ok`:
+        // there is no allowlist rule to name, and a suggestion would
+        // misdirect the agent into retrying forms the same profile
+        // rejects (the retry-loop class this task exists to kill).
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        };
+        for command in ["sleep 5", "echo hi", "python3 -m pytest"] {
+            assert!(
+                !p.is_command_allowed_for_shell(command, ShellDialect::Posix),
+                "read-only must deny {command:?}"
+            );
+            assert!(
+                p.classify_command_allowed_for_shell(command, ShellDialect::Posix)
+                    .is_ok(),
+                "the classifier must name no allowlist rule under read-only autonomy: {command:?}"
+            );
+        }
     }
 
     #[test]
