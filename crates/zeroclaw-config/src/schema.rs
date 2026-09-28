@@ -13056,7 +13056,7 @@ pub struct RiskProfileConfig {
     pub firejail_args: Vec<String>,
     /// Per-command argument-deny exemptions, subtracted (clause-equality: a
     /// value string-equals one deny entry of the keyed arm and removes it)
-    /// from the hardcoded arg-deny arms in `SecurityPolicy::is_args_safe`.
+    /// from the argument-deny guard's table-driven rules.
     /// Keys bind to the invoked command's lowercased basename — `python` and
     /// `python3` are distinct keys requiring distinct entries. Absent/empty
     /// is byte-for-byte today's behavior. Validated at parse time by

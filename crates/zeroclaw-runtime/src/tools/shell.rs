@@ -274,10 +274,30 @@ impl Tool for ShellTool {
         ) {
             Ok(_) => {}
             Err(reason) => {
+                // Reason-threading: the allowlist layer's rejection is
+                // opaque on its own, so re-derive it as a
+                // `CommandRejection` naming the offending rule and a
+                // policy-correct sanctioned alternative, computed from the
+                // live policy state — only a profile whose
+                // `arg_deny_exemptions` lifts the python `-c` deny may
+                // suggest `-c`; an exemption-less profile gets only the
+                // temp-script route. Every other gate (no shell access,
+                // high-risk block, approval prompts, forbidden paths)
+                // already names itself and flows through unchanged: for
+                // those the classifier returns `Ok`, keeping `reason`.
+                let error = match self
+                    .security
+                    .classify_command_allowed_for_shell(command, self.runtime.shell_dialect())
+                {
+                    Err(rejection) => {
+                        format!("{reason} — {}", rejection.suggestion(&self.security))
+                    }
+                    Ok(()) => reason,
+                };
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(reason),
+                    error: Some(error),
                 });
             }
         }
@@ -1076,6 +1096,71 @@ mod tests {
                 .is_some_and(|error| error.contains("not allowed by security policy")),
             "mixed-quoted provider path must be blocked before spawn: {:?}",
             result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_denial_names_rule_and_exempted_alternative() {
+        // Reason-threading: on a profile whose arg_deny_exemptions lifts the
+        // python `-c` deny, a `python3 -m pytest` denial names the `-m` rule
+        // and may offer `-c` as allowed on this profile — so the agent stops
+        // retry-looping the same denied form.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            arg_deny_exemptions: [("python3".into(), vec!["-c".into()])]
+                .into_iter()
+                .collect(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let tool = ShellTool::new(security.clone(), runtime);
+
+        let result = tool
+            .execute(json!({"command": "python3 -m pytest"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        let error = result.error.expect("rejection must carry an error");
+        assert!(
+            error.contains("not allowed by security policy"),
+            "the opaque prefix is kept for compatibility: {error}"
+        );
+        assert!(error.contains("-m"), "must name the -m rule: {error}");
+        assert!(
+            error.contains("python3 -c") && error.contains("allowed"),
+            "must offer the -c alternative as allowed on this profile: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_denial_without_exemption_offers_only_the_temp_script() {
+        // Same denial on an exemption-less profile: the message offers ONLY
+        // the temp-script alternative and never claims `-c` is allowed.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let tool = ShellTool::new(security.clone(), runtime);
+
+        let result = tool
+            .execute(json!({"command": "python3 -m pytest"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        let error = result.error.expect("rejection must carry an error");
+        assert!(error.contains("-m"), "must name the -m rule: {error}");
+        assert!(
+            error.contains("file_write"),
+            "must offer the temp-script alternative: {error}"
+        );
+        assert!(
+            !error.contains("-c"),
+            "an exemption-less profile must never claim -c is allowed: {error}"
         );
     }
 

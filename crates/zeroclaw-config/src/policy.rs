@@ -378,7 +378,7 @@ pub struct SecurityPolicy {
     pub firejail_args: Vec<String>,
     /// Per-command argument-deny exemptions, subtracted (clause-equality: a
     /// value string-equals one deny entry of the keyed arm and removes it)
-    /// from the hardcoded arg-deny arms in `is_args_safe`. Keys bind to the
+    /// from the argument-deny guard's table-driven rules. Keys bind to the
     /// invoked command's lowercased basename — `python` and `python3` are
     /// distinct keys requiring distinct entries. Absent/empty map is
     /// byte-for-byte today's behavior.
@@ -2478,11 +2478,54 @@ impl SecurityPolicy {
         }
     }
 
+    /// Classify the command allowlist layer, threading the rejection reason.
+    ///
+    /// This is the reason-threading sibling of the allowlist check inside
+    /// [`validate_command_execution_for_shell`](Self::validate_command_execution_for_shell):
+    /// `Ok(())` exactly when
+    /// [`is_command_allowed_for_shell`](Self::is_command_allowed_for_shell)
+    /// returns `true` for a live dialect, and otherwise the rejection names
+    /// the rule that denied the command, so a caller can render an
+    /// actionable message via [`CommandRejection::suggestion`] — which is
+    /// computed from the live policy state. The allow/deny verdicts are
+    /// byte-for-byte those of the bool guards; only the reason is new.
+    ///
+    /// The `None` dialect returns `Ok(())`: a shell-less runtime has no
+    /// allowlist verdict — its rejection ("no shell access") belongs to
+    /// `validate_command_execution_for_shell`'s own first gate and must not
+    /// be reworded here.
+    pub fn classify_command_allowed_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Result<(), CommandRejection> {
+        match dialect {
+            ShellDialect::PowerShell => self.classify_simple_powershell_command_allowed(command),
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                self.classify_posix_like_command_allowed(command, dialect)
+            }
+            ShellDialect::None => Ok(()),
+        }
+    }
+
     fn is_simple_powershell_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
 
+        self.classify_simple_powershell_command_allowed(command)
+            .is_ok()
+    }
+
+    /// Classify twin of [`SecurityPolicy::is_simple_powershell_command_allowed`]
+    /// (minus its `ReadOnly` autonomy short-circuit, which stays in the bool
+    /// guard: read-only mode denies every command with no deny rule to
+    /// name). `Ok(())` exactly when the bool guard returns `true`;
+    /// otherwise the rejection names the gate that rejected.
+    fn classify_simple_powershell_command_allowed(
+        &self,
+        command: &str,
+    ) -> Result<(), CommandRejection> {
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         // Preserve the existing trusted-environment escape hatch shared with
         // POSIX/cmd policy: wildcard plus disabled high-risk blocking opts out
@@ -2490,26 +2533,41 @@ impl SecurityPolicy {
         // apply the complete bounded PowerShell grammar before a named command
         // can qualify for an allowlist or high-risk exemption.
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            return Ok(());
         }
 
         let Some(segments) = split_simple_powershell_pipeline(command) else {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "PowerShell pipeline syntax outside the bounded grammar \
+                    (e.g. the `--%` stop-parsing token, subexpressions, or mixed quoting)"
+                    .into(),
+            });
         };
 
         for segment in &segments {
             let mut words = segment.split_whitespace();
             let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            if raw_executable.is_empty()
-                || raw_executable.starts_with('$')
-                || raw_executable.starts_with(['\'', '"'])
-            {
-                return false;
+            if raw_executable.is_empty() {
+                return Err(CommandRejection::UnknownCommand {
+                    command: String::new(),
+                });
+            }
+            if raw_executable.starts_with('$') {
+                return Err(CommandRejection::SyntaxGuard {
+                    construct: "variable-named command (`$...`)".into(),
+                });
+            }
+            if raw_executable.starts_with(['\'', '"']) {
+                return Err(CommandRejection::SyntaxGuard {
+                    construct: "quoted executable".into(),
+                });
             }
 
             let base_owned = command_basename(raw_executable).to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
-                return false;
+                return Err(CommandRejection::SyntaxGuard {
+                    construct: "batch file (`.bat`/`.cmd`) execution".into(),
+                });
             }
             let base = strip_powershell_executable_suffix(&base_owned);
             if !self
@@ -2517,7 +2575,9 @@ impl SecurityPolicy {
                 .iter()
                 .any(|allowed| is_powershell_allowlist_entry_match(allowed, raw_executable, base))
             {
-                return false;
+                return Err(CommandRejection::UnknownCommand {
+                    command: base.to_string(),
+                });
             }
 
             let args_cased: Vec<String> = words.map(str::to_string).collect();
@@ -2525,18 +2585,20 @@ impl SecurityPolicy {
                 .iter()
                 .any(|argument| is_powershell_provider_argument(argument))
             {
-                return false;
+                return Err(CommandRejection::SyntaxGuard {
+                    construct:
+                        "PowerShell provider path argument (`Env:`, `Function:`, drive paths)"
+                            .into(),
+                });
             }
             let args: Vec<String> = args_cased
                 .iter()
                 .map(|word| word.to_ascii_lowercase())
                 .collect();
-            if !self.is_args_safe(base, &args, &args_cased) {
-                return false;
-            }
+            self.classify_args_safety(base, &args, &args_cased)?;
         }
 
-        true
+        Ok(())
     }
 
     fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
@@ -2544,21 +2606,45 @@ impl SecurityPolicy {
             return false;
         }
 
+        self.classify_posix_like_command_allowed(command, dialect)
+            .is_ok()
+    }
+
+    /// Classify twin of [`SecurityPolicy::is_posix_like_command_allowed`]
+    /// (minus its `ReadOnly` autonomy short-circuit, which stays in the bool
+    /// guard: read-only mode denies every command with no deny rule to
+    /// name). `Ok(())` exactly when the bool guard returns `true`;
+    /// otherwise the rejection names the first gate that rejected. Gate
+    /// order and verdicts mirror the bool guard byte-for-byte — the gates
+    /// are only split apart so each can name its construct.
+    fn classify_posix_like_command_allowed(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Result<(), CommandRejection> {
         // When the operator has explicitly opted out of all command-level
         // restrictions (wildcard + no high-risk blocking), skip the
         // subshell/expansion guard entirely. This allows backticks,
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            return Ok(());
         }
 
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
+        if command.contains('`') {
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "backtick command substitution".into(),
+            });
+        }
+        if contains_unquoted_shell_variable_expansion(command) {
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "unquoted `$` expansion (`$VAR`/`$()`)".into(),
+            });
+        }
+        if command.contains("<(") || command.contains(">(") {
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "process substitution (`<(`/`>(`)".into(),
+            });
         }
 
         // Block shell redirections that target files. Allow safe forms:
@@ -2566,10 +2652,14 @@ impl SecurityPolicy {
         //   - `2>&1`, `1>&2` (fd merging)
         //   - `<<` heredocs, `<<<` here-strings (input literals)
         if contains_unsafe_output_redirect_for_shell(command, dialect) {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "output redirect to a file".into(),
+            });
         }
         if contains_unquoted_input_redirect(command) {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "input redirect from a file".into(),
+            });
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -2578,7 +2668,9 @@ impl SecurityPolicy {
             .split_whitespace()
             .any(|w| w == "tee" || w.ends_with("/tee"))
         {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "`tee` (writes to arbitrary files)".into(),
+            });
         }
 
         // Block background command chaining (`&`), which can hide extra
@@ -2587,7 +2679,9 @@ impl SecurityPolicy {
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
         if contains_unquoted_single_ampersand(&ampersand_check) {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "background command chaining (`&`)".into(),
+            });
         }
 
         // Split on unquoted command separators and validate each sub-command.
@@ -2618,7 +2712,9 @@ impl SecurityPolicy {
                 .iter()
                 .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
-                return false;
+                return Err(CommandRejection::UnknownCommand {
+                    command: base_cmd.to_string(),
+                });
             }
 
             // Validate arguments for the command.
@@ -2627,19 +2723,33 @@ impl SecurityPolicy {
             //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
             let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args, &args_cased) {
-                return false;
-            }
+            self.classify_args_safety(base_cmd, &args, &args_cased)?;
         }
 
         // At least one command must be present
-        segments.iter().any(|s| {
+        if segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        })
+        }) {
+            Ok(())
+        } else {
+            Err(CommandRejection::UnknownCommand {
+                command: String::new(),
+            })
+        }
     }
 
-    fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
+    /// The argument-deny guard: `Ok(())` exactly when the command's
+    /// arguments pass the table-driven denies (the former `is_args_safe`
+    /// bool guard, absorbed here when the guard chain upgraded to
+    /// reason-threading), otherwise the first matching deny entry reified
+    /// as the [`CommandRejection::ArgDeny`] reason.
+    fn classify_args_safety(
+        &self,
+        base: &str,
+        args: &[String],
+        args_cased: &[String],
+    ) -> Result<(), CommandRejection> {
         let base = base.to_ascii_lowercase();
         // Argument denies are table-driven: `deny_entries_for` reifies the
         // per-command arms (token — predicate — case domain) as the single
@@ -2647,7 +2757,7 @@ impl SecurityPolicy {
         // validated as live can never silently no-op here. Commands with no
         // table entry carry no argument denials.
         let Some(entries) = deny_entries_for(&base) else {
-            return true;
+            return Ok(());
         };
         // `arg_deny_exemptions` subtracts by clause-equality: a value
         // string-equals (case-sensitively, against the entry token as
@@ -2658,21 +2768,25 @@ impl SecurityPolicy {
         // basename (`python`/`python3` distinct), and an absent/empty map
         // keeps byte-for-byte today's behavior.
         let exempted = self.arg_deny_exemptions.get(&base);
-        !entries
-            .iter()
-            .filter(|entry| {
-                exempted.is_none_or(|values| !values.iter().any(|value| *value == entry.token))
-            })
-            .any(|entry| {
-                // The git `-c` entry compares against the case-preserved
-                // args (`git -C` stays allowed); every other entry against
-                // the lowercased ones.
-                let candidate_args = if entry.cased { args_cased } else { args };
-                candidate_args.iter().any(|arg| match entry.predicate {
-                    DenyPredicate::Exact => arg == entry.token,
-                    DenyPredicate::StartsWith => arg.starts_with(entry.token),
-                })
-            })
+        for entry in entries.iter().filter(|entry| {
+            exempted.is_none_or(|values| !values.iter().any(|value| *value == entry.token))
+        }) {
+            // The git `-c` entry compares against the case-preserved
+            // args (`git -C` stays allowed); every other entry against
+            // the lowercased ones.
+            let candidate_args = if entry.cased { args_cased } else { args };
+            let matched = candidate_args.iter().any(|arg| match entry.predicate {
+                DenyPredicate::Exact => arg == entry.token,
+                DenyPredicate::StartsWith => arg.starts_with(entry.token),
+            });
+            if matched {
+                return Err(CommandRejection::ArgDeny {
+                    command: base,
+                    entry: entry.token.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Scan `command` for forbidden path arguments against a specific shell
@@ -3811,8 +3925,8 @@ pub(crate) enum DenyPredicate {
     StartsWith,
 }
 
-/// One hardcoded argument-deny rule of [`SecurityPolicy::is_args_safe`]'s
-/// per-command arms, reified as table data.
+/// One hardcoded argument-deny rule of the argument-deny guard's per-command
+/// arms, reified as table data.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DenyEntry {
     /// The deny token as stored in the arm. Case-sensitive: the cased `git`
@@ -3826,15 +3940,15 @@ pub(crate) struct DenyEntry {
     pub(crate) cased: bool,
 }
 
-/// The per-command argument-deny table: what
-/// [`SecurityPolicy::is_args_safe`] actually enforces, keyed by the
+/// The per-command argument-deny table: what the argument-deny guard
+/// (`classify_args_safe`) actually enforces, keyed by the
 /// command's lowercased basename. `None` means the command carries no
 /// argument denials.
 ///
 /// The table is the single source of truth for the `arg_deny_exemptions`
 /// mechanism: config validation (keys must name table commands; values must
 /// string-equal an entry token of the keyed arm) and the exemption
-/// subtraction in `is_args_safe` both derive from it, and the
+/// subtraction in `classify_args_safe` both derive from it, and the
 /// `deny_entry_table_invariant` test pins the key set so upstream arm drift
 /// fails the build instead of rotting silently.
 pub(crate) fn deny_entries_for(base: &str) -> Option<&'static [DenyEntry]> {
@@ -3957,6 +4071,103 @@ pub(crate) fn deny_entries_for(base: &str) -> Option<&'static [DenyEntry]> {
             cased: false,
         }]),
         _ => None,
+    }
+}
+
+/// Why the command allowlist layer rejected a command: the reason channel of
+/// the guard chain, with enough detail to render an actionable denial.
+///
+/// A rejection is produced by the `classify_*` twins under exactly the
+/// conditions that make the corresponding `is_*` guards return `false`, so
+/// the allow/deny verdicts never depend on it. [`CommandRejection::suggestion`]
+/// turns it into the message content — names the offending rule and a
+/// policy-correct sanctioned alternative — computed from the LIVE policy
+/// state, so a denial can never misdirect an agent toward a form the same
+/// profile would reject again (the retry-loop this exists to kill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandRejection {
+    /// A table-driven argument-deny rule matched: `command` is the command's
+    /// lowercased basename (the `arg_deny_exemptions` key domain) and `entry`
+    /// the deny token that fired.
+    ArgDeny { command: String, entry: String },
+    /// The first executable token is not on the profile's command allowlist;
+    /// `command` is the executable's lowercased, suffix-stripped base name
+    /// (empty when no command was present at all).
+    UnknownCommand { command: String },
+    /// A shell-syntax guard rejected the command; `construct` names the
+    /// construct (backticks, `$()`/`$VAR` expansion, redirects, `tee`,
+    /// background `&`, …).
+    SyntaxGuard { construct: String },
+}
+
+impl CommandRejection {
+    /// Render the actionable denial reason: name the offending rule and a
+    /// policy-correct sanctioned alternative, computed from the live policy
+    /// state.
+    ///
+    /// The alternative is derived, never hardcoded: an argument-deny
+    /// message may suggest another deny entry of the same command only when
+    /// this profile's `arg_deny_exemptions` actually lifts it — so a profile
+    /// whose exemption lifts the python `-c` deny may say `-c` is allowed on
+    /// this profile — and an interpreter family without a lifted alternative
+    /// offers ONLY the temp-script route. A static "`-c` is allowed" on an
+    /// exemption-less profile would be the exact misdirect this exists to
+    /// kill.
+    pub fn suggestion(&self, policy: &SecurityPolicy) -> String {
+        match self {
+            CommandRejection::ArgDeny { command, entry } => {
+                // Another deny entry of this command that this profile's
+                // live exemption map lifts is a sanctioned alternative form.
+                let entries = deny_entries_for(command).unwrap_or(&[]);
+                let lifted = policy.arg_deny_exemptions.get(command);
+                let alternative = entries.iter().find_map(|candidate| {
+                    let sanctioned = lifted
+                        .is_some_and(|values| values.iter().any(|value| *value == candidate.token));
+                    (candidate.token != entry && sanctioned).then_some(candidate.token)
+                });
+                match alternative {
+                    Some(alternative) => format!(
+                        "denied by argument rule `{entry}` for `{command}`; on this profile \
+                         `{command} {alternative}` is allowed — use that form instead"
+                    ),
+                    // The interpreter inline-code family — whose table arm
+                    // carries the `StartsWith`/uncased `-c` inline-code
+                    // entry (python/python3; git's cased `Exact` `-c` is a
+                    // config flag, not code) — has a sanctioned script-file
+                    // form: `{command} script.py` runs local files.
+                    None if entries.iter().any(|e| {
+                        e.token == "-c" && e.predicate == DenyPredicate::StartsWith && !e.cased
+                    }) =>
+                    {
+                        format!(
+                            "denied by argument rule `{entry}` for `{command}`; write a temp \
+                             script via file_write and run it instead (e.g. \
+                             `{command} script.py`)"
+                        )
+                    }
+                    None => format!(
+                        "denied by argument rule `{entry}` for `{command}`; no alternative \
+                         argument form is sanctioned on this profile — ask the operator if \
+                         this form is required"
+                    ),
+                }
+            }
+            CommandRejection::UnknownCommand { command } => {
+                if command.is_empty() {
+                    "the command is empty: there is no executable to check against \
+                     the allowlist"
+                        .into()
+                } else {
+                    format!(
+                        "`{command}` is not on this profile's command allowlist — use an \
+                         allowlisted command or ask the operator to add `{command}`"
+                    )
+                }
+            }
+            CommandRejection::SyntaxGuard { construct } => {
+                format!("denied by the shell syntax guard: {construct}")
+            }
+        }
     }
 }
 
@@ -5752,14 +5963,15 @@ mod tests {
         assert!(!p.is_command_allowed("python3 -c 'x'")); // corpus-dominant form stays denied
     }
 
-    // Both dialect entry points route through the same `is_args_safe`
-    // consult; these two tests pin that routing. Rows mirror F1's deny
-    // corpus (every table arm's tokens), with rows the bounded PowerShell
-    // grammar rejects for NON-arg-deny reasons elided from the shared
-    // loop — `;`/`$`/backtick rows (POSIX-shell constructs) and the glued
-    // `-c'code'` form (a mixed quoted/unquoted token the PowerShell lexer
-    // rejects before `is_args_safe` runs). The glued form is pinned
-    // separately below via the POSIX entry point.
+    // Both dialect entry points route through the same argument-deny
+    // consult (`classify_args_safe`); these two tests pin that routing.
+    // Rows mirror F1's deny corpus (every table arm's tokens), with rows
+    // the bounded PowerShell grammar rejects for NON-arg-deny reasons
+    // elided from the shared loop — `;`/`$`/backtick rows (POSIX-shell
+    // constructs) and the glued `-c'code'` form (a mixed quoted/unquoted
+    // token the PowerShell lexer rejects before the argument-deny consult
+    // runs). The glued form is pinned separately below via the POSIX
+    // entry point.
     #[test]
     fn deny_matrix_holds_through_both_dialect_entry_points() {
         let p = default_policy();
@@ -5854,10 +6066,157 @@ mod tests {
         // The glued form (`-c'code'`, one whitespace token) is the stated
         // starts_with blast radius of lifting `-c` — pinned through the
         // POSIX entry point. The bounded PowerShell grammar rejects the
-        // mixed quoted/unquoted token class before `is_args_safe` runs,
-        // so it stays denied there regardless of exemptions.
+        // mixed quoted/unquoted token class before the argument-deny
+        // consult runs, so it stays denied there regardless of exemptions.
         assert!(p.is_posix_like_command_allowed("python3 -c'import os'", ShellDialect::Posix));
         assert!(!p.is_simple_powershell_command_allowed("python3 -c'import os'"));
+    }
+
+    // ── Reason-threading: actionable denial messages ──────────────────────
+    //
+    // The message content is computed from LIVE policy state: the same
+    // profile that denies the command decides which sanctioned alternative
+    // the message may offer. A static "`-c` is allowed" suggestion on an
+    // exemption-less profile is the exact misdirect this exists to kill.
+
+    #[test]
+    fn arg_deny_message_names_rule_and_exempted_alternative() {
+        // Profile whose arg_deny_exemptions lifts the python `-c` deny: a
+        // `python3 -m pytest` denial names the `-m` rule AND may offer `-c`
+        // as allowed on this profile.
+        let p = exempt_policy();
+        let Err(rejection) =
+            p.classify_command_allowed_for_shell("python3 -m pytest", ShellDialect::Posix)
+        else {
+            panic!("python3 -m pytest must stay denied: -m survives the -c exemption");
+        };
+        assert!(
+            matches!(rejection, CommandRejection::ArgDeny { ref entry, .. } if entry == "-m"),
+            "the -m deny rule must be named: {rejection:?}"
+        );
+        let suggestion = rejection.suggestion(&p);
+        assert!(
+            suggestion.contains("-m"),
+            "must name the -m rule: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("python3 -c") && suggestion.contains("allowed"),
+            "must offer the -c alternative as allowed on this profile: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn arg_deny_message_without_exemption_offers_only_the_temp_script() {
+        // Same command on a profile WITHOUT the exemption: the message offers
+        // ONLY the temp-script alternative and never claims `-c` is allowed.
+        let p = default_policy();
+        let Err(rejection) =
+            p.classify_command_allowed_for_shell("python3 -m pytest", ShellDialect::Posix)
+        else {
+            panic!("python3 -m pytest must be denied by the -m table entry");
+        };
+        let suggestion = rejection.suggestion(&p);
+        assert!(
+            suggestion.contains("-m"),
+            "must name the -m rule: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("file_write"),
+            "must offer the temp-script alternative via file_write: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("-c"),
+            "an exemption-less profile must never claim -c is allowed: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn arg_deny_message_reaches_both_dialect_paths() {
+        // Both dialect entry points route through the same classifier, so
+        // the reason (and the policy-computed suggestion) is identical.
+        let p = exempt_policy();
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            let Err(rejection) = p.classify_command_allowed_for_shell("python3 -m pytest", dialect)
+            else {
+                panic!("python3 -m pytest must be denied under {dialect:?}");
+            };
+            assert!(
+                matches!(rejection, CommandRejection::ArgDeny { ref entry, .. } if entry == "-m"),
+                "{dialect:?} must name the -m deny rule: {rejection:?}"
+            );
+            let suggestion = rejection.suggestion(&p);
+            assert!(
+                suggestion.contains("python3 -c") && suggestion.contains("allowed"),
+                "{dialect:?} suggestion must offer the exempted -c alternative: {suggestion}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_miss_message_names_the_allowlist_gate() {
+        let p = default_policy();
+        let Err(rejection) = p.classify_command_allowed_for_shell("sleep 5", ShellDialect::Posix)
+        else {
+            panic!("sleep is not on the default allowlist and must be denied");
+        };
+        assert!(
+            matches!(rejection, CommandRejection::UnknownCommand { ref command, .. } if command == "sleep"),
+            "the unknown first token must be named: {rejection:?}"
+        );
+        let suggestion = rejection.suggestion(&p);
+        assert!(
+            suggestion.contains("allowlist"),
+            "an allowlist miss must name the allowlist gate: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("sleep"),
+            "must name the command: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn backtick_message_names_the_construct() {
+        let p = default_policy();
+        let Err(rejection) = p.classify_command_allowed_for_shell("echo `id`", ShellDialect::Posix)
+        else {
+            panic!("backticks must be denied by the syntax guard");
+        };
+        assert!(
+            matches!(rejection, CommandRejection::SyntaxGuard { .. }),
+            "backticks are a syntax-guard rejection: {rejection:?}"
+        );
+        let suggestion = rejection.suggestion(&p);
+        assert!(
+            suggestion.contains("backtick"),
+            "the construct must be named: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn non_interpreter_arg_deny_gets_no_temp_script_advice() {
+        // The temp-script route is the interpreter inline-code family's
+        // sanctioned form. `git config` (git's cased `Exact` `-c` entry is a
+        // config flag, not inline code) must NOT be told to write a
+        // `git script.py`.
+        let p = default_policy();
+        let Err(rejection) =
+            p.classify_command_allowed_for_shell("git config user.name evil", ShellDialect::Posix)
+        else {
+            panic!("git config must be denied by the config table entry");
+        };
+        assert!(
+            matches!(rejection, CommandRejection::ArgDeny { ref entry, .. } if entry == "config"),
+            "the config deny rule must be named: {rejection:?}"
+        );
+        let suggestion = rejection.suggestion(&p);
+        assert!(
+            suggestion.contains("config"),
+            "must name the config rule: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("file_write") && !suggestion.contains("script.py"),
+            "a non-interpreter deny must not offer the temp-script route: {suggestion}"
+        );
     }
 
     #[test]
