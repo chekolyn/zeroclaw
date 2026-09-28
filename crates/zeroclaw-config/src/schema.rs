@@ -12865,6 +12865,73 @@ impl RiskProfileConfig {
             firejail_args: self.firejail_args.clone(),
         }
     }
+
+    /// Keys accepted by `arg_deny_exemptions`, for the unknown-key error
+    /// message only — the authoritative set is the `deny_entries_for`
+    /// match in [`crate::policy`] (pinned by its `deny_entry_table_invariant`
+    /// test, which also fails the build if a listed key is removed). Keep
+    /// the list in sync when a table arm is added.
+    const ARG_DENY_EXEMPTION_KEYS_HINT: &str =
+        "cargo, find, git, node, npm, pip, pip3, python, python3";
+
+    /// Validate [`Self::arg_deny_exemptions`] against the hardcoded
+    /// deny-entry table ([`crate::policy::deny_entries_for`]).
+    ///
+    /// Comparison semantics (pinned — the cased-entry near-miss is a
+    /// config-injection carve if folded):
+    /// - keys compare **exactly** against the table's lowercased command
+    ///   names: `Python = ["-c"]` is an unknown-key error;
+    /// - values compare **case-sensitively** against the entry tokens AS
+    ///   STORED: the `git` arm's cased `-c` entry exempts only `-c`, never
+    ///   `-C` — case-folding here would re-open `git -c` config injection;
+    /// - key validation precedes the empty-list no-op: an unknown key with
+    ///   an empty list is still an error, while a known key with an empty
+    ///   list exempts nothing (today's behavior).
+    ///
+    /// Wired into [`Config::validate`] so a bad map fails config parsing
+    /// loudly instead of silently arming an exemption that subtracts
+    /// nothing (typo, dead value) or carves an unintended deny rule.
+    fn validate_arg_deny_exemptions(&self) -> Result<(), String> {
+        for (command, tokens) in &self.arg_deny_exemptions {
+            let Some(entries) = crate::policy::deny_entries_for(command) else {
+                let hint = Self::ARG_DENY_EXEMPTION_KEYS_HINT;
+                return Err(format!(
+                    "arg_deny_exemptions: unknown command key '{command}'; keys must name \
+                     one of the built-in arg-deny commands ({hint})"
+                ));
+            };
+            for token in tokens {
+                if token.is_empty() {
+                    return Err(format!(
+                        "arg_deny_exemptions.{command}: values must not be empty"
+                    ));
+                }
+                if token == "*" {
+                    return Err(format!(
+                        "arg_deny_exemptions.{command}: '*' is not a valid exemption; name a \
+                         specific deny entry of the '{command}' arm instead"
+                    ));
+                }
+                if token.chars().any(char::is_whitespace) {
+                    return Err(format!(
+                        "arg_deny_exemptions.{command}: '{token}' must not contain whitespace"
+                    ));
+                }
+                if !entries.iter().any(|entry| entry.token == token.as_str()) {
+                    let valid = entries
+                        .iter()
+                        .map(|entry| entry.token)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "arg_deny_exemptions.{command}: '{token}' is not a deny entry of the \
+                         '{command}' arm (case-sensitive comparison); valid: {valid}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_sandbox_backend(name: &str) -> SandboxBackend {
@@ -12987,6 +13054,19 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
+    /// Per-command argument-deny exemptions, subtracted (clause-equality: a
+    /// value string-equals one deny entry of the keyed arm and removes it)
+    /// from the hardcoded arg-deny arms in `SecurityPolicy::is_args_safe`.
+    /// Keys bind to the invoked command's lowercased basename — `python` and
+    /// `python3` are distinct keys requiring distinct entries. Absent/empty
+    /// is byte-for-byte today's behavior. Validated at parse time by
+    /// `validate_arg_deny_exemptions` (wired into [`Config::validate`]):
+    /// keys must name a command of the deny-entry table; values must
+    /// string-equal a deny entry token of the keyed arm, compared
+    /// case-sensitively as stored (the `git` arm's cased `-c` entry exempts
+    /// only `-c`, never `-C`).
+    #[serde(default)]
+    pub arg_deny_exemptions: HashMap<String, Vec<String>>,
 }
 
 impl Default for RiskProfileConfig {
@@ -13009,6 +13089,7 @@ impl Default for RiskProfileConfig {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
+            arg_deny_exemptions: HashMap::new(),
         }
     }
 }
@@ -21960,6 +22041,9 @@ impl Config {
                     );
                 }
             }
+            if let Err(msg) = profile.validate_arg_deny_exemptions() {
+                anyhow::bail!("risk_profiles.{profile_alias}.{msg}");
+            }
         }
 
         // Security OTP / estop
@@ -28700,6 +28784,302 @@ auto_approve = ["weather", "file_read"]
                 .filter(|t| *t == "file_read")
                 .count(),
             1
+        );
+    }
+
+    // ── Argument-deny exemptions: parse + fail-loud validation ──
+    //
+    // `Config::validate()` is the parse-time wire point: a bad map must
+    // fail validation loudly at startup instead of silently arming an
+    // exemption that subtracts nothing (typo) or carves an unintended deny
+    // rule. The comparison semantics are pinned — see the near-miss tests.
+
+    /// An absent `arg_deny_exemptions` key parses to the empty map (the
+    /// whole-struct `#[serde(default)]` on `RiskProfileConfig` fills it) and
+    /// validates: absent/empty is byte-for-byte today's behavior.
+    #[test]
+    async fn arg_deny_exemptions_absent_key_parses_empty() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+workspace_only = false
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            profile.arg_deny_exemptions.is_empty(),
+            "absent key must parse to the empty map"
+        );
+        parsed.validate().expect("absent key must validate");
+    }
+
+    /// `arg_deny_exemptions = { python = ["-c"] }` parses into the map and
+    /// passes validation: `python` is a deny-table command and `-c` is one
+    /// of its entry tokens.
+    #[test]
+    async fn arg_deny_exemptions_known_command_and_token_parses() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = ["-c"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert_eq!(
+            profile.arg_deny_exemptions,
+            HashMap::from([("python".to_string(), vec!["-c".to_string()])])
+        );
+        parsed
+            .validate()
+            .expect("a table-command key with a matching entry token must validate");
+    }
+
+    /// A known command key with an empty list is the no-op form: it exempts
+    /// nothing and validates. (Only unknown keys with empty lists error —
+    /// see `arg_deny_exemptions_unknown_key_with_empty_list_rejected`.)
+    #[test]
+    async fn arg_deny_exemptions_empty_list_for_known_command_is_a_noop() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = [] }
+"#;
+        let parsed = parse_test_config(raw);
+        parsed
+            .validate()
+            .expect("a known key with an empty list exempts nothing and must validate");
+    }
+
+    /// Keys must name a deny-table command: an unknown key is rejected.
+    #[test]
+    async fn arg_deny_exemptions_unknown_command_key_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { foo = ["-c"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("unknown command key must fail validation loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions"),
+            "error must name the offending field path; got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown command key 'foo'"),
+            "error must name the offending key; got: {msg}"
+        );
+    }
+
+    /// Values must string-equal a deny entry of the keyed arm: `-q` is not
+    /// in the `python` arm, so the exemption would silently subtract
+    /// nothing — a typo must fail validation, not arm a no-op.
+    #[test]
+    async fn arg_deny_exemptions_value_not_a_deny_entry_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = ["-q"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("a token outside the keyed arm's deny entries must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.python"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("'-q'"),
+            "error must name the offending value; got: {msg}"
+        );
+    }
+
+    /// A token that belongs to ANOTHER arm's table exempts nothing from
+    /// this arm (`-exec` is a `find` entry, not a `git` one) and is
+    /// rejected.
+    #[test]
+    async fn arg_deny_exemptions_cross_arm_token_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { git = ["-exec"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("another arm's token must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.git"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("'-exec'"),
+            "error must name the offending value; got: {msg}"
+        );
+    }
+
+    /// The `*` wildcard is rejected: it is not a deny-entry token and must
+    /// never expand to "exempt everything".
+    #[test]
+    async fn arg_deny_exemptions_wildcard_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = ["*"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("the '*' wildcard must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.python"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("'*'"),
+            "error must name the offending value; got: {msg}"
+        );
+    }
+
+    /// The cased-entry near-miss: `git = ["-C"]` must be rejected. The
+    /// `git` arm's cased `-c` entry matches only `-c`, NEVER `-C` —
+    /// case-folding the value comparison here would carve `git -c` (config
+    /// injection) through an exemption the user never granted.
+    #[test]
+    async fn arg_deny_exemptions_git_uppercase_dash_c_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { git = ["-C"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("the cased-entry near-miss must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.git"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("'-C'"),
+            "error must name the offending value; got: {msg}"
+        );
+    }
+
+    /// Keys compare exactly against the table's lowercased command names:
+    /// `Python` is an unknown-key error, not an alias for `python`.
+    #[test]
+    async fn arg_deny_exemptions_uppercase_command_key_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { Python = ["-c"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("an uppercase command key must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions"),
+            "error must name the offending field path; got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown command key 'Python'"),
+            "error must name the offending key; got: {msg}"
+        );
+    }
+
+    /// Key validation precedes the empty-list no-op: `foo = []` is an
+    /// unknown-key error, not a silently-ignored empty exemption.
+    #[test]
+    async fn arg_deny_exemptions_unknown_key_with_empty_list_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { foo = [] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("an unknown key must be rejected even with an empty list");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions"),
+            "error must name the offending field path; got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown command key 'foo'"),
+            "error must name the offending key; got: {msg}"
+        );
+    }
+
+    /// Empty values are rejected: an exemption token is matched by exact
+    /// string equality, and an empty string would silently subtract
+    /// nothing.
+    #[test]
+    async fn arg_deny_exemptions_empty_value_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = [""] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("an empty exemption value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.python"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("must not be empty"),
+            "error must state the empty-value rule; got: {msg}"
+        );
+    }
+
+    /// Whitespace-containing values are rejected: deny entries are matched
+    /// as exact argument tokens, so a value with embedded whitespace never
+    /// corresponds to a real entry.
+    #[test]
+    async fn arg_deny_exemptions_whitespace_value_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+arg_deny_exemptions = { python = ["- c"] }
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("a whitespace-containing exemption value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("risk_profiles.default.arg_deny_exemptions.python"),
+            "error must name the offending key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("must not contain whitespace"),
+            "error must state the whitespace rule; got: {msg}"
         );
     }
 

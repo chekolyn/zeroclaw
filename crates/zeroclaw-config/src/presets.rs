@@ -88,6 +88,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         sandbox_enabled: Some(true),
         sandbox_backend: None,
         firejail_args: vec![],
+        arg_deny_exemptions: std::collections::HashMap::new(),
     }
 }
 
@@ -112,6 +113,7 @@ fn balanced_risk() -> RiskProfileConfig {
         sandbox_enabled: Some(true),
         sandbox_backend: None,
         firejail_args: vec![],
+        arg_deny_exemptions: std::collections::HashMap::new(),
     }
 }
 
@@ -136,6 +138,7 @@ fn yolo_risk() -> RiskProfileConfig {
         sandbox_enabled: Some(false),
         sandbox_backend: None,
         firejail_args: vec![],
+        arg_deny_exemptions: std::collections::HashMap::new(),
     }
 }
 

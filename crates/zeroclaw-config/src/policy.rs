@@ -3830,7 +3830,6 @@ pub(crate) struct DenyEntry {
 /// subtraction in `is_args_safe` both derive from it, and the
 /// `deny_entry_table_invariant` test pins the key set so upstream arm drift
 /// fails the build instead of rotting silently.
-#[allow(dead_code)] // only the invariant test reads this until the is_args_safe consult lands
 pub(crate) fn deny_entries_for(base: &str) -> Option<&'static [DenyEntry]> {
     match base {
         "find" => Some(&[
@@ -4162,6 +4161,7 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            arg_deny_exemptions: HashMap::new(),
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
