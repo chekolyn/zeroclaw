@@ -30535,6 +30535,7 @@ bot_token = "xoxb-tok"
             send_method: None,
             auth_header: None,
             secret: None,
+            signature_header: "X-Hub-Signature-256".to_string(),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
