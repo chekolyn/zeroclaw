@@ -695,10 +695,7 @@ pub enum EscalationViolation {
     /// did not exempt. Allowlist direction (child ⊆ parent): a subagent
     /// may narrow the operator-granted deny-guard carve-outs but
     /// never widen them.
-    ArgDenyExemptionExpandedByChild {
-        command: String,
-        arg: String,
-    },
+    ArgDenyExemptionExpandedByChild { command: String, arg: String },
 }
 
 impl std::fmt::Display for EscalationViolation {
