@@ -5971,13 +5971,17 @@ mod tests {
 
     // Both dialect entry points route through the same argument-deny
     // consult (`classify_args_safe`); these two tests pin that routing.
-    // Rows mirror F1's deny corpus (every table arm's tokens), with rows
-    // the bounded PowerShell grammar rejects for NON-arg-deny reasons
-    // elided from the shared loop — `;`/`$`/backtick rows (POSIX-shell
-    // constructs) and the glued `-c'code'` form (a mixed quoted/unquoted
-    // token the PowerShell lexer rejects before the argument-deny consult
-    // runs). The glued form is pinned separately below via the POSIX
-    // entry point.
+    // The rows are the complete deny set of every table arm (spec §1.9):
+    // map absent, every entry denies; map present (the python `-c`
+    // exemption), the exempted entries lift while everything else —
+    // every other arm's complete set AND the shell-syntax layer, which no
+    // exemption can reach — stays denied. The syntax rows deny under both
+    // dialects (POSIX names the guard construct; the bounded PowerShell
+    // grammar rejects the construct class before the consult runs), so
+    // they stay in the shared loop. The one exception is the glued
+    // `-c'code'` form — a mixed quoted/unquoted token the PowerShell lexer
+    // rejects before the argument-deny consult runs — pinned separately
+    // below via the POSIX entry point.
     #[test]
     fn deny_matrix_holds_through_both_dialect_entry_points() {
         let p = default_policy();
@@ -5991,6 +5995,7 @@ mod tests {
             ("git config user.name evil", false),
             ("git config.local path", false),
             ("git alias.st status", false),
+            ("git alias st status", false), // the EXACT `alias` entry (vs the `alias.` prefix row above)
             ("git -C /tmp status", true),
             ("git status", true),
             // python/python3: starts_with -c / -m, glued forms included
@@ -6004,7 +6009,11 @@ mod tests {
             ("node -p 'process.env'", false),
             ("node --print=process.env", false),
             ("node app.js", true),
-            // pip/pip3: exact install / download
+            // pip/pip3: exact install / download. NOTE: pip3 is NOT on the
+            // Unix default allowlist (only `pip` is), so these pip3 rows
+            // deny at the allowlist gate and never reach the pip3 arm —
+            // the arm-isolating pip3 rows live in
+            // `pip3_deny_arm_isolated_by_custom_allowlist` below.
             ("pip install evil-package", false),
             ("pip download evil-package", false),
             ("pip3 install evil-package", false),
@@ -6020,6 +6029,17 @@ mod tests {
             // cargo: exact install
             ("cargo install malicious-crate", false),
             ("cargo build", true),
+            // ── Shell-syntax layer (untouched by arg_deny_exemptions):
+            // backticks in ANY quote state, `$()` expansion, unsafe
+            // redirects, `tee`, unquoted single `&`. Same verdicts under
+            // both dialects — POSIX names the construct, the bounded
+            // PowerShell grammar rejects the construct class outright.
+            ("echo `id`", false),
+            ("echo $(cat /etc/passwd)", false),
+            ("echo secret > /etc/crontab", false),
+            ("echo secret | tee /etc/crontab", false),
+            ("ls & rm -rf /", false),
+            ("echo hello", true),
         ] {
             assert_eq!(
                 p.is_posix_like_command_allowed(command, ShellDialect::Posix),
@@ -6046,17 +6066,39 @@ mod tests {
             ("python3 -m http.server", false),
             // known false positive: inert trailing -m keeps the deny
             ("python -c 'x' -m junk", false),
-            // every other arm unchanged
+            // every OTHER arm's complete deny set unchanged (the python/
+            // python3 keys touch only the python/python3 arms):
             ("git -c x.y=true status", false),
+            ("git config user.name evil", false),
+            ("git config.local path", false),
+            ("git alias st status", false),
+            ("git alias.st status", false),
             ("git -C /tmp status", true),
             ("node -e 'process.exit()'", false),
+            ("node --eval=process.exit()", false),
+            ("node -p 'process.env'", false),
+            ("node --print=process.env", false),
             ("pip install evil-package", false),
+            ("pip download evil-package", false),
+            ("npm exec -- malicious-pkg", false),
             ("npm install malicious-pkg", false),
+            ("npm i malicious-pkg", false),
+            ("npm add malicious-pkg", false),
+            ("npm ci", false),
             ("cargo install malicious-crate", false),
             ("find . -exec rm {}", false),
+            ("find . -ok rm {}", false),
+            // the shell-syntax layer is unreachable from the exemptions
+            // map: the constructs deny identically with the map present
+            ("echo `id`", false),
+            ("echo $(cat /etc/passwd)", false),
+            ("echo secret > /etc/crontab", false),
+            ("echo secret | tee /etc/crontab", false),
+            ("ls & rm -rf /", false),
             // safe rows stay safe
             ("python script.py", true),
             ("git status", true),
+            ("npm test", true),
         ] {
             assert_eq!(
                 p.is_posix_like_command_allowed(command, ShellDialect::Posix),
@@ -6077,6 +6119,108 @@ mod tests {
         assert!(p.is_posix_like_command_allowed("python3 -c'import os'", ShellDialect::Posix));
         assert!(!p.is_simple_powershell_command_allowed("python3 -c'import os'"));
     }
+
+    // Clause-equality on the git arm's compound entries: `git = ["config"]`
+    // subtracts the EXACT `config` entry alone — the `config.` prefix entry,
+    // the cased `-c`, and both `alias` entries all survive, and the git key
+    // never touches the python arm (keys bind to the lowercased basename).
+    #[test]
+    fn git_config_exemption_is_clause_equal() {
+        let mut p = default_policy();
+        p.arg_deny_exemptions = [("git".into(), vec!["config".into()])]
+            .into_iter()
+            .collect();
+        for (command, expect_allowed) in [
+            ("git config user.name evil", true), // the exempted exact entry lifts
+            ("git config.local path", false),    // the `config.` prefix entry survives
+            ("git -c x.y=true status", false),   // the cased -c entry survives
+            ("git alias st status", false),      // the exact `alias` entry survives
+            ("git alias.st status", false),      // the `alias.` prefix entry survives
+            ("git -C /tmp status", true),        // never denied in the first place
+            ("git status", true),
+            ("python -c 'print(1)'", false), // the git key never touches the python arm
+        ] {
+            assert_eq!(
+                p.is_posix_like_command_allowed(command, ShellDialect::Posix),
+                expect_allowed,
+                "posix dialect disagrees on {command:?}"
+            );
+            assert_eq!(
+                p.is_simple_powershell_command_allowed(command),
+                expect_allowed,
+                "powershell dialect disagrees on {command:?}"
+            );
+        }
+    }
+
+    // pip3 is NOT on the Unix default allowlist (only `pip` is), so the
+    // default-policy pip3 rows above deny at the allowlist gate and never
+    // reach the pip3 arm — they prove the command is denied, not WHICH rule
+    // denies it. This row set isolates the arm: the custom allowlist passes
+    // pip3, so every verdict below is the pip3 arm's own, and the exemption
+    // consult demonstrably works per-arm key (`pip3 = ["install"]` lifts
+    // install alone; the pip arm is untouched).
+    #[test]
+    fn pip3_deny_arm_isolated_by_custom_allowlist() {
+        // Map absent: the pip3 arm's complete deny set through a policy that
+        // allowlists pip3 (never a "*" + block_high_risk_commands=false
+        // helper — that escape skips all guards).
+        let mut p = default_policy();
+        p.allowed_commands.push("pip3".into());
+        for (command, expect_allowed) in [
+            ("pip3 install evil-package", false),
+            ("pip3 download evil-package", false),
+            ("pip3 list", true), // allowlisted AND no arm entry matches
+        ] {
+            assert_eq!(
+                p.is_posix_like_command_allowed(command, ShellDialect::Posix),
+                expect_allowed,
+                "posix dialect disagrees on {command:?}"
+            );
+            assert_eq!(
+                p.is_simple_powershell_command_allowed(command),
+                expect_allowed,
+                "powershell dialect disagrees on {command:?}"
+            );
+        }
+
+        // Map present: `pip3 = ["install"]` lifts exactly that entry.
+        p.arg_deny_exemptions = [("pip3".into(), vec!["install".into()])]
+            .into_iter()
+            .collect();
+        for (command, expect_allowed) in [
+            ("pip3 install evil-package", true),   // the exempted entry lifts
+            ("pip3 download evil-package", false), // its compound sibling survives
+            ("pip3 list", true),
+            ("pip install evil-package", false), // the pip arm is untouched by the pip3 key
+        ] {
+            assert_eq!(
+                p.is_posix_like_command_allowed(command, ShellDialect::Posix),
+                expect_allowed,
+                "posix dialect disagrees on {command:?}"
+            );
+            assert_eq!(
+                p.is_simple_powershell_command_allowed(command),
+                expect_allowed,
+                "powershell dialect disagrees on {command:?}"
+            );
+        }
+    }
+
+    // The §1.9 matrix's remaining classes live where their seams are:
+    //  - the escalation subset in both directions (child ⊆ parent, the
+    //    `ArgDenyExemptionExpandedByChild` variant — new pair, new arg
+    //    under an exempted command, and the same/subset/dropped-key
+    //    accepts): the `ensure_no_escalation_*arg_deny*` tests below in
+    //    this module;
+    //  - the validation errors (unknown keys, values matching no deny entry
+    //    of the keyed arm, `*`, empty and whitespace-containing values, the
+    //    cased `git = ["-C"]` config-injection near-miss, key case, and the
+    //    key-check-precedes-empty-list ordering): schema.rs's
+    //    `arg_deny_exemptions_*` tests — the parse-time fail-loud gate;
+    //  - the table's key set itself: `deny_entry_table_invariant` below in
+    //    this module (the key-set invariant that makes arm-level drift fail
+    //    the build).
 
     // ── Reason-threading: actionable denial messages ──────────────────────
     //
