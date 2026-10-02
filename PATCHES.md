@@ -28,7 +28,8 @@ are the lineage contract. The rules:
 - The probe cell names a probe registry key EXACTLY (the checker's `PROBES`
   dict); `-` means no probe. Probes are mandatory for any patch ever
   implicated in a silent drop: the mqtt liveness fix (this row carries
-  `mqtt-poll-alive`) and U1 (carries `allow_scripts-config-read`).
+  `mqtt-poll-alive`), U1 (carries `allow_scripts-config-read`), and U2
+  (carries `cron-session-route`).
 - **Superseded (no row):** the old `adapt` patch (`454f20239`, "adapt cheknet
   patches to v0.8.4 ToolOutput API") is superseded, not dropped — its purpose
   was the v0.8.4 `ToolOutput` adaptation, and the v0.8.5 sites were
@@ -79,13 +80,18 @@ are the lineage contract. The rules:
 | ADE-5 | 264e2c293 | v0.8.5 | arg_deny_exemptions — policy-state-computed denial messages (reason-threading). | - |
 | ADE-6 | 118afa241 | v0.8.5 | arg_deny_exemptions — classifier mirrors ReadOnly autonomy (no misdirecting suggestion on read-only profiles). | - |
 | ADE-7 | 2f32e99bb | v0.8.5 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present). | - |
+| U1 | 33f948e15 | v0.8.5 | the `allow_scripts` subagent propagation fix (delegated subagents skipped skills containing script files — `skills.allow_scripts` was not propagated from the parent config). Carried as the upstreamed claim "upstream `352672c0`" since the v0.8.3-era table; verified dead 2026-10-02 (the origin patch-id absent from v0.8.4's patch-id set, the tree probe failing on v0.8.4/v0.8.5/the current tree) and resolved by the C.1 remediation: cherry-picked from `cheknet-pached` `352672c02` onto v0.8.5, both `load_skills_from_directory` scan sites reshaped to the v0.8.5 loader (the tuple return) and reading the root config snapshot per site; the origin commit's ws.rs marker cleanup and .dockerignore excludes dropped — never applicable on this lineage (the excludes already ride `c91662850`). | allow_scripts-config-read |
+| U2 | 957bee7d6 | v0.8.5 | the cron chat-leak fix (automated cron outputs routed exclusively to the `cron` session, not broadcast to all chat WebSockets). Carried as the upstreamed claim "upstream `69dd83ed`" since the v0.8.3-era table; verified dead 2026-10-02 (the origin patch-id absent from v0.8.4's 1350-commit patch-id set, the fix shape absent from the v0.8.4/v0.8.5 trees) and resolved by the C.1 remediation: cherry-picked from `cheknet-pached` `69dd83ed4` onto v0.8.5 — `event_matches_session`'s no-session arm routes `cron_result` to the `cron` session alone, and v0.8.5's own `is_global_chat_event` whitelist (the leaky arm's old shape) is removed with its only caller replaced. | cron-session-route |
 
 ### Upstreamed rows
 
-| id | origin_commit | asserted_in | upstream_sha | probe | description |
-|----|---------------|-------------|--------------|-------|-------------|
-| U1 | 352672c02 | v0.8.4 | TBD-RESOLVE | allow_scripts-config-read | the `allow_scripts` subagent propagation fix (delegated subagents skipped skills containing script files — `skills.allow_scripts` was not propagated from the parent config). Carried as "upstream `352672c0`" since the v0.8.3-era table; the origin commit lives on `cheknet-pached`. Verified 2026-10-02: the origin patch-id is ABSENT from v0.8.4's patch-id set and the tree probe fails on v0.8.4, v0.8.5, and the current tree — the claim is dead. Resolution (the C.1 remediation): cherry-pick `352672c02`, row U→R with the new current sha, probe retained. |
-| U2 | 69dd83ed4 | v0.8.4 | TBD-RESOLVE | - | the cron chat-leak fix (automated cron outputs routed exclusively to the `cron` session, not broadcast to all chat WebSockets). Carried as "upstream `69dd83ed`" since the v0.8.3-era table; the origin commit lives on `cheknet-pached`. Verified 2026-10-02: the origin patch-id is ABSENT from v0.8.4's patch-id set — the claim is dead as asserted. Resolution: search v0.8.4's history for the origin patch-id → record the sha (claim proven), or cherry-pick + row U→R + a probe derived then. |
+(None. The two historical claims were resolved 2026-10-02 by the C.1
+remediation — U1 and U2 moved U→R, the applied rows above: both were
+carried as "upstreamed by v0.8.4" since the v0.8.3-era table with their
+origin commits on `cheknet-pached`; both origin patch-ids were verified
+absent from v0.8.4's patch-id set and both fix shapes absent from the
+v0.8.4/v0.8.5 trees — the checker's `check_upstreamed` machinery — so
+the content was replayed onto this lineage instead.)
 
 `TBD-RESOLVE` marks an unresolved upstreamed claim — a checker failure
 (FAIL_U, exit 1), never a pass and never an error exit; the checker never
@@ -151,7 +157,9 @@ The discovery enumeration for the fork patch-lineage guarantee (task 0 of the
 the manifest's input truth. Every commit in
 `git rev-list --no-merges v0.8.5..cheknet-patched-v0.8.5` is classified below.
 The branch is exactly the `v0.8.5` tag (`cb2b20a9f` — the first commit's parent)
-plus these 40 non-merge commits; no commit is left unclassified.
+plus these 42 content commits; no content commit is left unclassified (the
+mechanism's own surfaces — PATCHES.md / scripts/check_patches.py / Makefile —
+ride the checker's reverse-check carve-out, never this map).
 
 lineage: cheknet-patched-v0.8.5 base v0.8.5
 
@@ -263,9 +271,11 @@ old-table rows (the class-b rows below `gateway`/`delegate-*`).
 | 118afa241 | a | ADE-6 | arg_deny_exemptions — classifier mirrors ReadOnly autonomy (no misdirecting suggestion on read-only profiles) |
 | 2f32e99bb | a | ADE-7 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present) |
 | a05960c1f | c | docs | PATCHES.md — the arg_deny_exemptions entry |
+| 33f948e15 | a | U1 | the allow_scripts subagent propagation fix — cherry-picked from cheknet-pached `352672c02` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
+| 957bee7d6 | a | U2 | the cron chat-leak fix — cherry-picked from cheknet-pached `69dd83ed4` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 
-Row count: 54 rows over 40 commits — 15 class-b rows (one commit, the squash
-carrier), 23 class-a rows (one per commit), 16 class-c rows (one per commit).
+Row count: 56 rows over 42 commits — 15 class-b rows (one commit, the squash
+carrier), 25 class-a rows (one per commit), 16 class-c rows (one per commit).
 The sha column is the 9-char short form (unique; `git cat-file -e` resolves
 each); the checker re-verifies every row against the branch.
 
@@ -338,4 +348,72 @@ probes: FAIL_B — 1 probe(s) below the floor:
   edf41c818 — PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
   a05960c1f — PATCHES.md — the arg_deny_exemptions entry
 result: RED — 2 failure section(s); every patch must map to a row or the allowlist, and the allowlist + class-c enumeration above must be human-verified
+```
+
+### The C.1 remediation — the checker's first green run (2026-10-02)
+
+The honest-red state above is repaired, exactly as its closing note
+prescribed. Both dead upstreamed claims resolved by replay: U1
+cherry-picked from `cheknet-pached` `352672c02` → `33f948e15` (both
+`load_skills_from_directory` scan sites now read the root config
+snapshot's `skills.allow_scripts` — the probe 2-of-2), U2 from
+`69dd83ed4` → `957bee7d6` (`event_matches_session`'s no-session arm
+routes `cron_result` exclusively to the `cron` session; v0.8.5's own
+`is_global_chat_event` whitelist — the leaky arm's old shape — removed
+with its only caller replaced; the derived probe `cron-session-route`
+pinned into the checker's registry). Both rows moved U→R (the U-table is
+empty; no TBD-RESOLVE remains), both picks landed as class-a map rows,
+and the picks carry the origin commit's third hunk dropped where it was
+old-lineage cruft (U1: ws.rs conflict-marker cleanup + .dockerignore
+excludes; U2: the marker block the auto-merge re-injected into an
+unrelated test — repaired before commit). The verbatim green report:
+
+```
+== fork patch-lineage checker ==
+repo: /Users/sa/git/zeroclaw-src
+manifest: /Users/sa/git/zeroclaw-src/PATCHES.md
+lineage: cheknet-patched-v0.8.5 (base v0.8.5) — reverse-scope: 17 path(s)
+manifest: OK — 42 applied rows, 0 upstreamed rows, 16 allowlist entries, 56 audit-map rows
+branch: OK — HEAD is on 'cheknet-patched-v0.8.5' (the declared lineage branch)
+presence: OK — 42/42 applied rows anchored in v0.8.5..HEAD (R1, R2, R3, R4, wiring, delegate-results_dir, R5, R6, gateway, delegate-ttl_seconds, t6b-task-events, sop-headless-drivers, otel-w3c-bridge, migrate-fixes, runs-fixes, finished-runs-cap, skip-at-dispatch, M3AX-1, M3AX-2, M3AX-3, GLM53-EFFORT, M3AX-WIRE, DELEGATE-EXCL, PG-BOUNDS, PG-SHARE, PG-BLOCKPOOL, PG-CACHE-GATE, OTEL-ONCE, PG-FLOAT8, L2B-NOTIFY, MQTT-POLL-ALIVE, RIDE-WEBHOOK-TEST, ADE-1, ADE-2, ADE-3, RIDE-FMT, ADE-4, ADE-5, ADE-6, ADE-7, U1, U2)
+reverse: OK — 45 scoped commits: 26 rowed, 13 allowlisted, 6 mechanism-exempt; 0 unmapped
+drift: OK — every applied row's touched paths lie within the reverse-scope (17 path(s))
+map-consistency: OK — 56 audit-map rows (a/b 26, c 16); rows↔a/b 26=26; class-c↔allowlist bijection 16=16; overlap ∅; no upstream-era/prior-lineage replay among allowlisted (asserted tags + the base tag)
+upstreamed: OK — no upstreamed claims declared
+probes: OK — allow_scripts-config-read 2/2; mqtt-poll-alive 4/1; cron-session-route 1/1
+-- allowlist (16) --
+  c91662850 — tooling: Docker build context excludes (.worktrees/ + target/; 225GB → ~1GB)
+  e0c654935 — realignment-fixup: restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock)
+  fd1ef7def — realignment-fixup: missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit)
+  60b7f1a91 — realignment-fixup: exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray zeroclaw_runtime/ add)
+  698fd1131 — realignment-fixup: namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape)
+  9eab4b59a — realignment-fixup: reaped_stuck_runs placement — method condition + initializer (not field decl)
+  968691630 — realignment-fixup: mut on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration)
+  a78b9816e — realignment-fixup: gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes)
+  6465b2c4c — realignment-fixup: webhook_secret_hash added to the AppState initializer (E0063 missing field)
+  ccd4b595e — realignment-fixup: HashMap::new() for generic_webhook fields (setup code lost in realignment)
+  96334076b — realignment-fixup: #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement)
+  b4535defa — realignment-fixup: webhook_secret_hash None unconditional in the initializer (field not #[cfg]-gated)
+  f2fda50ad — realignment-fixup: Cargo.lock sync — entries missing from the restored v0.8.5 lockfile
+  a1fed21af — realignment-fixup: Cargo.lock entries completed for the realigned cheknet patch deps
+  edf41c818 — docs: PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
+  a05960c1f — docs: PATCHES.md — the arg_deny_exemptions entry
+-- audit-map class-c (16) --
+  c91662850 — Docker build context excludes (`.worktrees/` + `target/`; 225GB → ~1GB)
+  e0c654935 — restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock)
+  fd1ef7def — missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit)
+  60b7f1a91 — exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray `zeroclaw_runtime/` add)
+  698fd1131 — namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape)
+  9eab4b59a — reaped_stuck_runs placement — method condition + initializer (not field decl)
+  968691630 — `mut` on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration)
+  a78b9816e — gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes)
+  6465b2c4c — webhook_secret_hash added to the AppState initializer (E0063 missing field)
+  ccd4b595e — HashMap::new() for generic_webhook fields (setup code lost in realignment)
+  96334076b — #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement)
+  b4535defa — webhook_secret_hash: None unconditional in the initializer (field not #[cfg]-gated)
+  f2fda50ad — Cargo.lock sync — entries missing from the restored v0.8.5 lockfile
+  a1fed21af — Cargo.lock entries completed for the realigned cheknet patch deps
+  edf41c818 — PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
+  a05960c1f — PATCHES.md — the arg_deny_exemptions entry
+result: GREEN — every patch in the lineage is accounted for; the allowlist + class-c enumeration above is the trust boundary: no drop can pass without appearing on this report
 ```

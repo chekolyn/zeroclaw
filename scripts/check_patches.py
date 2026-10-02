@@ -54,12 +54,17 @@ FAIL_U/FAIL_D/FAIL_B); 2 invocation/environment error (bad repo, unreadable
 manifest, broken git). The checker NEVER edits anything — read-only git
 plumbing only. Zero dependencies beyond git + the python3 stdlib.
 
-The probe registry is FULLY PINNED with verified real paths (both re-verified
-with ls before the first run):
+The probe registry is FULLY PINNED with verified real paths (each re-verified
+with ls before the first run; the U2 probe was derived from the replayed
+fix's shape at C.1 remediation time, 2026-10-02):
   - "allow_scripts-config-read" — crates/zeroclaw-runtime/src/tools/delegate.rs
     (the REAL runtime-crate path; both scan sites, min_count 2)
   - "mqtt-poll-alive" — crates/zeroclaw-channels/src/orchestrator/mqtt.rs
     (the REAL channels-crate path; record_poll_alive lives only there)
+  - "cron-session-route" — crates/zeroclaw-gateway/src/ws.rs
+    (the REAL gateway-crate path; the cron_result routing decision —
+    `session_id == "cron"` — lives only in the fixed no-session arm,
+    min_count 1; the shape is absent from the v0.8.4/v0.8.5 tag trees)
 """
 
 from __future__ import annotations
@@ -86,6 +91,11 @@ PROBE_REGISTRY: dict = {
     "mqtt-poll-alive": {
         "glob": "crates/zeroclaw-channels/src/orchestrator/mqtt.rs",
         "pattern": r"record_poll_alive",
+        "min_count": 1,
+    },
+    "cron-session-route": {
+        "glob": "crates/zeroclaw-gateway/src/ws.rs",
+        "pattern": r'session_id == "cron"',
         "min_count": 1,
     },
 }
@@ -1163,9 +1173,14 @@ def _run_selftest() -> int:
             "pattern": r"record_poll_alive",
             "min_count": 1,
         },
+        "cron-session-route": {
+            "glob": "crates/zeroclaw-gateway/src/ws.rs",
+            "pattern": r'session_id == "cron"',
+            "min_count": 1,
+        },
     }
     print("== check_patches selftest ==")
-    print(f"registry pinning (both entries, real paths, min_counts): "
+    print(f"registry pinning (all three entries, real paths, min_counts): "
           f"{'PASS' if pinned_ok else 'FAIL — PROBE_REGISTRY drifted from the pinned spec'}")
 
     results = []
