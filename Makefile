@@ -2,12 +2,15 @@ IMAGE_NAME    = zeroclaw
 IMAGE_TAG     = stagex
 IMAGE_FAT_TAG = stagex-fat
 
-.PHONY: build build-fat extract extract-fat shell-debug clean
+.PHONY: build build-fat extract extract-fat shell-debug clean check-patches
 
-build:
+check-patches:
+	python3 scripts/check_patches.py --repo . || { echo "REFUSING: the fork patch-lineage is unverified — an unverified lineage can never produce an image (see the checker report above)"; exit 1; }
+
+build: check-patches
 	podman build -t $(IMAGE_NAME):$(IMAGE_TAG) --target package -f Containerfile .
 
-build-fat:
+build-fat: check-patches
 	podman build -t $(IMAGE_NAME):$(IMAGE_FAT_TAG) --target package-fat -f Containerfile .
 
 extract:
