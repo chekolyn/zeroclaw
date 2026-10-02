@@ -268,3 +268,74 @@ Row count: 54 rows over 40 commits — 15 class-b rows (one commit, the squash
 carrier), 23 class-a rows (one per commit), 16 class-c rows (one per commit).
 The sha column is the 9-char short form (unique; `git cat-file -e` resolves
 each); the checker re-verifies every row against the branch.
+
+### The honest starting state — the checker's first recorded real-repo run (2026-10-02)
+
+`python3 scripts/check_patches.py --repo /Users/sa/git/zeroclaw-src` →
+**exit 1** — the expected honest red, exactly the predicted three facets and
+NOTHING else: U1's dead-link claim + U2's dead-link claim (both FAIL_U,
+`TBD-RESOLVE` — the origin patch-ids are absent from v0.8.4's patch-id set,
+per the verified rows above) + U1's current-tree probe (FAIL_B: the worktree's
+`delegate.rs` still hardcodes `false` at both `load_skills_from_directory`
+call sites — 0-of-2, the honest pre-fix red). The liveness probe
+(`mqtt-poll-alive`) PASSES on its real path; the mechanism's own commits ride
+the carve-out (4 mechanism-exempt); the map-consistency arm is green with the
+base-tag arm consulted (the class-c↔allowlist bijection 16=16, no
+upstream-era/prior-lineage replay among the allowlisted). This red is the
+state the C.1 remediation repairs (U1: cherry-pick `352672c02`, row U→R,
+probe retained; U2: resolve the claim or cherry-pick). The verbatim report —
+the trust boundary's surface, status lines + the allowlist + the class-c
+enumeration (the RED report carries it too):
+
+```
+== fork patch-lineage checker ==
+repo: /Users/sa/git/zeroclaw-src
+manifest: /Users/sa/git/zeroclaw-src/PATCHES.md
+lineage: cheknet-patched-v0.8.5 (base v0.8.5) — reverse-scope: 17 path(s)
+manifest: OK — 40 applied rows, 2 upstreamed rows, 16 allowlist entries, 54 audit-map rows
+branch: OK — HEAD is on 'cheknet-patched-v0.8.5' (the declared lineage branch)
+presence: OK — 40/40 applied rows anchored in v0.8.5..HEAD (R1, R2, R3, R4, wiring, delegate-results_dir, R5, R6, gateway, delegate-ttl_seconds, t6b-task-events, sop-headless-drivers, otel-w3c-bridge, migrate-fixes, runs-fixes, finished-runs-cap, skip-at-dispatch, M3AX-1, M3AX-2, M3AX-3, GLM53-EFFORT, M3AX-WIRE, DELEGATE-EXCL, PG-BOUNDS, PG-SHARE, PG-BLOCKPOOL, PG-CACHE-GATE, OTEL-ONCE, PG-FLOAT8, L2B-NOTIFY, MQTT-POLL-ALIVE, RIDE-WEBHOOK-TEST, ADE-1, ADE-2, ADE-3, RIDE-FMT, ADE-4, ADE-5, ADE-6, ADE-7)
+reverse: OK — 41 scoped commits: 24 rowed, 13 allowlisted, 4 mechanism-exempt; 0 unmapped
+drift: OK — every applied row's touched paths lie within the reverse-scope (17 path(s))
+map-consistency: OK — 54 audit-map rows (a/b 24, c 16); rows↔a/b 24=24; class-c↔allowlist bijection 16=16; overlap ∅; no upstream-era/prior-lineage replay among allowlisted (asserted tags + the base tag)
+upstreamed: FAIL_U — 2 unproven claim(s):
+    row 'U1': TBD-RESOLVE — the upstreamed claim is unresolved (exit 1, never a pass and never exit 2)
+    row 'U2': TBD-RESOLVE — the upstreamed claim is unresolved (exit 1, never a pass and never exit 2)
+probes: FAIL_B — 1 probe(s) below the floor:
+    probe 'allow_scripts-config-read': expected >= 2 match(es) of 'root_config.*allow_scripts' in 'crates/zeroclaw-runtime/src/tools/delegate.rs', found 0
+-- allowlist (16) --
+  c91662850 — tooling: Docker build context excludes (.worktrees/ + target/; 225GB → ~1GB)
+  e0c654935 — realignment-fixup: restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock)
+  fd1ef7def — realignment-fixup: missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit)
+  60b7f1a91 — realignment-fixup: exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray zeroclaw_runtime/ add)
+  698fd1131 — realignment-fixup: namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape)
+  9eab4b59a — realignment-fixup: reaped_stuck_runs placement — method condition + initializer (not field decl)
+  968691630 — realignment-fixup: mut on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration)
+  a78b9816e — realignment-fixup: gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes)
+  6465b2c4c — realignment-fixup: webhook_secret_hash added to the AppState initializer (E0063 missing field)
+  ccd4b595e — realignment-fixup: HashMap::new() for generic_webhook fields (setup code lost in realignment)
+  96334076b — realignment-fixup: #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement)
+  b4535defa — realignment-fixup: webhook_secret_hash None unconditional in the initializer (field not #[cfg]-gated)
+  f2fda50ad — realignment-fixup: Cargo.lock sync — entries missing from the restored v0.8.5 lockfile
+  a1fed21af — realignment-fixup: Cargo.lock entries completed for the realigned cheknet patch deps
+  edf41c818 — docs: PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
+  a05960c1f — docs: PATCHES.md — the arg_deny_exemptions entry
+-- audit-map class-c (16) --
+  c91662850 — Docker build context excludes (`.worktrees/` + `target/`; 225GB → ~1GB)
+  e0c654935 — restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock)
+  fd1ef7def — missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit)
+  60b7f1a91 — exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray `zeroclaw_runtime/` add)
+  698fd1131 — namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape)
+  9eab4b59a — reaped_stuck_runs placement — method condition + initializer (not field decl)
+  968691630 — `mut` on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration)
+  a78b9816e — gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes)
+  6465b2c4c — webhook_secret_hash added to the AppState initializer (E0063 missing field)
+  ccd4b595e — HashMap::new() for generic_webhook fields (setup code lost in realignment)
+  96334076b — #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement)
+  b4535defa — webhook_secret_hash: None unconditional in the initializer (field not #[cfg]-gated)
+  f2fda50ad — Cargo.lock sync — entries missing from the restored v0.8.5 lockfile
+  a1fed21af — Cargo.lock entries completed for the realigned cheknet patch deps
+  edf41c818 — PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
+  a05960c1f — PATCHES.md — the arg_deny_exemptions entry
+result: RED — 2 failure section(s); every patch must map to a row or the allowlist, and the allowlist + class-c enumeration above must be human-verified
+```
