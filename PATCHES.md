@@ -4,27 +4,118 @@ The patched branches carry local custom patches on top of the pinned upstream
 ZeroClaw tags for the home-lab deployment. v0.8.4 base: `a56c345d`; the current
 branch `cheknet-patched-v0.8.5` pins upstream v0.8.5.
 
-## Upstreamed fixes (already in v0.8.4, NOT replayed here)
+## The structured manifest
 
-These were cheknet-origin fixes that landed upstream; they are present in
-v0.8.4 and were intentionally dropped from the replay set to avoid conflicts:
+The machine-verifiable manifest for the current lineage — the parse surface
+the fork's patch checker (`scripts/check_patches.py`) reads. The audit map
+(below, "The 2026-10-02 lineage audit") is the discovery truth; these rows
+are the lineage contract. The rules:
 
-- Cron chat-leak fix (upstream `69dd83ed`)
-- `allow_scripts` subagent propagation fix (upstream `352672c0`)
+- Every patch has a row with its CURRENT on-branch sha (`current_sha`). The
+  v0.8.4-branch shas are NOT anchors — each lives only in its description's
+  provenance note.
+- `origin_base` is the upstream tag whose tree the patch content was first
+  authored against: `v0.8.4` for the replayed generation, `v0.8.5` for the
+  native generation.
+- The v0.8.5 realignment was a single squash (`f9b2c9fcf`) carrying every
+  replayed v0.8.4-era patch as one adapted diff — moved-site replays whose
+  per-patch content was verified at HEAD (see the audit map). All 17
+  v0.8.4-era rows therefore share the squash's sha as their current anchor.
+  The old table's `R2–R4` collapse (`a0f48c2f8`, one commit for all three
+  patches) is split into per-patch rows here: R2 the `started` publish site,
+  R3 the terminal `completed` publish site, R4 the `DelegateEventArgs`
+  parsing — the split follows the old commit's own R2/R3/R4 labels.
+- The probe cell names a probe registry key EXACTLY (the checker's `PROBES`
+  dict); `-` means no probe. Probes are mandatory for any patch ever
+  implicated in a silent drop: the mqtt liveness fix (this row carries
+  `mqtt-poll-alive`) and U1 (carries `allow_scripts-config-read`).
+- **Superseded (no row):** the old `adapt` patch (`454f20239`, "adapt cheknet
+  patches to v0.8.4 ToolOutput API") is superseded, not dropped — its purpose
+  was the v0.8.4 `ToolOutput` adaptation, and the v0.8.5 sites were
+  re-adapted inside the realignment squash's conflict resolutions. It has no
+  row and no allowlist entry; see the audit map's not-on-this-branch list.
 
-## Applied patches (cheknet-specific, replayed onto v0.8.4)
+### Applied rows
 
-| R | Commit | Description |
-|---|--------|-------------|
-| R1 | `7090d8c28` | `feat(runtime): add mqtt_bus publisher helper` |
-| R2–R4 | `a0f48c2f8` | `feat(runtime): delegate publishes started/completed events + arg extensions` |
-| wiring | `1a564c72d` | `fix(event-driven): wire mqtt_bus::init() into daemon + forward channel-mqtt to runtime` |
-| delegate | `4bc701acf` | `fix(delegate): make results_dir config-overridable (upstreamable)` |
-| R5 | `b04266372` | `feat(runtime): mqtt_publish tool for agent/SOP event publishing` |
-| R6 | `57568bc62` | `feat(tools): memory_store append + memory_recall prefix` |
-| gateway | `b4eb7ed10` | `feat(gateway): dynamic webhook route registration from config` |
-| delegate | `efd448d8f` | `fix(delegate): add ttl_seconds parameter + fix loop detector false positives` |
-| adapt | `454f20239` | `fix: adapt cheknet patches to v0.8.4 ToolOutput API` (realignment fixup) |
+| id | current_sha | origin_base | description | probe |
+|----|-------------|-------------|-------------|-------|
+| R1 | f9b2c9fcf | v0.8.4 | feat(runtime): add mqtt_bus publisher helper (`crates/zeroclaw-runtime/src/mqtt_bus.rs`); provenance: v0.8.4-branch `7090d8c28`. | - |
+| R2 | f9b2c9fcf | v0.8.4 | delegate publishes the `started` event (retained) to the MQTT bus for the event-driven swarm — the started publish site in `delegate.rs` (`projects/{project}/milestones/{milestone}/tasks/{task_id}/started`); provenance: the v0.8.4-branch `R2–R4` collapse `a0f48c2f8` (one commit carried all three patches — split per patch here). | - |
+| R3 | f9b2c9fcf | v0.8.4 | delegate publishes the terminal `completed` event to the MQTT bus — the terminal publish site in `delegate.rs`; provenance: the v0.8.4-branch `R2–R4` collapse `a0f48c2f8`. | - |
+| R4 | f9b2c9fcf | v0.8.4 | the event-driven delegate args — `DelegateEventArgs`/`parse_delegate_event_args` (project/milestone/chain/ttl_seconds/session from the tool's JSON args, for the MQTT topic hierarchy and the result struct); provenance: the v0.8.4-branch `R2–R4` collapse `a0f48c2f8`. | - |
+| wiring | f9b2c9fcf | v0.8.4 | wire `mqtt_bus::init()` into the daemon entry + forward channel-mqtt to runtime (call site `src/main.rs`); provenance: v0.8.4-branch `1a564c72d`. | - |
+| delegate-results_dir | f9b2c9fcf | v0.8.4 | fix(delegate): make `results_dir` config-overridable (upstreamable); provenance: v0.8.4-branch `4bc701acf`. | - |
+| R5 | f9b2c9fcf | v0.8.4 | feat(runtime): `mqtt_publish` tool for agent/SOP event publishing; provenance: v0.8.4-branch `b04266372`. | - |
+| R6 | f9b2c9fcf | v0.8.4 | feat(tools): `memory_store` append + `memory_recall` prefix; provenance: v0.8.4-branch `57568bc62`. | - |
+| gateway | f9b2c9fcf | v0.8.4 | feat(gateway): dynamic webhook route registration from config; provenance: v0.8.4-branch `b4eb7ed10`. | - |
+| delegate-ttl_seconds | f9b2c9fcf | v0.8.4 | fix(delegate): `ttl_seconds` parameter + the loop-detector false-positive fix; provenance: v0.8.4-branch `efd448d8f`. | - |
+| t6b-task-events | f9b2c9fcf | v0.8.4 | M2 T6b — typed `Task*` events on fixed topics (`zeroclaw/tasks/{started,completed,failed}`), non-retained, IDs in payload; provenance: v0.8.4-branch `3f4dfb5d5`. | - |
+| sop-headless-drivers | f9b2c9fcf | v0.8.4 | the SOP headless-driver system (driver ownership/supervision, step scoping, headless runs; `sop/active_scope.rs` + the sop tree); provenance: the v0.8.4-branch headless-driver series `c776c7239..ea6d8713f` (19 commits, merged via `ffec91f64`). | - |
+| otel-w3c-bridge | f9b2c9fcf | v0.8.4 | the tracing-opentelemetry bridge + W3C TraceContext/Baggage composite propagator (`zeroclaw-log/src/otel_bridge.rs`); provenance: v0.8.4-branch `bcdac41f0` + `34a99fd1d`. | - |
+| migrate-fixes | f9b2c9fcf | v0.8.4 | migration fixes — permissive operator policy on the postgres path + V3 agent metadata preservation; provenance: v0.8.4-branch `17f07cb01` + `135e89839`. | - |
+| runs-fixes | f9b2c9fcf | v0.8.4 | file_read directory listing, run pruning, stuck-run reaper, cron-load Option; provenance: v0.8.4-branch `1b74f1f35`. | - |
+| finished-runs-cap | f9b2c9fcf | v0.8.4 | finished_runs capped to `max_finished_runs` on restore + the maintenance tick; provenance: v0.8.4-branch `b6bfb8c78`. | - |
+| skip-at-dispatch | f9b2c9fcf | v0.8.4 | sidecar SOP skip-at-dispatch — no run created (present at HEAD despite the squash's "deferred" note); provenance: v0.8.4-branch `4cd7afde4`. | - |
+| M3AX-1 | d3e195993 | v0.8.5 | memory Phase 0.5 — three-axis recall + namespace/importance store + exclude config + the recall SELECT fix. | - |
+| M3AX-2 | 2fd2a3e49 | v0.8.5 | memory Phase 0.5 — tool params (namespace/importance on store; category/namespace/key_prefix/scope on recall) + btree index on key. | - |
+| M3AX-3 | 3548143b1 | v0.8.5 | memory Phase 0.5 — three-axis in-memory filtering in `memory_recall` `execute()`. | - |
+| GLM53-EFFORT | 7be31cc2e | v0.8.5 | provider — `thinking.budget_tokens` to OpenAI-compatible chat completions + `reasoning_effort`-max; rides: the stray `zeroclaw_runtime/` dir removed. | - |
+| M3AX-WIRE | 43d274e2a | v0.8.5 | complete three-axis recall exclusion wiring. | - |
+| DELEGATE-EXCL | 8e5690fbb | v0.8.5 | config-sourced recall excludes threaded into bounded delegate memory tools. | - |
+| PG-BOUNDS | dea4038bf | v0.8.5 | bound PostgreSQL memory ops — `statement_timeout`, keepalives, op timeout. | - |
+| PG-SHARE | 355575edf | v0.8.5 | share one backend instance per config across agent constructions. | - |
+| PG-BLOCKPOOL | 27eb2d694 | v0.8.5 | construct backends on the blocking pool, not async workers. | - |
+| PG-CACHE-GATE | c311d2b76 | v0.8.5 | gate resolutions — `backend_cache` default to postgres; bound construction await. | - |
+| OTEL-ONCE | 7fed6e9a8 | v0.8.5 | construct the OTel pipeline once per process. | - |
+| PG-FLOAT8 | 90c554280 | v0.8.5 | type the importance param as FLOAT8 in the postgres store. | - |
+| L2B-NOTIFY | 7a3640776 | v0.8.5 | Lever-2b — the engine-side completion-notification directive (quorum PROCEED 3/3, `delegate-bg-notify-injection`). | - |
+| MQTT-POLL-ALIVE | 9c65570d3 | v0.8.5 | the per-poll liveness stamp — defect #2, the mqtt flap root cause (the channels crate); the pre-audit prose carried no sha, so the probe is this patch's mandatory re-pin anchor. | mqtt-poll-alive |
+| RIDE-WEBHOOK-TEST | 1796a6b85 | v0.8.5 | ride-along — `WebhookConfig.signature_header` lib-test initializer gap (same class/fix as v0.8.4's `109b9a6ca`). | - |
+| ADE-1 | 998fb082c | v0.8.5 | arg_deny_exemptions — deny-entry table + `arg_deny_exemptions` field (RED groundwork). | - |
+| ADE-2 | 1701c56aa | v0.8.5 | arg_deny_exemptions — schema + fail-loud parse-time validation. | - |
+| ADE-3 | db0f20af7 | v0.8.5 | arg_deny_exemptions — config threading + escalation-subset variant. | - |
+| RIDE-FMT | 1d21f221f | v0.8.5 | ride-along — pre-existing fmt drift (F3's `EscalationViolation` variant initializer). | - |
+| ADE-4 | 694db6a2f | v0.8.5 | arg_deny_exemptions — `is_args_safe` table-driven + exemption consult (python -c unblocked). | - |
+| ADE-5 | 264e2c293 | v0.8.5 | arg_deny_exemptions — policy-state-computed denial messages (reason-threading). | - |
+| ADE-6 | 118afa241 | v0.8.5 | arg_deny_exemptions — classifier mirrors ReadOnly autonomy (no misdirecting suggestion on read-only profiles). | - |
+| ADE-7 | 2f32e99bb | v0.8.5 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present). | - |
+
+### Upstreamed rows
+
+| id | origin_commit | asserted_in | upstream_sha | probe | description |
+|----|---------------|-------------|--------------|-------|-------------|
+| U1 | 352672c02 | v0.8.4 | TBD-RESOLVE | allow_scripts-config-read | the `allow_scripts` subagent propagation fix (delegated subagents skipped skills containing script files — `skills.allow_scripts` was not propagated from the parent config). Carried as "upstream `352672c0`" since the v0.8.3-era table; the origin commit lives on `cheknet-pached`. Verified 2026-10-02: the origin patch-id is ABSENT from v0.8.4's patch-id set and the tree probe fails on v0.8.4, v0.8.5, and the current tree — the claim is dead. Resolution (the C.1 remediation): cherry-pick `352672c02`, row U→R with the new current sha, probe retained. |
+| U2 | 69dd83ed4 | v0.8.4 | TBD-RESOLVE | - | the cron chat-leak fix (automated cron outputs routed exclusively to the `cron` session, not broadcast to all chat WebSockets). Carried as "upstream `69dd83ed`" since the v0.8.3-era table; the origin commit lives on `cheknet-pached`. Verified 2026-10-02: the origin patch-id is ABSENT from v0.8.4's patch-id set — the claim is dead as asserted. Resolution: search v0.8.4's history for the origin patch-id → record the sha (claim proven), or cherry-pick + row U→R + a probe derived then. |
+
+`TBD-RESOLVE` marks an unresolved upstreamed claim — a checker failure
+(FAIL_U, exit 1), never a pass and never an error exit; the checker never
+edits anything. Proof obligation per row: the origin commit's patch-id in
+the asserted tag's patch-id set OR the row's probe against the tag's tree.
+
+## Checker allowlist
+
+The class-c set — the realignment fixups + tooling + docs, outside the
+applied rows, allowlisted with reasons from the audit map's vocabulary
+(`realignment-fixup`, `tooling`, `docs`). The bijection with the audit map's
+class-c rows is enforced (FAIL_A); an allowlisted sha that also has an
+applied row is a misclassification failure.
+
+allowlist: c91662850 — tooling: Docker build context excludes (.worktrees/ + target/; 225GB → ~1GB)
+allowlist: e0c654935 — realignment-fixup: restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock)
+allowlist: fd1ef7def — realignment-fixup: missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit)
+allowlist: 60b7f1a91 — realignment-fixup: exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray zeroclaw_runtime/ add)
+allowlist: 698fd1131 — realignment-fixup: namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape)
+allowlist: 9eab4b59a — realignment-fixup: reaped_stuck_runs placement — method condition + initializer (not field decl)
+allowlist: 968691630 — realignment-fixup: mut on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration)
+allowlist: a78b9816e — realignment-fixup: gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes)
+allowlist: 6465b2c4c — realignment-fixup: webhook_secret_hash added to the AppState initializer (E0063 missing field)
+allowlist: ccd4b595e — realignment-fixup: HashMap::new() for generic_webhook fields (setup code lost in realignment)
+allowlist: 96334076b — realignment-fixup: #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement)
+allowlist: b4535defa — realignment-fixup: webhook_secret_hash None unconditional in the initializer (field not #[cfg]-gated)
+allowlist: f2fda50ad — realignment-fixup: Cargo.lock sync — entries missing from the restored v0.8.5 lockfile
+allowlist: a1fed21af — realignment-fixup: Cargo.lock entries completed for the realigned cheknet patch deps
+allowlist: edf41c818 — docs: PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
+allowlist: a05960c1f — docs: PATCHES.md — the arg_deny_exemptions entry
 
 ## Realignment notes (v0.8.3 → v0.8.4)
 
