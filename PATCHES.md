@@ -44,7 +44,7 @@ v0.8.4 and were intentionally dropped from the replay set to avoid conflicts:
 - **Lever-2b: the engine-side completion-notification directive** (`7a3640776`, quorum PROCEED 3/3 — `delegate-bg-notify-injection`, debops-cheknet 2026-09-27): `delegate.rs execute_background` gains `apply_bg_notify_directive` — the dedup-guarded append of the notify instruction to every background child's prompt. Idempotency + explicit-re-target-wins: any `sessions_send` already in the dispatcher's prompt (either form) → the injection yields. `execute_sync` untouched. 4 unit tests; the spec: `debops-cheknet/docs/proposals/2026-09-27-delegate-bg-notify-injection-design.md`.
 - **Test-target debt repair** (rides the same commit): the loop_.rs test helper mints its registry via the sanctioned `ScopedToolRegistry::assemble` seam; `rpc/context.rs::minimal_with_cert_audit` gains `sop_driver_handles: None`; the engine test's nonexistent `terminal_run_count()` replaced with the `SopRunStore::load_terminal_runs` trait call. The 5 remaining `sop::engine` test failures are pre-existing drift (they never ran before — the lib-test target did not compile).
 
-- **Defect #2 — the mqtt loop's per-poll liveness stamp (the flap root cause)** (2026-09-27, root-caused via systematic debugging): `orchestrator/mqtt.rs`'s event loop stamped the `mqtt` health component ONLY on ConnAck — a healthy persistent connection receives ConnAck exactly once at boot, so `mqtt.last_ok` froze at boot and the staleness liveness probe (the 2026-09-23 wire-death interim, 900s) killed every healthy gateway instance at ~18 min uptime (12 kills/4h prod, 14 canary; `restart_count: 0` throughout — the client never died; the probe commit's premise "last_ok updates on message consumption" was false — Publishes/PingResp never stamped). The fix: `record_poll_alive()` stamps the component on EVERY successful poll (the keepalive PingResp arrives every 30s even when idle) — `last_ok` becomes a true liveness-of-loop metric: a healthy-but-quiet wire never trips the probe; a genuinely hung loop (the original 2026-09-23 wire death) goes stale and the probe fires — the interim mitigation restored to its intended semantics. 2 unit tests (RED-then-GREEN: the stamp + the starting-state clears); the channels suite 1554/1554 + default 1540/1540.
+- **Defect #2 — the mqtt loop's per-poll liveness stamp (the flap root cause)** (2026-09-27, root-caused via systematic debugging): `orchestrator/mqtt.rs`'s event loop stamped the `mqtt` health component ONLY on ConnAck — a healthy persistent connection receives ConnAck exactly once at boot, so `mqtt.last_ok` froze at boot and the staleness liveness probe (the 2026-09-23 wire-death interim, 900s) killed every healthy gateway instance at ~18 min uptime (12 kills/4h prod, 14 canary; `restart_count: 0` throughout — the client never died; the probe commit's premise "last_ok updates on message consumption" was false — Publishes/PingResp never stamped). The fix: `record_poll_alive()` stamps the component on EVERY successful poll (the keepalive PingResp arrives every 30s even when idle) — `last_ok` becomes a true liveness-of-loop metric: a healthy-but-quiet wire never trips the probe; a genuinely hung loop (the original 2026-09-23 wire death) goes stale and the probe fires — the interim mitigation restored to its intended semantics. 2 unit tests (RED-then-GREEN: the stamp + the starting-state clears); the channels suite 1554/1554 + default 1540/1540. **Provenance: `9c65570d3`** (`cheknet-patched-v0.8.5`, 2026-09-27 — the channels crate: `orchestrator/mqtt.rs` + `orchestrator/mod.rs` + `filesystem.rs`; this prose entry rode in the same commit) — the sha this entry carried nowhere in the pre-audit prose; the anchor the mandatory re-pin probe checks.
 - **Test-target debt repair (rides along)**: the channels lib-test target did not compile — 4 mechanical drift fixes (`AgentRouter::multi` calls gained the `sop_driver_sink: None` arg ×2; `ChannelRuntimeContext` initializer gained `sop_driver_sink: None`; `FilesystemChannelConfig` gained `driver_sink: None`).
 - **`arg_deny_exemptions` (the python -c unblock)** (2026-09-28; spec: `debops-cheknet/docs/superpowers/specs/2026-09-28-python-c-arg-carveout-design.md`): the argument-deny guard's hardcoded `is_args_safe` arms are reified as a per-arm deny-entry table — `deny_entries_for` (token — predicate — case domain; the table is the single source of truth) — and `is_args_safe` becomes table-driven. `RiskProfileConfig`/`SecurityPolicy` gain `arg_deny_exemptions: HashMap<String, Vec<String>>` (`#[serde(default)]`: absent/empty is byte-for-byte today's behavior, and the currently deployed binary ignores the key, so config-before-image cannot crashloop). Semantics: subtract-only, clause-equality — a value string-equals (case-sensitively, as stored) exactly one deny entry of the keyed arm and removes that entry alone; keys bind to the invoked command's lowercased basename (`python`/`python3` distinct keys). Parse-time validation fails loud: unknown keys AND values matching no deny entry of the keyed arm are config errors (dead-config prevention, the dead-`tee` lesson), plus `*`/empty/whitespace values rejected; the key-set invariant test pins the table so arm drift fails the build. The shell-syntax layer (backticks in any quote state, `$VAR`/`$()`, unsafe redirects, `tee`, unquoted single `&`) is unreachable from the map. Escalation: child entries ⊆ parent (`ArgDenyExemptionExpandedByChild`, the allowlist direction — NOT `forbidden_paths`). Denial messages are computed from live policy state (`CommandRejection` + `suggestion(&policy)`) so a profile without the exemption never claims `-c` is allowed — the misdirect-retry class (the 88-retry `memory-purge` loop) this patch exists to kill. Friction-not-containment framing is binding in every comment/message that touches this: the container is the only hard boundary; the arg layer is friction + auditability.
   Touchpoints: `crates/zeroclaw-config/src/policy.rs` (the deny-entry table + `DenyEntry`/`DenyPredicate`, the `arg_deny_exemptions` field + `Default` impl, `from_profiles` threading, the `ensure_no_escalation_beyond` child⊆parent check, the `classify_args_safety` consult + the `classify_*` reason-threading); `crates/zeroclaw-config/src/schema.rs` (the `RiskProfileConfig.arg_deny_exemptions` field + `validate_arg_deny_exemptions`, wired into the config-parse error path); `crates/zeroclaw-runtime/src/tools/shell.rs` (the `rejection.suggestion(&self.security)` site — the message text itself lives in policy.rs).
@@ -52,3 +52,128 @@ v0.8.4 and were intentionally dropped from the replay set to avoid conflicts:
   - **RE-PIN (the sandbox posture):** on re-pin, RE-VERIFY the sandbox posture and pin `sandbox_backend` explicitly if auto-bwrap is unwanted — upstream's post-v0.8.5 sandbox rework moves bubblewrap into the Linux Auto chain, and on our Landlock-less kernel Auto would select it once the binary exists (the image ships it).
   - **schemars `schema-export`:** the exported-config-schema question was CHECKED at plan time (2026-09-28): no committed artifact exists to regenerate (the fork serves the schema dynamically from the compiled binary); re-check on re-pin.
   - **Ride-along repairs made in passing by this series:** the pre-existing `WebhookConfig.signature_header` lib-test compile repair (the webhook roundtrip test literal predates the field — unblocks the `cargo test -p zeroclaw-config --lib` target; same class and fix as `109b9a6ca` on cheknet-patched-v0.8.4) and the pre-existing fmt-drift style fix (F3's `EscalationViolation` variant initializer).
+
+## The 2026-10-02 lineage audit
+
+The discovery enumeration for the fork patch-lineage guarantee (task 0 of the
+2026-10-02 patch-lineage work): the complete commit map of the current lineage —
+the manifest's input truth. Every commit in
+`git rev-list --no-merges v0.8.5..cheknet-patched-v0.8.5` is classified below.
+The branch is exactly the `v0.8.5` tag (`cb2b20a9f` — the first commit's parent)
+plus these 40 non-merge commits; no commit is left unclassified.
+
+lineage: cheknet-patched-v0.8.5 base v0.8.5
+
+reverse-scope: crates/zeroclaw-api, crates/zeroclaw-channels, crates/zeroclaw-config, crates/zeroclaw-gateway, crates/zeroclaw-log, crates/zeroclaw-macros, crates/zeroclaw-memory, crates/zeroclaw-providers, crates/zeroclaw-runtime, crates/zeroclaw-tools, Cargo.toml, Cargo.lock, PATCHES.md, docs/book/src/sop, src/main.rs, tests/component, zeroclaw_runtime
+
+The reverse-scope is the union of every path the class-a/b commits touch
+(`git show --stat` over each) — the ten crate trees plus the additional scoped
+paths. `zeroclaw_runtime/` is a transient stray zc-engine dir (added in the
+realignment window, removed by `7be31cc2e`; not in the HEAD tree but a
+recorded on-branch touch).
+
+**Method and the patch-id truth.** `git patch-id --stable` was computed for the
+old table's nine shas (R1 through `adapt`) and for all 40 current commits:
+**zero matches**. The v0.8.5 realignment was a single squash merge
+(`f9b2c9fcf`, "realign cheknet patches onto v0.8.5") carrying every replayed
+v0.8.4-era patch as one adapted diff — conflict resolutions against v0.8.5's
+`ScopedToolRegistry`, `sop_webhook_routes`, and the daemon registry rework, so
+these are moved-site replays whose patch-ids legitimately differ. The class-b
+rows therefore repeat the squash's sha: it is the current on-branch anchor for
+each old patch (the description-based fallback; no replayed v0.8.4-era content
+exists in any other current commit — the post-squash commits that repaired the
+carrier's conflicts are class-c). Content survival was verified at HEAD per
+row (e.g. `mqtt_bus.rs`/`mqtt_publish.rs`, the R2/R3 publish sites in
+`delegate.rs`, `zeroclaw/tasks/*` topics, `otel_bridge.rs`,
+`directory_listing` in `file_read.rs`, `truncate_finished_runs_to_max`,
+`SopRunAction::Skipped`).
+
+**Classes.** `a` — v0.8.5-native patches (authored on this lineage, post-squash);
+`b` — replayed v0.8.4-era patches (all carried by `f9b2c9fcf`); `c` — realignment
+fixups + tooling/docs (allowlisted by the reason in the id column, from the
+vocabulary `realignment-fixup`, `tooling`, `docs`).
+
+**Row ids.** The old table's ids are reused where they map (`R1`, `R2-R4`,
+`wiring`, `gateway`; the old table's two `delegate` rows are disambiguated as
+`delegate-results_dir` and `delegate-ttl_seconds`). New stable ids are minted
+for the native generation (class-a) and for the v0.8.4-era series that never had
+old-table rows (the class-b rows below `gateway`/`delegate-*`).
+
+**Not on this branch — v0.8.4-era patches with no current counterpart
+(each verified at HEAD, none a silent drop):**
+
+- `c7c0dd2c7` (pgvector init-thread fix) — upstream-absorbed: upstream
+  `dc2a37ba9` (#10209) is native in v0.8.5.
+- `c4768dd66` (resolve SOPs by declared `name` field) — upstream-absorbed:
+  v0.8.5 carries #9765's native `load_sop_by_name`.
+- `454f20239` (`adapt`) — superseded by this realignment itself: its purpose was
+  the v0.8.4 `ToolOutput` adaptation; the v0.8.5 sites were re-adapted inside
+  the squash's conflict resolutions.
+- `109b9a6ca` (v0.8.4 test-initializer gaps) — superseded by the v0.8.5-native
+  ride-along `1796a6b85` (same class, same fix).
+- Correction to the squash's own message: skip-at-dispatch (`4cd7afde4`) was
+  noted "deferred (dispatch.rs kept HEAD)" but its content IS present at HEAD
+  (`SopRunAction::Skipped` + the deterministic-skip tests, introduced by
+  `f9b2c9fcf`) — carried, class-b row `skip-at-dispatch`.
+
+| sha | class | row_id_or_allowlist | description |
+|-----|-------|---------------------|-------------|
+| f9b2c9fcf | b | R1 | old-table R1 — `feat(runtime): add mqtt_bus publisher helper` (`crates/zeroclaw-runtime/src/mqtt_bus.rs`) |
+| f9b2c9fcf | b | R2-R4 | old-table R2–R4 — delegate publishes started/completed events + arg extensions |
+| f9b2c9fcf | b | wiring | old-table wiring — mqtt_bus::init() into the daemon entry + channel-mqtt feature unification (call site `src/main.rs`) |
+| f9b2c9fcf | b | delegate-results_dir | old-table delegate — results_dir config-overridable (upstreamable) |
+| f9b2c9fcf | b | R5 | old-table R5 — the mqtt_publish tool for agent/SOP event publishing |
+| f9b2c9fcf | b | R6 | old-table R6 — memory_store append + memory_recall prefix |
+| f9b2c9fcf | b | gateway | old-table gateway — dynamic webhook route registration from config |
+| f9b2c9fcf | b | delegate-ttl_seconds | old-table delegate — ttl_seconds parameter + loop-detector false-positive fix |
+| f9b2c9fcf | b | t6b-task-events | M2 T6b — typed Task* events on fixed topics (`zeroclaw/tasks/{started,completed,failed}`), non-retained, IDs in payload |
+| f9b2c9fcf | b | sop-headless-drivers | the SOP headless-driver system (driver ownership/supervision, step scoping, headless runs; `sop/active_scope.rs` + the sop tree) |
+| f9b2c9fcf | b | otel-w3c-bridge | the tracing-opentelemetry bridge + W3C TraceContext/Baggage composite propagator (`zeroclaw-log/src/otel_bridge.rs`) |
+| f9b2c9fcf | b | migrate-fixes | migration fixes — permissive operator policy on the postgres path + V3 agent metadata preservation |
+| f9b2c9fcf | b | runs-fixes | v0.8.4-era `1b74f1f35` — file_read directory listing, run pruning, stuck-run reaper, cron-load Option |
+| f9b2c9fcf | b | finished-runs-cap | v0.8.4-era `b6bfb8c78` — finished_runs capped to max_finished_runs on restore + maintenance tick |
+| f9b2c9fcf | b | skip-at-dispatch | v0.8.4-era `4cd7afde4` — sidecar SOP skip-at-dispatch (present at HEAD despite the squash's "deferred" note) |
+| d3e195993 | a | M3AX-1 | memory Phase 0.5 — three-axis recall + namespace/importance store + exclude config + recall SELECT fix |
+| 2fd2a3e49 | a | M3AX-2 | memory Phase 0.5 — tool params (namespace/importance on store; category/namespace/key_prefix/scope on recall) + btree index on key |
+| 3548143b1 | a | M3AX-3 | memory Phase 0.5 — three-axis in-memory filtering in memory_recall execute() |
+| c91662850 | c | tooling | Docker build context excludes (`.worktrees/` + `target/`; 225GB → ~1GB) |
+| e0c654935 | c | realignment-fixup | restore the v0.8.5 Cargo.lock (the squash brought v0.8.4's stale lock) |
+| fd1ef7def | c | realignment-fixup | missing `]` on the exclude_namespaces serde attribute (dropped in the realignment edit) |
+| 60b7f1a91 | c | realignment-fixup | exclude_namespaces/categories/key_prefixes in the MemoryConfig Default impl (rode in the stray `zeroclaw_runtime/` add) |
+| 698fd1131 | c | realignment-fixup | namespace+importance moved to owned before run_on_os_thread (E0521 borrow escape) |
+| 9eab4b59a | c | realignment-fixup | reaped_stuck_runs placement — method condition + initializer (not field decl) |
+| 968691630 | c | realignment-fixup | `mut` on sub_tools (retain needs &mut against v0.8.5's ScopedToolRegistry declaration) |
+| a78b9816e | c | realignment-fixup | gateway lib.rs conflict markers resolved (v0.8.5 sop_webhook_routes + our dynamic webhook routes) |
+| 6465b2c4c | c | realignment-fixup | webhook_secret_hash added to the AppState initializer (E0063 missing field) |
+| ccd4b595e | c | realignment-fixup | HashMap::new() for generic_webhook fields (setup code lost in realignment) |
+| 96334076b | c | realignment-fixup | #[cfg(feature=channel-webhook)] restored on the generic_webhook_secrets initializer (lost in sed replacement) |
+| b4535defa | c | realignment-fixup | webhook_secret_hash: None unconditional in the initializer (field not #[cfg]-gated) |
+| 7be31cc2e | a | GLM53-EFFORT | provider — thinking.budget_tokens to OpenAI-compatible chat completions + reasoning_effort=max; rides: the stray `zeroclaw_runtime/` dir removed |
+| 43d274e2a | a | M3AX-WIRE | complete three-axis recall exclusion wiring |
+| 8e5690fbb | a | DELEGATE-EXCL | config-sourced recall excludes threaded into bounded delegate memory tools |
+| dea4038bf | a | PG-BOUNDS | bound PostgreSQL memory ops — statement_timeout, keepalives, op timeout |
+| 355575edf | a | PG-SHARE | share one backend instance per config across agent constructions |
+| 27eb2d694 | a | PG-BLOCKPOOL | construct backends on the blocking pool, not async workers |
+| f2fda50ad | c | realignment-fixup | Cargo.lock sync — entries missing from the restored v0.8.5 lockfile |
+| c311d2b76 | a | PG-CACHE-GATE | gate resolutions — backend_cache default to postgres; bound construction await |
+| 7fed6e9a8 | a | OTEL-ONCE | construct the OTel pipeline once per process |
+| 90c554280 | a | PG-FLOAT8 | type the importance param as FLOAT8 in the postgres store |
+| a1fed21af | c | realignment-fixup | Cargo.lock entries completed for the realigned cheknet patch deps |
+| 7a3640776 | a | L2B-NOTIFY | Lever-2b — the engine-side completion-notification directive (quorum PROCEED 3/3, delegate-bg-notify-injection) |
+| edf41c818 | c | docs | PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair) |
+| 9c65570d3 | a | MQTT-POLL-ALIVE | the per-poll liveness stamp — defect #2, the mqtt flap root cause (the channels crate) |
+| 1796a6b85 | a | RIDE-WEBHOOK-TEST | ride-along — WebhookConfig.signature_header lib-test initializer gap (same class/fix as v0.8.4's `109b9a6ca`) |
+| 998fb082c | a | ADE-1 | arg_deny_exemptions — deny-entry table + arg_deny_exemptions field (RED groundwork) |
+| 1701c56aa | a | ADE-2 | arg_deny_exemptions — schema + fail-loud parse-time validation |
+| db0f20af7 | a | ADE-3 | arg_deny_exemptions — config threading + escalation-subset variant |
+| 1d21f221f | a | RIDE-FMT | ride-along — pre-existing fmt drift (F3's `EscalationViolation` variant initializer) |
+| 694db6a2f | a | ADE-4 | arg_deny_exemptions — is_args_safe table-driven + exemption consult (python -c unblocked) |
+| 264e2c293 | a | ADE-5 | arg_deny_exemptions — policy-state-computed denial messages (reason-threading) |
+| 118afa241 | a | ADE-6 | arg_deny_exemptions — classifier mirrors ReadOnly autonomy (no misdirecting suggestion on read-only profiles) |
+| 2f32e99bb | a | ADE-7 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present) |
+| a05960c1f | c | docs | PATCHES.md — the arg_deny_exemptions entry |
+
+Row count: 54 rows over 40 commits — 15 class-b rows (one commit, the squash
+carrier), 23 class-a rows (one per commit), 16 class-c rows (one per commit).
+The sha column is the 9-char short form (unique; `git cat-file -e` resolves
+each); the checker re-verifies every row against the branch.
