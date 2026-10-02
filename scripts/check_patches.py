@@ -23,8 +23,10 @@ the structured manifest (PATCHES.md) and the machine-parseable audit map:
                       rule 2: the audit map's class-c set = the allowlist set
                               (a bijection, both directions)
                       rule 3: no allowlisted commit's patch-id appears in a
-                              cached prior-tag patch-id set — an upstream-era
-                              replay misfiled as a fixup is a failure
+                              cached prior-tag patch-id set — the asserted
+                              tags PLUS the lineage's base tag (the
+                              prior-lineage family) — an upstream-era replay
+                              misfiled as a fixup is a failure
                       a/b↔rows: every class-a/b map sha has >=1 applied row
                               and every row's sha is in the map's a∪b set
                               (sha-level — one map row may cover several rows
@@ -633,19 +635,26 @@ def run_checks(repo: str, manifest_path: str, registry: dict = PROBE_REGISTRY) -
     for urow in manifest.upstreamed:
         if urow.asserted_in not in asserted_tags:
             asserted_tags.append(urow.asserted_in)
-    resolved_tags = {t for t in asserted_tags if _resolve(repo, t) is not None}
+    # Rule 3's target sets — the prior-lineage family: the asserted tags PLUS
+    # the lineage's declared base tag (the controller's ruling; the expansion
+    # also closes the strict-reading vacuity where a manifest with zero
+    # upstreamed rows would otherwise leave rule 3 with no target sets).
+    rule3_targets = []
+    for tag in asserted_tags + ([manifest.base] if manifest.base else []):
+        if tag and tag not in rule3_targets and _resolve(repo, tag) is not None:
+            rule3_targets.append(tag)
     pid_cache: dict = {}
     for full, reason in allow_full.items():
         pid = _patch_id(repo, full)
         if pid is None:
             continue
-        for tag in resolved_tags:
-            ids = _tag_patch_ids(repo, tag, pid_cache)
-            if pid in ids:
-                rule3.append(
-                    f"rule 3: allowlisted sha {full[:12]} ('{reason}') has per-commit "
-                    f"patch-id {pid} present in prior-tag '{tag}'s patch-id set — "
-                    f"an upstream-era replay misfiled as a fixup")
+        hits = [t for t in rule3_targets if pid in _tag_patch_ids(repo, t, pid_cache)]
+        if hits:
+            rule3.append(
+                f"rule 3: allowlisted sha {full[:12]} ('{reason}') has per-commit "
+                f"patch-id {pid} present in prior-tag patch-id set(s) "
+                f"{', '.join(repr(t) for t in hits)} — an upstream-era replay "
+                f"misfiled as a fixup")
     if rule1 or rule2 or rule3 or split:
         details = rule1 + rule2 + rule3 + split
         fail("map-consistency", "FAIL_A",
@@ -656,7 +665,8 @@ def run_checks(repo: str, manifest_path: str, registry: dict = PROBE_REGISTRY) -
             f"map-consistency: OK — {len(manifest.map_rows)} audit-map rows "
             f"(a/b {len(map_ab)}, c {len(map_c)}); rows↔a/b {len(row_full)}="
             f"{len(map_ab)}; class-c↔allowlist bijection {len(map_c)}="
-            f"{len(allow_full)}; overlap ∅; no upstream-era replay among allowlisted")
+            f"{len(allow_full)}; overlap ∅; no upstream-era/prior-lineage "
+            f"replay among allowlisted (asserted tags + the base tag)")
 
     # -- check_upstreamed ------------------------------------------------------
     if manifest.upstreamed:
@@ -831,6 +841,13 @@ def run_checks(repo: str, manifest_path: str, registry: dict = PROBE_REGISTRY) -
 #      allowlist                     an allowlisted commit whose patch-id is
 #                                    in the asserted tag's cached set ->
 #                                    FAIL_A rule 3.
+# (9b) base-tag-native-replay-in-
+#      allowlist (fix round 1)       an allowlisted commit whose patch-id is
+#                                    in the BASE tag's set but NOT the prior
+#                                    asserted tag's — only the expanded arm
+#                                    (asserted tags + base) catches it; the
+#                                    case also drops the upstreamed rows,
+#                                    pinning the zero-asserted-tags vacuity.
 # (10) row-path-outside-reverse-
 #      scope                         a row touching a path outside the
 #                                    declared scope -> FAIL_D.
@@ -961,8 +978,17 @@ MQTT_C0 = "fn poll() {\n}\n"
 MQTT_N2 = "fn poll() {\n}\nfn record_poll_alive() {}\n"
 
 
-def _build_fixture(where: str, delegate_sites: int = 2, extra: list | None = None) -> dict:
-    """Build the deep lineage fixture; return the named shas."""
+def _build_fixture(where: str, delegate_sites: int = 2, extra: list | None = None,
+                   base_native_replay: bool = False) -> dict:
+    """Build the deep lineage fixture; return the named shas.
+
+    With base_native_replay=True the fixture additionally carries the
+    base-tag-native replay arm: a commit BN in the v1.0 base history whose
+    content the release drops, then a clean cherry-pick of BN (REPLAY-BN)
+    later in the lineage — its per-commit patch-id is in the BASE tag's set
+    but NOT in the prior-era tag's (v0.9's) set, so only the expanded rule-3
+    arm (asserted tags + base) can catch it being misfiled as a fixup.
+    """
     repo = os.path.join(where, "repo")
     os.makedirs(repo)
     _h_git(repo, "init", "-q")
@@ -1008,8 +1034,15 @@ def _build_fixture(where: str, delegate_sites: int = 2, extra: list | None = Non
     o_adpt = _h_commit(repo, "O_ADPT: origin of the adapted claim")
     _h_git(repo, "checkout", "-q", "cheknet-lineage")
 
+    bn = None
+    if base_native_replay:
+        _h_write(repo, "crates/runtime/src/base_native.rs",
+                 "pub fn base_native_help() {}\n")
+        bn = _h_commit(repo, "BN: base-native helper (pre-v1.0 history)")
     _h_write(repo, "crates/runtime/src/lib.rs", LIB_R1)
     _h_unlink(repo, "crates/runtime/src/era_two.rs")
+    if base_native_replay:
+        _h_unlink(repo, "crates/runtime/src/base_native.rs")
     _h_write(repo, "Cargo.toml", CARGO_R1)
     _h_commit(repo, "R1: the v1.0 release (drops the era patches)")
     _h_git(repo, "tag", "v1.0")
@@ -1021,6 +1054,10 @@ def _build_fixture(where: str, delegate_sites: int = 2, extra: list | None = Non
     fixup = _h_commit(repo, "FIXUP: repair the realignment Cargo.toml artifact")
     _h_git(repo, "cherry-pick", e2)
     replay = _h_out(repo, "rev-parse", "HEAD")
+    replay_bn = None
+    if base_native_replay:
+        _h_git(repo, "cherry-pick", bn)
+        replay_bn = _h_out(repo, "rev-parse", "HEAD")
 
     sites = "\n".join(
         f"fn scan_{i}() {{ let v{i} = root_config.slot{i}.allow_scripts; }}"
@@ -1044,7 +1081,8 @@ def _build_fixture(where: str, delegate_sites: int = 2, extra: list | None = Non
         "repo": repo,
         "c0": c0, "f1": f1, "m": m, "e1": e1, "e2": e2, "upt": upt, "adpt": adpt,
         "o_prov": o_prov, "o_abs": o_abs, "o_adpt": o_adpt,
-        "squash": squash, "fixup": fixup, "replay": replay, "n1": n1, "n2": n2,
+        "bn": bn, "squash": squash, "fixup": fixup, "replay": replay,
+        "replay_bn": replay_bn, "n1": n1, "n2": n2,
         "ta": ta, "tb": tb, "extras": extras,
     }
 
@@ -1251,6 +1289,52 @@ def _run_selftest() -> int:
             _write_manifest(td, "m9.md", m9), 1,
             ["map-consistency: FAIL_A", "rule 3"])
 
+        # -- (9b) base-tag-native replay in the allowlist (fix round 1) -------
+        # The expanded rule-3 arm: an allowlisted commit whose per-commit
+        # patch-id lives in the BASE tag's (v1.0's) set but NOT in the prior
+        # asserted tag's (v0.9's) — the strict reading could not catch it.
+        # The case manifest also drops the upstreamed rows entirely, pinning
+        # the vacuity closure: with zero asserted tags, the base tag is the
+        # only rule-3 target and the misfiling still fails.
+        fxb = _build_fixture(os.path.join(td, "05-base-native"),
+                             base_native_replay=True)
+        rb_repo = fxb["repo"]
+
+        def base_arm_sanity(ctx):
+            if _h_patch_id(rb_repo, fxb["replay_bn"]) != _h_patch_id(rb_repo, fxb["bn"]):
+                return ("fixture invalid: REPLAY-BN's per-commit patch-id != BN's "
+                        "(not a clean base-tag-native replay)")
+            if _h_patch_id(rb_repo, fxb["replay_bn"]) in _tag_set_fixture(rb_repo, "v0.9"):
+                return ("fixture invalid: REPLAY-BN's patch-id IS in v0.9's set — "
+                        "the strict arm would already catch it (not a base-arm case)")
+            if not _h_is_ancestor(rb_repo, fxb["bn"], "v1.0"):
+                return "fixture invalid: BN is not an ancestor of the base tag v1.0"
+            if _h_is_ancestor(rb_repo, fxb["bn"], "v0.9"):
+                return "fixture invalid: BN is an ancestor of v0.9 (not base-native)"
+            return None
+
+        m9b = _green_manifest(fxb)
+        for u_line in (
+            "| U-PROV | {} | v0.9 | {} | - | the proven twin claim — the origin patch-id is in the asserted tag's set |".format(
+                _h_short(rb_repo, fxb["o_prov"], 9), _h_short(rb_repo, fxb["upt"], 9)),
+            "| U-ADPT | {} | v0.9 | {} | up-content | the adapted claim — probe-proven against the tag tree |".format(
+                _h_short(rb_repo, fxb["o_adpt"], 8), _h_short(rb_repo, fxb["adpt"], 9)),
+        ):
+            m9b = m9b.replace(u_line + "\n", "")
+        rb8 = _h_short(rb_repo, fxb["replay_bn"], 8)
+        rb9 = _h_short(rb_repo, fxb["replay_bn"], 9)
+        m9b = m9b.replace(
+            "| {} | c | realignment-fixup | the Cargo.toml repair |".format(
+                _h_short(rb_repo, fxb["fixup"], 9)),
+            "| {} | c | realignment-fixup | the Cargo.toml repair |\n"
+            "| {} | c | realignment-fixup | the base-native replay — misfiled |".format(
+                _h_short(rb_repo, fxb["fixup"], 9), rb8))
+        m9b += "\nallowlist: {} — realignment-fixup: misfiled base-native replay\n".format(rb9)
+        add("9b", "base-tag-native-replay-in-allowlist (FAIL_A rule 3, the base arm)",
+            rb_repo, _write_manifest(td, "m9b.md", m9b), 1,
+            ["map-consistency: FAIL_A", "rule 3", "'v1.0'",
+             "no upstreamed claims declared"], base_arm_sanity)
+
         # -- (10) row path outside the reverse-scope ----------------------------
         tb9 = _h_short(rg, fxg["tb"], 9)
         n2_8 = _h_short(rg, fxg["n2"], 8)
@@ -1319,8 +1403,9 @@ def _run_selftest() -> int:
     n_pass = sum(results)
     total = len(results)
     green = n_pass == total and pinned_ok and drop_ok
-    print(f"{'GREEN' if green else 'RED'}: {n_pass}/{total} enumerated cases pass "
-          f"(+1 integrity assertion; eleven fixtures)")
+    print(f"{'GREEN' if green else 'RED'}: {n_pass}/{total} cases pass — the "
+          f"thirteen enumerated + the fix-round-1 base-tag arm "
+          f"(+1 integrity assertion; twelve fixtures)")
     return 0 if green else 1
 
 
