@@ -5150,7 +5150,7 @@ impl SopEngine {
             pruned_runs,
             finalized_cancellations,
             finalized_step_budget_failures,
-            reaped_stuck_runs: 0,
+            reaped_stuck_runs,
             timeout_actions,
         }
     }
@@ -7522,7 +7522,8 @@ mod tests {
             input: Some(required_object_schema("ok")),
             output: None,
         });
-        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]).with_store(store.clone());
+        let mut engine =
+            engine_with_sops(vec![with_tail_capability(sop)]).with_store(store.clone());
 
         let err = engine
             .start_deterministic_run("det-schema-start-finish-fail", manual_event())
@@ -13121,7 +13122,10 @@ mod tests {
         }
 
         let summary = engine.run_maintenance_tick();
-        assert_eq!(summary.reaped_stuck_runs, 1, "overdue running run should be reaped");
+        assert_eq!(
+            summary.reaped_stuck_runs, 1,
+            "overdue running run should be reaped"
+        );
 
         let finished = engine.finished_runs(None);
         assert_eq!(finished.len(), 1, "reaped run should land in finished_runs");
@@ -13144,8 +13148,14 @@ mod tests {
         let rid = extract_run_id(&action).to_string();
         // started_at is now() -> not overdue
         let summary = engine.run_maintenance_tick();
-        assert_eq!(summary.reaped_stuck_runs, 0, "fresh run should not be reaped");
-        assert!(engine.active_runs.contains_key(&rid), "fresh run must stay active");
+        assert_eq!(
+            summary.reaped_stuck_runs, 0,
+            "fresh run should not be reaped"
+        );
+        assert!(
+            engine.active_runs.contains_key(&rid),
+            "fresh run must stay active"
+        );
     }
 
     #[test]
@@ -13167,8 +13177,14 @@ mod tests {
         }
 
         let summary = engine.run_maintenance_tick();
-        assert_eq!(summary.reaped_stuck_runs, 0, "timeout=0 disables the reaper");
-        assert!(engine.active_runs.contains_key(&rid), "run must stay active when reaper disabled");
+        assert_eq!(
+            summary.reaped_stuck_runs, 0,
+            "timeout=0 disables the reaper"
+        );
+        assert!(
+            engine.active_runs.contains_key(&rid),
+            "run must stay active when reaper disabled"
+        );
     }
 
     #[test]
@@ -13671,8 +13687,9 @@ type = "manual"
 
     #[test]
     fn deterministic_run_drives_to_completion_through_advance_step() {
-        let mut engine =
-            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-run"))]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(
+            deterministic_sop_all_execute("det-run"),
+        )]);
         let action = engine.start_run("det-run", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(
@@ -13789,8 +13806,9 @@ type = "manual"
 
     #[test]
     fn deterministic_failed_step_fails_run_through_advance_step() {
-        let mut engine =
-            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-fail"))]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(
+            deterministic_sop_all_execute("det-fail"),
+        )]);
         let action = engine.start_run("det-fail", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -13838,8 +13856,9 @@ type = "manual"
 
     #[test]
     fn deterministic_advance_step_preserves_caller_timestamps() {
-        let mut engine =
-            engine_with_sops(vec![with_tail_capability(deterministic_sop_all_execute("det-ts"))]);
+        let mut engine = engine_with_sops(vec![with_tail_capability(
+            deterministic_sop_all_execute("det-ts"),
+        )]);
         let action = engine.start_run("det-ts", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
 
@@ -16008,6 +16027,106 @@ type = "manual"
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
         engine.restore_runs();
         assert!(engine.active_runs().contains_key("r-restore"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Incident regression (2026-10-03..05, end-to-end): a torn non-terminal
+    /// row must not wedge the boot self-heal chain. Pre-fix, one poison row
+    /// aborted `restore_runs` wholesale — the orphaned runs never entered
+    /// `active_runs`, the stuck-run reaper (an in-memory scan) never saw
+    /// them, and the stale `sop_claims` left by the dead process blocked the
+    /// start-gate with "execution slots full" until lease expiry,
+    /// recurring on every pod restart. Post-fix: the poison row is
+    /// quarantined at scan, the orphan rehydrates, the maintenance tick
+    /// reaps it, and the gate admits again — all without the lease
+    /// ever expiring.
+    #[test]
+    fn poison_row_does_not_wedge_restore_reap_or_admission() {
+        use super::super::store::SqliteRunStore;
+        let path =
+            std::env::temp_dir().join(format!("zc-sop-poison-e2e-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        // An orphan left by a dead pod: Running with an ancient started_at
+        // and the stale exec claim the dead process never released.
+        let orphan = SopRun {
+            run_id: "r-orphan".to_string(),
+            sop_name: "deploy".to_string(),
+            initiating_agent: None,
+            trigger_event: manual_event(),
+            frame_marker_id: "marker-orphan".to_string(),
+            status: SopRunStatus::Running,
+            current_step: 1,
+            total_steps: 2,
+            started_at: "2020-01-01T00:00:00Z".to_string(),
+            completed_at: None,
+            failure_reason: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(
+                orphan,
+                "2020-01-01T00:00:00Z".to_string(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        store
+            .try_claim_run("r-orphan", "deploy", 1, 1)
+            .unwrap()
+            .unwrap();
+
+        // The torn write: non-terminal, invalid JSON (a process kill
+        // mid-commit on the WAL store leaves exactly this shape).
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+            raw.execute(
+                "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
+                 VALUES ('poison', 0, 0, NULL, ?1)",
+                rusqlite::params![r#"{"version":1,"run":{"run_id":"poison"#],
+            )
+            .unwrap();
+        }
+
+        // Boot: the orphan rehydrates DESPITE the poison row (pre-fix,
+        // restore failed and nothing rehydrated).
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 60,
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        })
+        .with_store(store.clone());
+        let mut sop = test_sop("deploy", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        engine.sops = vec![sop];
+        engine.restore_runs();
+        assert!(
+            engine.active_runs().contains_key("r-orphan"),
+            "the orphan rehydrates despite the poison row"
+        );
+
+        // The maintenance tick reaps the restored orphan (its claim would
+        // otherwise be heartbeated forever).
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(
+            summary.reaped_stuck_runs, 1,
+            "the restored orphan is reaped"
+        );
+
+        // The start-gate is free again without waiting for lease expiry:
+        // the reap released the claim, the poison row holds no claim, and
+        // admission admits.
+        let (per_sop, total) = engine.exec_counts("deploy");
+        assert_eq!((per_sop, total), (0, 0), "no stale claim survives");
+        assert!(
+            matches!(engine.evaluate_admission("deploy"), SopAdmission::Admit),
+            "the start-gate admits after the boot self-heal"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

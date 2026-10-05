@@ -7,9 +7,11 @@ use chrono::{Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::model::{
-    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SopEventRecord,
+    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SOP_STORE_VERSION,
+    SopEventRecord,
 };
 use super::{RETAINED_TERMINAL_ROLLBACK_HOLDER, SopRunStore, StoreError, pending_capacity_member};
+use crate::sop::types::{SopEvent, SopRun, SopRunStatus, SopTriggerSource};
 
 /// Default claim lease. The concurrency tick (EPIC A1) renews via `heartbeat_claim`;
 /// the reaper reclaims claims past this without a heartbeat.
@@ -118,6 +120,130 @@ impl SqliteRunStore {
         self.conn
             .lock()
             .map_err(|_| StoreError::Backend("sqlite run store lock poisoned".into()))
+    }
+}
+
+/// Quarantine a row whose `json` cannot be parsed as a [`PersistedRun`]
+/// (a torn write — WAL `synchronous = NORMAL` under a process kill — or a
+/// row persisted by an older store schema).
+///
+/// Left as-is such a row wedges the engine's whole self-heal chain: the
+/// load surfaces used to abort on the first unparseable row, so no runs
+/// rehydrated, the stuck-run reaper (an in-memory scan) never saw the
+/// orphans, and the stale `sop_claims` left by the dead process blocked
+/// the start-gate ("execution slots full") until lease expiry —
+/// recurring on every pod restart. The row can never be resumed, so the
+/// honest action is a terminal tombstone: mark it terminal, replace the
+/// json with a minimal parseable envelope (so every reader — this store
+/// AND the sidecar's `json_extract` collectors — heals), release any
+/// claim it still holds, and preserve the original bytes plus the parse
+/// error as a `run_quarantined` ledger event (pruned together with the
+/// row). Best-effort: a quarantine write failure is logged and the scan
+/// continues — a row that cannot be quarantined is still skipped, so the
+/// load itself never fails. Returns the tombstone the row was replaced
+/// with (`None` when the quarantine write failed), so a caller that just
+/// scanned the row can surface it in its result instead of leaving the
+/// row invisible until the next load.
+fn quarantine_poison_row(
+    conn: &Connection,
+    run_id: &str,
+    revision: u64,
+    json: &str,
+    error: &serde_json::Error,
+) -> Option<PersistedRun> {
+    let now = Utc::now().to_rfc3339();
+    let tombstone = PersistedRun {
+        version: SOP_STORE_VERSION,
+        revision,
+        run: SopRun {
+            run_id: run_id.to_string(),
+            // The original SOP name died with the torn bytes; a stable
+            // sentinel keeps group-bys honest instead of guessing.
+            sop_name: "quarantined".to_string(),
+            initiating_agent: None,
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now.clone(),
+            },
+            frame_marker_id: String::new(),
+            status: SopRunStatus::Failed,
+            current_step: 0,
+            total_steps: 0,
+            started_at: now.clone(),
+            completed_at: Some(now.clone()),
+            failure_reason: Some(format!("quarantined: persisted row unparseable ({error})")),
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+        },
+        last_progress_at: now.clone(),
+        redacted: false,
+        trigger_source: SopTriggerSource::Manual,
+    };
+    let reason = format!("persisted row unparseable: {error}");
+    let forensics = serde_json::json!({
+        "parse_error": error.to_string(),
+        "original_json": json,
+    });
+    let result: Result<(), StoreError> = (|| {
+        let tx = conn.unchecked_transaction().map_err(sql_err)?;
+        tx.execute(
+            "UPDATE sop_runs SET terminal=1, last_progress_at=?2, json=?3 WHERE run_id=?1",
+            params![run_id, now, serde_json::to_string(&tombstone)?],
+        )
+        .map_err(sql_err)?;
+        tx.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
+            .map_err(sql_err)?;
+        tx.execute(
+            "INSERT INTO sop_events (run_id, ts, kind, actor, reason, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id,
+                now,
+                "run_quarantined",
+                None::<String>,
+                reason,
+                forensics.to_string()
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "parse_error": error.to_string(),
+                    })),
+                "SOP store: quarantined an unparseable run row (terminal tombstone written, \
+                 stale claim released, forensics appended to sop_events)"
+            );
+            Some(tombstone)
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "parse_error": error.to_string(),
+                        "error": e.to_string(),
+                    })),
+                "SOP store: could not quarantine an unparseable run row; it stays skipped and \
+                 the quarantine is retried on the next scan"
+            );
+            None
+        }
     }
 }
 
@@ -340,30 +466,79 @@ impl SopRunStore for SqliteRunStore {
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
         let g = self.lock()?;
+        // Tolerant scan: a poison row (torn write or a legacy-schema row) must
+        // not abort the restore — one unparseable row used to fail the WHOLE
+        // load, so nothing rehydrated and the stale claims of every orphan
+        // wedged the start-gate until lease expiry (2026-10-03..05 incident;
+        // see `quarantine_poison_row`). Poison rows are collected during the
+        // scan and quarantined once the cursor is closed (a write under an
+        // open read cursor on the same table is avoidable; avoid it).
         let mut stmt = g
-            .prepare("SELECT json FROM sop_runs WHERE terminal=0")
+            .prepare("SELECT run_id, revision, json FROM sop_runs WHERE terminal=0")
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(sql_err)?;
         let mut out = Vec::new();
+        let mut poison: Vec<(String, u64, String, serde_json::Error)> = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+            let (run_id, revision, json) = row.map_err(sql_err)?;
+            match serde_json::from_str(&json) {
+                Ok(pr) => out.push(pr),
+                Err(e) => poison.push((run_id, revision as u64, json, e)),
+            }
+        }
+        drop(stmt);
+        for (run_id, revision, json, error) in poison {
+            // The tombstone is terminal — deliberately NOT added to the
+            // active set.
+            let _ = quarantine_poison_row(&g, &run_id, revision, &json, &error);
         }
         Ok(out)
     }
 
     fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
         let g = self.lock()?;
+        // Tolerant scan (see `load_active_runs`): a terminal poison row — e.g.
+        // a torn write the reaper marked terminal — must not abort the boot
+        // seeding of the finished-runs window. It is quarantined (tombstoned)
+        // so the next reader, including the sidecar's `json_extract`
+        // collectors on this same DB, sees a parseable row.
         let mut stmt = g
-            .prepare("SELECT json FROM sop_runs WHERE terminal=1")
+            .prepare("SELECT run_id, revision, json FROM sop_runs WHERE terminal=1")
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(sql_err)?;
         let mut out: Vec<PersistedRun> = Vec::new();
+        let mut poison: Vec<(String, u64, String, serde_json::Error)> = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+            let (run_id, revision, json) = row.map_err(sql_err)?;
+            match serde_json::from_str(&json) {
+                Ok(pr) => out.push(pr),
+                Err(e) => poison.push((run_id, revision as u64, json, e)),
+            }
+        }
+        drop(stmt);
+        for (run_id, revision, json, error) in poison {
+            if let Some(tombstone) = quarantine_poison_row(&g, &run_id, revision, &json, &error) {
+                // The row IS terminal — surface the tombstone so this load
+                // already includes it (a boot seed must not silently drop
+                // rows it just healed).
+                out.push(tombstone);
+            }
         }
         out.sort_by(|a, b| b.run.started_at.cmp(&a.run.started_at));
         if limit > 0 && out.len() > limit {
@@ -393,7 +568,9 @@ impl SopRunStore for SqliteRunStore {
         // `completed_at` lives inside the run JSON, not a column. Pull the
         // successful terminal rows for this SOP (bounded by retention) and take
         // the max completion. ISO-8601 UTC ("...Z") timestamps sort lexically
-        // in completion order.
+        // in completion order. A poison row is skipped, not fatal: one bad row
+        // must not break every SOP's cooldown read (it is tombstoned by the
+        // boot-time terminal scan in `load_terminal_runs`).
         let mut stmt = g
             .prepare("SELECT json FROM sop_runs WHERE terminal=1")
             .map_err(sql_err)?;
@@ -402,7 +579,9 @@ impl SopRunStore for SqliteRunStore {
             .map_err(sql_err)?;
         let mut latest: Option<String> = None;
         for row in rows {
-            let pr: PersistedRun = serde_json::from_str(&row.map_err(sql_err)?)?;
+            let Ok(pr) = serde_json::from_str::<PersistedRun>(&row.map_err(sql_err)?) else {
+                continue;
+            };
             if pr.run.sop_name != sop_name
                 || pr.run.status != crate::sop::types::SopRunStatus::Completed
             {
@@ -593,14 +772,43 @@ impl SopRunStore for SqliteRunStore {
     fn expired_claims(&self, now_iso: &str) -> Result<Vec<ClaimToken>, StoreError> {
         let g = self.lock()?;
         let mut stmt = g
-            .prepare("SELECT json FROM sop_claims WHERE lease_expires <= ?1")
+            .prepare("SELECT run_id, json FROM sop_claims WHERE lease_expires <= ?1")
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map(params![now_iso], |r| r.get::<_, String>(0))
+            .query_map(params![now_iso], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(sql_err)?;
         let mut out = Vec::new();
+        let mut torn: Vec<(String, String)> = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+            let (run_id, json) = row.map_err(sql_err)?;
+            match serde_json::from_str(&json) {
+                Ok(token) => out.push(token),
+                Err(e) => {
+                    // A torn CLAIM row (same WAL crash-window class as a torn
+                    // run row) must not abort the whole expired-claims scan —
+                    // that would silently disable lease reaping and wedge the
+                    // start-gate on every stale claim. The row is garbage its
+                    // holder died writing; its run_id column is the only
+                    // field needed to release the slot.
+                    torn.push((run_id, e.to_string()));
+                }
+            }
+        }
+        drop(stmt);
+        for (run_id, parse_error) in torn {
+            let _ = g.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id]);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "parse_error": parse_error,
+                    })),
+                "SOP store: released a torn claim row during the expired-claims scan"
+            );
         }
         Ok(out)
     }
@@ -838,6 +1046,208 @@ mod tests {
         );
         assert_eq!(s.backend(), "sqlite");
         assert!(s.health_check());
+    }
+
+    /// Incident regression (2026-10-03..05): ONE poison row in `sop_runs` must
+    /// not abort `load_active_runs` — the wholesale failure wedged the engine
+    /// (no runs rehydrated → the stuck-run reaper never saw the orphans →
+    /// their stale `sop_claims` blocked the start-gate "execution slots full"
+    /// until lease expiry, recurring on every pod restart).
+    #[test]
+    fn load_active_runs_quarantines_poison_row_instead_of_failing() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        s.save_run(&run("good", SopRunStatus::Running, "1"))
+            .unwrap();
+        // A torn write: non-terminal, invalid JSON, with a stale claim (what
+        // the dead process left behind on the durable store).
+        s.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
+                 VALUES ('poison', 3, 0, NULL, ?1)",
+                params![r#"{"version":1,"run":{"run_id":"poison"#],
+            )
+            .unwrap();
+        s.lock().unwrap()
+            .execute(
+                "INSERT INTO sop_claims (run_id, sop_name, lease_expires, json)
+                 VALUES ('poison', 'deploy', '2999-01-01T00:00:00Z', ?1)",
+                params![r#"{"run_id":"poison","sop_name":"deploy","claimed_at":"t","lease_expires":"2999-01-01T00:00:00Z","holder":"pid-1"}"#],
+            )
+            .unwrap();
+
+        // Pre-fix this call failed wholesale (StoreError) — now the parseable
+        // run still loads.
+        let active = s.load_active_runs().unwrap();
+        assert_eq!(active.len(), 1, "the parseable run still loads");
+        assert_eq!(active[0].run.run_id, "good");
+
+        // The poison row is quarantined: terminal, tombstoned (parseable),
+        // and its stale claim released — the gate slot is freed.
+        let poison = s.load_run("poison").unwrap().expect("tombstone kept");
+        assert_eq!(poison.revision, 3, "tombstone keeps the row's revision");
+        assert!(matches!(poison.run.status, SopRunStatus::Failed));
+        let claims: i64 = s
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sop_claims", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(claims, 0, "quarantine released the stale claim");
+        // The tombstone is valid JSON for EVERY reader of this shared DB
+        // (the sidecar's json_extract collectors crash on invalid JSON).
+        let json_valid: i64 = s
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT json_valid(json) FROM sop_runs WHERE run_id='poison'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(json_valid, 1, "the tombstone is valid JSON");
+        // Forensics: the quarantine is on the ledger, not just in the logs.
+        let events: i64 = s
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sop_events WHERE run_id='poison' AND kind='run_quarantined'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "a run_quarantined event records the quarantine");
+        // Idempotent: a second scan no longer sees the row as active and
+        // does not re-quarantine (no second event).
+        let active = s.load_active_runs().unwrap();
+        assert_eq!(active.len(), 1, "the quarantined row stays terminal");
+        let events: i64 = s
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sop_events WHERE run_id='poison' AND kind='run_quarantined'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    /// The terminal surface must survive (and heal) a poison row too: the
+    /// observed torn row was marked terminal by the one-shot reaper and kept
+    /// crashing every reader of the terminal set.
+    #[test]
+    fn load_terminal_runs_quarantines_poison_row_instead_of_failing() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        let mut terminal = run("done", SopRunStatus::Completed, "2");
+        terminal.revision = 1;
+        s.save_run(&run("done", SopRunStatus::Running, "1"))
+            .unwrap();
+        s.finish_run("done", &terminal).unwrap();
+        s.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
+                 VALUES ('poison', 0, 1, NULL, ?1)",
+                params![r#"{"version":1,"run":{"run_id":"poison"#],
+            )
+            .unwrap();
+
+        let loaded = s.load_terminal_runs(10).unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "the parseable terminal run loads and the poison row is tombstoned in place"
+        );
+        assert!(
+            loaded.iter().any(
+                |pr| pr.run.run_id == "poison" && matches!(pr.run.status, SopRunStatus::Failed)
+            ),
+            "the poison row's tombstone is parseable and Failed"
+        );
+        // And the shared-DB invariant: the tombstone is valid JSON.
+        let json_valid: i64 = s
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT json_valid(json) FROM sop_runs WHERE run_id='poison'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(json_valid, 1);
+    }
+
+    /// The cooldown read must skip a poison terminal row instead of erroring
+    /// (pre-fix one bad row made EVERY SOP's cooldown check fall back to the
+    /// local view).
+    #[test]
+    fn last_terminal_completed_at_skips_poison_rows() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        s.save_run(&run("done", SopRunStatus::Running, "1"))
+            .unwrap();
+        let mut terminal = run("done", SopRunStatus::Completed, "2");
+        terminal.revision = 1;
+        terminal.run.completed_at = Some("2026-10-01T00:00:00Z".to_string());
+        s.finish_run("done", &terminal).unwrap();
+        s.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
+                 VALUES ('poison', 0, 1, NULL, ?1)",
+                params![r#"{"version":1,"run":{"run_id":"poison"#],
+            )
+            .unwrap();
+
+        let last = s.last_terminal_completed_at("deploy").unwrap();
+        assert_eq!(
+            last.as_deref(),
+            Some("2026-10-01T00:00:00Z"),
+            "the cooldown read skips the poison row and still answers"
+        );
+    }
+
+    /// A torn CLAIM row must not abort the expired-claims scan — pre-fix the
+    /// whole reaper errored out each tick, silently disabling lease reaping
+    /// and wedging the start-gate on every stale claim.
+    #[test]
+    fn expired_claims_scan_releases_torn_claim_rows_instead_of_failing() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        // An expired claim with a parseable token: the normal reaper path.
+        s.try_claim_run("r-live", "deploy", 2, 2).unwrap().unwrap();
+        s.lock()
+            .unwrap()
+            .execute(
+                "UPDATE sop_claims SET lease_expires='2000-01-01T00:00:00Z' WHERE run_id='r-live'",
+                [],
+            )
+            .unwrap();
+        // A torn claim row: expired, invalid JSON.
+        s.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sop_claims (run_id, sop_name, lease_expires, json)
+                 VALUES ('r-torn', 'deploy', '2000-01-01T00:00:00Z', ?1)",
+                params![r#"{"run_id":"r-torn""#],
+            )
+            .unwrap();
+
+        let reaped = s.expired_claims("2999-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            reaped.len(),
+            1,
+            "the parseable expired claim is reaped despite the torn row"
+        );
+        assert_eq!(reaped[0].run_id, "r-live");
+        let torn_left: i64 = s
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sop_claims WHERE run_id='r-torn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(torn_left, 0, "the torn claim row is released outright");
     }
 
     #[test]
