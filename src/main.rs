@@ -9824,6 +9824,7 @@ fn spawn_sop_maintenance(
                         .with_attrs(::serde_json::json!({
                             "timed_out": report.maintenance.timed_out,
                             "reaped_claims": report.maintenance.reaped_claims,
+                            "reaped_stuck_runs": report.maintenance.reaped_stuck_runs,
                             "pruned_runs": report.maintenance.pruned_runs,
                             "cron_started": report.cron_started,
                             "cron_skipped": report.cron_skipped,

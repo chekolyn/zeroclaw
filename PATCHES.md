@@ -82,6 +82,7 @@ are the lineage contract. The rules:
 | ADE-7 | 2f32e99bb | v0.8.5 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present). | - |
 | U1 | 33f948e15 | v0.8.5 | the `allow_scripts` subagent propagation fix (delegated subagents skipped skills containing script files — `skills.allow_scripts` was not propagated from the parent config). Carried as the upstreamed claim "upstream `352672c0`" since the v0.8.3-era table; verified dead 2026-10-02 (the origin patch-id absent from v0.8.4's patch-id set, the tree probe failing on v0.8.4/v0.8.5/the current tree) and resolved by the C.1 remediation: cherry-picked from `cheknet-pached` `352672c02` onto v0.8.5, both `load_skills_from_directory` scan sites reshaped to the v0.8.5 loader (the tuple return) and reading the root config snapshot per site; the origin commit's ws.rs marker cleanup and .dockerignore excludes dropped — never applicable on this lineage (the excludes already ride `c91662850`). | allow_scripts-config-read |
 | U2 | 957bee7d6 | v0.8.5 | the cron chat-leak fix (automated cron outputs routed exclusively to the `cron` session, not broadcast to all chat WebSockets). Carried as the upstreamed claim "upstream `69dd83ed`" since the v0.8.3-era table; verified dead 2026-10-02 (the origin patch-id absent from v0.8.4's 1350-commit patch-id set, the fix shape absent from the v0.8.4/v0.8.5 trees) and resolved by the C.1 remediation: cherry-picked from `cheknet-pached` `69dd83ed4` onto v0.8.5 — `event_matches_session`'s no-session arm routes `cron_result` to the `cron` session alone, and v0.8.5's own `is_global_chat_event` whitelist (the leaky arm's old shape) is removed with its only caller replaced. | cron-session-route |
+| SOP-POISON-QUARANTINE | 1717ecde3 | v0.8.5 | the SOP ledger poison-row quarantine (2026-10-03..05 restore-wedge incident, root cause of the recurring "execution slots full" outage): `load_active_runs`/`load_terminal_runs` aborted wholesale on one unparseable row (a torn WAL write or legacy-schema row), so boot restore rehydrated nothing — the in-memory stuck-run reaper never saw the orphans and the dead process's stale `sop_claims` blocked the start-gate until lease expiry. Fix: tolerant scans that quarantine poison rows terminally (minimal parseable tombstone, stale claim released, `run_quarantined` forensic event — the tombstone also heals the sidecar's `json_extract` readers on the shared DB), a torn-claim-row release in the expired-claims reaper, and the `reaped_stuck_runs` maintenance-summary reporting fix (hardcoded 0 → the real count; the pre-existing reap test was RED on HEAD). 5 regression tests; the 4 remaining sop:: failures are pre-existing lineage debt (verified red on pristine HEAD). | - |
 
 ### Upstreamed rows
 
@@ -273,9 +274,10 @@ old-table rows (the class-b rows below `gateway`/`delegate-*`).
 | a05960c1f | c | docs | PATCHES.md — the arg_deny_exemptions entry |
 | 33f948e15 | a | U1 | the allow_scripts subagent propagation fix — cherry-picked from cheknet-pached `352672c02` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 | 957bee7d6 | a | U2 | the cron chat-leak fix — cherry-picked from cheknet-pached `69dd83ed4` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
+| 1717ecde3 | a | SOP-POISON-QUARANTINE | the SOP ledger poison-row quarantine — tolerant restore scans + terminal tombstones + the reaped_stuck_runs reporting fix (the 2026-10-03..05 restore-wedge / slots-full root cause) |
 
-Row count: 56 rows over 42 commits — 15 class-b rows (one commit, the squash
-carrier), 25 class-a rows (one per commit), 16 class-c rows (one per commit).
+Row count: 57 rows over 43 commits — 15 class-b rows (one commit, the squash
+carrier), 26 class-a rows (one per commit), 16 class-c rows (one per commit).
 The sha column is the 9-char short form (unique; `git cat-file -e` resolves
 each); the checker re-verifies every row against the branch.
 
