@@ -1807,6 +1807,7 @@ async fn run_tool_call_loop_impl<'a>(
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
             no_progress_exempt_tools: pacing.no_progress_exempt_tools.clone(),
+            benign_repeat_tools: pacing.benign_repeat_tools.clone(),
         },
     );
 
