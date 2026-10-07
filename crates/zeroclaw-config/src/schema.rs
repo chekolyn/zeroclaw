@@ -6171,6 +6171,19 @@ pub struct PacingConfig {
     /// search tools.
     #[serde(default = "default_no_progress_exempt_tools")]
     pub no_progress_exempt_tools: Vec<String>,
+
+    /// The benign-repeat class: idempotent status/read tools (sop_status,
+    /// cron_list, memory_recall) whose identical repeat output usually
+    /// means the step's work is already complete. An identical-results
+    /// loop-detector trip on one of these tools steers — a Warning with
+    /// the steering hint ("the tool's result is unchanged; the step's
+    /// work may be complete — end the turn") injected into the agent's
+    /// next prompt — instead of refusing the call or aborting the run.
+    /// The run-abort is retained for write-path tools (file_write /
+    /// shell / mqtt_publish), where identical results are a real
+    /// no-progress loop. Defaults to the ruling's status/reads set.
+    #[serde(default = "default_benign_repeat_tools")]
+    pub benign_repeat_tools: Vec<String>,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6187,10 +6200,17 @@ fn default_loop_detection_max_repeats() -> usize {
 
 fn default_no_progress_exempt_tools() -> Vec<String> {
     vec![
-        "memory_recall".to_string(),
         "content_search".to_string(),
         "web_search_tool".to_string(),
         "glob_search".to_string(),
+    ]
+}
+
+fn default_benign_repeat_tools() -> Vec<String> {
+    vec![
+        "sop_status".to_string(),
+        "cron_list".to_string(),
+        "memory_recall".to_string(),
     ]
 }
 
@@ -6205,6 +6225,7 @@ impl Default for PacingConfig {
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
             no_progress_exempt_tools: default_no_progress_exempt_tools(),
+            benign_repeat_tools: default_benign_repeat_tools(),
         }
     }
 }
@@ -36741,6 +36762,37 @@ url = "http://localhost:8080/mcp"
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
+
+        // The benign-repeat class (RCA fix #4): the shipped default must be
+        // exactly the ruling's idempotent status/reads, and memory_recall
+        // must NOT sit in the silent-exempt default (benign steering
+        // supersedes the exemption there — a dead-config return would
+        // silently re-arm the run-reaping).
+        assert_eq!(
+            from_toml.benign_repeat_tools,
+            vec![
+                "sop_status".to_string(),
+                "cron_list".to_string(),
+                "memory_recall".to_string(),
+            ]
+        );
+        assert_eq!(
+            from_toml.no_progress_exempt_tools,
+            vec![
+                "content_search".to_string(),
+                "web_search_tool".to_string(),
+                "glob_search".to_string(),
+            ],
+            "memory_recall must live in the benign class, not the silent exemption"
+        );
+        assert_eq!(
+            from_toml.benign_repeat_tools, manual.benign_repeat_tools,
+            "serde and manual defaults must agree"
+        );
+        assert_eq!(
+            from_toml.no_progress_exempt_tools, manual.no_progress_exempt_tools,
+            "serde and manual defaults must agree"
+        );
     }
 
     // ── Docker baked config template ────────────────────────────

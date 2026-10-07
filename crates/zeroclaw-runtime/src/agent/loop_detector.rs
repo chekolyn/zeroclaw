@@ -6,6 +6,15 @@ use std::hash::{Hash, Hasher};
 
 // ── Configuration ────────────────────────────────────────────────
 
+/// The steering hint injected into the agent's next prompt (via the
+/// Warning -> `[Loop Detection]` system-message path in
+/// `collect_tool_results`) when a benign-repeat tool trips an
+/// identical-results detector. A benign tool's unchanged repeat output
+/// usually means the step's work is already complete — the run must be
+/// steered to a close, not reaped.
+pub(crate) const BENIGN_REPEAT_STEERING_HINT: &str =
+    "the tool's result is unchanged; the step's work may be complete — end the turn";
+
 /// Configuration for the loop detector, typically derived from
 /// `PacingConfig` fields at the call site.
 #[derive(Debug, Clone)]
@@ -18,11 +27,20 @@ pub struct LoopDetectorConfig {
     pub max_repeats: usize,
     /// Tools exempt from the no-progress detector. These are typically
     /// read-only search tools that can legitimately return identical
-    /// results for different queries (e.g. memory_recall returning
-    /// similar content for different keys, or search returning "no
-    /// results" for different queries). Exact-repeat and ping-pong
+    /// results for different queries (e.g. content_search returning
+    /// "no results" for different queries). Exact-repeat and ping-pong
     /// detection still apply to these tools.
     pub no_progress_exempt_tools: Vec<String>,
+    /// The benign-repeat class: idempotent status/read tools (sop_status,
+    /// cron_list, memory_recall) whose identical repeat output usually
+    /// means the step's work is already complete. An identical-results
+    /// trip on one of these tools steers — a Warning carrying the
+    /// steering hint below, injected into the agent's next prompt — at
+    /// every escalation level, instead of refusing the call (Block) or
+    /// aborting the run (Break). The run-abort is retained for write-path
+    /// tools (file_write/shell/mqtt_publish, the non-benign default)
+    /// where identical results are a real no-progress loop.
+    pub benign_repeat_tools: Vec<String>,
 }
 
 impl Default for LoopDetectorConfig {
@@ -32,10 +50,14 @@ impl Default for LoopDetectorConfig {
             window_size: 20,
             max_repeats: 3,
             no_progress_exempt_tools: vec![
-                "memory_recall".to_string(),
                 "content_search".to_string(),
                 "web_search_tool".to_string(),
                 "glob_search".to_string(),
+            ],
+            benign_repeat_tools: vec![
+                "sop_status".to_string(),
+                "cron_list".to_string(),
+                "memory_recall".to_string(),
             ],
         }
     }
@@ -214,6 +236,21 @@ impl LoopDetector {
         LoopDetectionResult::Ok
     }
 
+    /// The benign-repeat class consult: is this tool an idempotent
+    /// status/read whose identical repeat output means the step's work is
+    /// likely already complete?
+    fn is_benign_repeat_tool(&self, name: &str) -> bool {
+        self.config.benign_repeat_tools.iter().any(|t| t == name)
+    }
+
+    /// The silent no-progress exemption consult (read-only search tools).
+    fn is_no_progress_exempt(&self, name: &str) -> bool {
+        self.config
+            .no_progress_exempt_tools
+            .iter()
+            .any(|t| t == name)
+    }
+
     fn detect_exact_repeat(&self) -> Option<LoopDetectionResult> {
         let max = self.config.max_repeats;
         if self.window.len() < max {
@@ -227,6 +264,20 @@ impl LoopDetector {
             .rev()
             .take_while(|r| r.name == last.name && r.args_hash == last.args_hash)
             .count();
+
+        // The benign-repeat class (RCA fix #4): an idempotent status/read
+        // tool repeating identically steers — the Warning + steering hint
+        // rides the existing nudge path (`collect_tool_results` appends it
+        // as a system message into the agent's next prompt) — at EVERY
+        // escalation level, instead of refusing the call (Block) or
+        // aborting the run (Break). The abort is retained for write-path
+        // tools: for those, an identical repeat is a real no-progress loop.
+        if consecutive >= max && self.is_benign_repeat_tool(&last.name) {
+            return Some(LoopDetectionResult::Warning(format!(
+                "tool '{}' called {} times consecutively with identical arguments — {}",
+                last.name, consecutive, BENIGN_REPEAT_STEERING_HINT
+            )));
+        }
 
         if consecutive >= max + 2 {
             Some(LoopDetectionResult::Break(format!(
@@ -324,6 +375,17 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
+
+        // The declared silent exemption (wired here — it was dead config
+        // from its introduction through v0.8.5: `no_progress_exempt_tools`
+        // was never consulted, so search tools returning "no results" for
+        // different queries were exposed to the no-progress breaker).
+        // Exempt tools produce no trip at all; exact-repeat and ping-pong
+        // detection still apply to them.
+        if self.is_no_progress_exempt(&last.name) {
+            return None;
+        }
+
         // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
@@ -344,6 +406,18 @@ impl LoopDetector {
         if unique_args.len() < 2 {
             // All same args — this is exact-repeat territory, not no-progress.
             return None;
+        }
+
+        // The benign-repeat class (RCA fix #4): steering at every escalation
+        // level for idempotent status/reads — never Block, never Break. The
+        // agent re-reads the same unchanged state; the hint tells it the
+        // step's work may already be done. The abort ladder below stays the
+        // write-path contract (file_write/shell/mqtt_publish).
+        if self.is_benign_repeat_tool(&last.name) {
+            return Some(LoopDetectionResult::Warning(format!(
+                "tool '{}' called {} times with different arguments but identical results — {}",
+                last.name, count, BENIGN_REPEAT_STEERING_HINT
+            )));
         }
 
         if count >= MIN_CALLS + 2 {
@@ -381,6 +455,7 @@ mod tests {
             window_size: 20,
             max_repeats,
             no_progress_exempt_tools: Vec::new(),
+            benign_repeat_tools: Vec::new(),
         }
     }
 
@@ -659,6 +734,7 @@ mod tests {
             window_size: 5,
             max_repeats: 3,
             no_progress_exempt_tools: Vec::new(),
+            benign_repeat_tools: Vec::new(),
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -711,6 +787,7 @@ mod tests {
             window_size: 6,
             max_repeats: 3,
             no_progress_exempt_tools: Vec::new(),
+            benign_repeat_tools: Vec::new(),
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -1020,41 +1097,43 @@ mod tests {
 
     #[test]
     fn no_progress_exempt_tool_different_args_identical_result_returns_ok() {
-        // memory_recall is a read-only search tool that can legitimately
-        // return identical results for different queries. 7 calls with
-        // different args but the same result must NOT trip the no-progress
-        // detector — this is the false positive that killed the director
-        // agent. The exemption list comes from the default config.
+        // content_search is a read-only search tool that can legitimately
+        // return identical results for different queries — the silent
+        // exemption (no trip at all). The exemption consult was declared
+        // since v0.8.4 but never wired (dead config); this fix wires it.
         let mut det = LoopDetector::new(default_config());
 
         for i in 0..7 {
-            let args = json!({"key": format!("memory_key_{i}")});
-            let result = det.record("memory_recall", &args, "no results found");
+            let args = json!({"query": format!("attempt_{i}")});
+            let result = det.record("content_search", &args, "no results found");
             assert_eq!(
                 result,
                 LoopDetectionResult::Ok,
-                "memory_recall call {i} should be exempt from no-progress"
+                "content_search call {i} should be exempt from no-progress"
             );
         }
     }
 
     #[test]
     fn no_progress_exempt_tool_same_args_still_triggers_exact_repeat() {
-        // The exemption only applies to detect_no_progress. Exact-repeat
-        // detection must still fire when an exempt tool is called with the
-        // SAME arguments repeatedly. 7 identical calls with max_repeats=3
-        // -> consecutive=7 >= max_repeats+2(5) -> Break.
-        let mut det = LoopDetector::new(config_with_repeats(3));
+        // The silent exemption only applies to detect_no_progress.
+        // Exact-repeat detection still fires when an exempt tool is called
+        // with the SAME arguments repeatedly. 7 identical calls with
+        // max_repeats=3 -> consecutive=7 >= max_repeats+2(5) -> Break.
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            no_progress_exempt_tools: vec!["content_search".to_string()],
+            ..config_with_repeats(3)
+        });
         let args = json!({"key": "same_key"});
 
         for _ in 0..6 {
-            det.record("memory_recall", &args, "some result");
+            det.record("content_search", &args, "some result");
         }
         // 7th consecutive identical call -> exact-repeat Break (circuit breaker).
-        match det.record("memory_recall", &args, "some result") {
+        match det.record("content_search", &args, "some result") {
             LoopDetectionResult::Break(msg) => {
                 assert!(
-                    msg.contains("memory_recall"),
+                    msg.contains("content_search"),
                     "should mention the tool: {msg}"
                 );
                 assert!(
@@ -1084,6 +1163,311 @@ mod tests {
                 assert!(msg.contains("no progress"));
             }
             other => panic!("expected no-progress Break for non-exempt tool, got {other:?}"),
+        }
+    }
+
+    // ── The benign-repeat class (RCA fix #4) ─────────────────────
+    //
+    // The 2026-10 verify-improvement SOP runs died 3× to circuit
+    // breakers AFTER completing their real work: the CB treated the
+    // agent's confused-retry flailing on idempotent status/reads as a
+    // run-killer. A benign tool's identical repeat output usually means
+    // the step's work is already complete — steer, don't reap.
+
+    #[test]
+    fn benign_default_class_pins_the_ruling_tools() {
+        // The shipped default posture: the benign-repeat class is exactly
+        // the ruling's idempotent status/reads; memory_recall moved here
+        // from the silent-exempt default (steering is strictly stronger:
+        // no abort in BOTH detectors + the hint).
+        let config = LoopDetectorConfig::default();
+        assert_eq!(
+            config.benign_repeat_tools,
+            vec![
+                "sop_status".to_string(),
+                "cron_list".to_string(),
+                "memory_recall".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.no_progress_exempt_tools,
+            vec![
+                "content_search".to_string(),
+                "web_search_tool".to_string(),
+                "glob_search".to_string(),
+            ],
+            "memory_recall must not stay in the exempt default: benign steering supersedes it"
+        );
+    }
+
+    #[test]
+    fn benign_exact_repeat_trips_as_steering_warning_not_abort() {
+        // RCA incident #1 verbatim: "tool 'sop_status' called 5 times
+        // consecutively with identical arguments" — previously a Break at
+        // the 5th call (max_repeats=3 + 2). The benign class steers instead:
+        // every trip level is the Warning + steering hint; never Block
+        // (the call is never refused), never Break (the run is never
+        // aborted).
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"run_id": "run-123"});
+
+        assert_eq!(
+            det.record("sop_status", &args, "status: running"),
+            LoopDetectionResult::Ok
+        );
+        assert_eq!(
+            det.record("sop_status", &args, "status: running"),
+            LoopDetectionResult::Ok
+        );
+        for call in 3..=7 {
+            match det.record("sop_status", &args, "status: running") {
+                LoopDetectionResult::Warning(msg) => {
+                    assert!(msg.contains("sop_status"), "call {call}: {msg}");
+                    assert!(msg.contains("identical arguments"), "call {call}: {msg}");
+                    assert!(
+                        msg.contains(BENIGN_REPEAT_STEERING_HINT),
+                        "call {call} must carry the steering hint: {msg}"
+                    );
+                }
+                other => panic!(
+                    "call {call}: expected steering Warning, got {other:?} \
+                     — a benign status read must never abort the run"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn benign_no_progress_trips_as_steering_warning_not_abort() {
+        // RCA incident #2's shape on a benign tool: different arguments,
+        // identical results, 5..7 calls — previously Block at 6 and Break
+        // at 7. The benign class steers at every level instead.
+        let mut det = LoopDetector::new(default_config());
+
+        for call in 0..7 {
+            let args = json!({"cron_id": format!("job_{call}")});
+            match det.record("cron_list", &args, "no cron jobs found") {
+                r if call < 4 => assert_eq!(
+                    r,
+                    LoopDetectionResult::Ok,
+                    "call {call} is below the no-progress threshold"
+                ),
+                LoopDetectionResult::Warning(msg) => {
+                    assert!(msg.contains("cron_list"), "call {call}: {msg}");
+                    assert!(msg.contains("identical results"), "call {call}: {msg}");
+                    assert!(
+                        msg.contains(BENIGN_REPEAT_STEERING_HINT),
+                        "call {call} must carry the steering hint: {msg}"
+                    );
+                }
+                other => panic!(
+                    "call {call}: expected steering Warning, got {other:?} \
+                     — a benign read's no-progress trip must never abort the run"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn benign_steering_is_non_escalating() {
+        // The benign trip NEVER escalates: a status read hammered far past
+        // every old escalation threshold keeps steering with the same
+        // Warning; the old ladder (Block at >max, Break at >=max+2 /
+        // count >= 7) is disarmed for benign tools at every level.
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"scope": "all"});
+
+        for call in 1..=20 {
+            match det.record("sop_status", &args, "status: idle") {
+                LoopDetectionResult::Warning(msg) => {
+                    assert!(
+                        msg.contains(BENIGN_REPEAT_STEERING_HINT),
+                        "call {call}: {msg}"
+                    );
+                }
+                LoopDetectionResult::Ok if call < 3 => {}
+                other => panic!(
+                    "call {call}: benign steering must stay a Warning forever, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn benign_memory_recall_exact_repeat_steers_not_breaks() {
+        // memory_recall is benign (the ruling's list): its identical-args
+        // repeats steered. This re-anchors the old exempt-vs-exact-repeat
+        // contract — exact-repeat detection still FIRES, but for a benign
+        // tool the trip is the steering Warning, not the Break.
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"key_prefix": "proj:cheknet"});
+
+        // Calls 1-2 are below the exact-repeat threshold (max_repeats=3);
+        // from the 3rd call on, every trip steers — never Break.
+        for call in 1..=9 {
+            match det.record("memory_recall", &args, "no memories") {
+                LoopDetectionResult::Warning(msg) => {
+                    assert!(msg.contains("memory_recall"), "call {call}: {msg}");
+                    assert!(
+                        msg.contains(BENIGN_REPEAT_STEERING_HINT),
+                        "call {call}: {msg}"
+                    );
+                }
+                LoopDetectionResult::Ok if call < 3 => {}
+                other => panic!(
+                    "call {call}: expected benign steering Warning for memory_recall, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn benign_memory_recall_no_progress_steers_not_breaks() {
+        // The pre-fix red state: the never-wired silent exemption left
+        // memory_recall's different-args/identical-result runs exposed to
+        // the no-progress Break (a search-probe loop reaped mid-work). The
+        // benign class steers it: Warning + hint at every trip level.
+        let mut det = LoopDetector::new(default_config());
+
+        for call in 0..7 {
+            let args = json!({"key_prefix": format!("attempt_{call}")});
+            match det.record("memory_recall", &args, "no results found") {
+                r if call < 4 => assert_eq!(r, LoopDetectionResult::Ok, "call {call}"),
+                LoopDetectionResult::Warning(msg) => {
+                    assert!(msg.contains("memory_recall"), "call {call}: {msg}");
+                    assert!(
+                        msg.contains(BENIGN_REPEAT_STEERING_HINT),
+                        "call {call}: {msg}"
+                    );
+                }
+                other => panic!("call {call}: expected benign steering Warning, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_path_no_progress_kill_retained_for_mqtt_publish() {
+        // RCA incident #2 verbatim: "tool 'mqtt_publish' called 7 times
+        // with different arguments but identical results — no progress".
+        // mqtt_publish is a write-path tool — the ruling RETAINS the
+        // run-abort: identical results from writes are a real no-progress
+        // loop.
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..6 {
+            let args = json!({"topic": format!("zeroclaw/tasks/{i}"), "payload": "x"});
+            det.record("mqtt_publish", &args, "published");
+        }
+        match det.record(
+            "mqtt_publish",
+            &json!({"topic": "zeroclaw/tasks/6", "payload": "x"}),
+            "published",
+        ) {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("mqtt_publish"), "{msg}");
+                assert!(msg.contains("no progress"), "{msg}");
+                assert!(!msg.contains(BENIGN_REPEAT_STEERING_HINT), "{msg}");
+            }
+            other => panic!("write-path no-progress Break must be retained, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_path_exact_repeat_kill_retained_for_file_write() {
+        // file_write identical-args repeats stay on the kill ladder:
+        // Block at the 4th consecutive call, Break at the 5th.
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"path": "/tmp/ledger.toml", "content": "same"});
+
+        for _ in 0..3 {
+            det.record("file_write", &args, "written");
+        }
+        match det.record("file_write", &args, "written") {
+            LoopDetectionResult::Block(msg) => {
+                assert!(msg.contains("file_write"), "{msg}");
+            }
+            other => panic!("expected exact-repeat Block at 4th call, got {other:?}"),
+        }
+        match det.record("file_write", &args, "written") {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("Circuit breaker"), "{msg}");
+                assert!(msg.contains("file_write"), "{msg}");
+            }
+            other => panic!("expected exact-repeat Break at 5th call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_benign_steering_does_not_disarm_the_write_path_kill() {
+        // Mixed sequence: benign sop_status trips (steered Warnings) share
+        // the window with a write tool's no-progress run — the steering
+        // must not disarm the kill for the write-path tool, and the
+        // benign entries must not trip anything on their own account.
+        let mut det = LoopDetector::new(default_config());
+
+        // Steered benign flailing (would-be incident #1) — warnings only
+        // (the first two calls are below the exact-repeat threshold).
+        for call in 0..5 {
+            let r = det.record("sop_status", &json!({"run_id": "r1"}), "status: running");
+            if call < 2 {
+                assert_eq!(r, LoopDetectionResult::Ok, "call {call}");
+            } else {
+                assert!(matches!(r, LoopDetectionResult::Warning(_)), "got {r:?}");
+            }
+        }
+        // A write tool's genuine no-progress loop — the kill ladder must
+        // step through its normal escalation (5th: Warning, 6th: Block,
+        // 7th: Break) exactly as it would without the benign entries in
+        // the window; the steering must not disarm any rung.
+        for i in 0..6 {
+            let args = json!({"cmd": format!("kubectl get pod p{i}")});
+            let r = det.record("shell", &args, "pod not found");
+            assert!(
+                matches!(
+                    r,
+                    LoopDetectionResult::Ok
+                        | LoopDetectionResult::Warning(_)
+                        | LoopDetectionResult::Block(_)
+                ),
+                "write tool rung {i} must follow the raw ladder, got {r:?}"
+            );
+        }
+        match det.record(
+            "shell",
+            &json!({"cmd": "kubectl get pod p6"}),
+            "pod not found",
+        ) {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("shell"), "{msg}");
+                assert!(msg.contains("no progress"), "{msg}");
+            }
+            other => panic!("the write-path Break must survive benign steering, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benign_no_progress_counts_interleaved_calls_and_steers() {
+        // The interleaved-counting semantics (filter, not take_while) hold
+        // for benign steering too: non-adjacent benign repeats with varied
+        // unrelated tools interleaved still steer — never abort.
+        let mut det = LoopDetector::new(default_config());
+
+        let mut last = LoopDetectionResult::Ok;
+        for i in 0..5 {
+            let args = json!({"run": format!("probe_{i}")});
+            last = det.record("sop_status", &args, "no change");
+            det.record(
+                &format!("reader_{i}"),
+                &json!({"path": format!("/f{i}")}),
+                &format!("body_{i}"),
+            );
+        }
+        match last {
+            LoopDetectionResult::Warning(msg) => {
+                assert!(msg.contains("sop_status"), "got: {msg}");
+                assert!(msg.contains(BENIGN_REPEAT_STEERING_HINT), "got: {msg}");
+            }
+            other => panic!("expected steering Warning on 5th interleaved probe, got {other:?}"),
         }
     }
 }

@@ -239,6 +239,12 @@ mod tests {
     /// different args but return an identical `output` string, with the given
     /// `success` flag.
     fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        run_named("file_read", n, output, success)
+    }
+
+    /// Same as [`run`] but with the tool name parameterised (the benign
+    /// steering test needs a benign-class tool).
+    fn run_named(tool: &str, n: usize, output: &str, success: bool) -> Result<CollectedResults> {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
@@ -246,15 +252,11 @@ mod tests {
         let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
         for i in 0..n {
             tool_calls.push(ParsedToolCall {
-                name: "file_read".to_string(),
-                arguments: serde_json::json!({ "path": format!("file_{i}.rs") }),
+                name: tool.to_string(),
+                arguments: serde_json::json!({ "arg_{i}": i }),
                 tool_call_id: None,
             });
-            ordered.push(Some((
-                "file_read".to_string(),
-                None,
-                outcome(output, success),
-            )));
+            ordered.push(Some((tool.to_string(), None, outcome(output, success))));
         }
         collect_tool_results(
             ordered,
@@ -288,6 +290,72 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("loop detector"), "got: {err}");
+    }
+
+    #[test]
+    fn benign_identical_repeat_output_steers_without_aborting() {
+        // RCA fix #4, end-to-end: the verify-improvement SOP's runs died on
+        // "Circuit breaker: tool 'sop_status' called N times ... — no
+        // progress" AFTER their real work was done — an idempotent status
+        // read re-polled with different args returns the same status by
+        // design, and the breaker reaped the run for it. The benign-repeat
+        // class steers instead: the collection pass must SUCCEED (no
+        // bail), and the steering hint must land in history as a system
+        // message — i.e. injected into the agent's next prompt.
+        let (collected, history) =
+            run_named_with_history("sop_status", 8, "run-123: status=running steps=done")
+                .expect("a benign status read's identical-repeat trip must never abort the turn");
+        assert!(
+            collected.tool_results.contains("status=running"),
+            "the tool output itself must flow through unblocked: {}",
+            collected.tool_results
+        );
+        let hint = crate::agent::loop_detector::BENIGN_REPEAT_STEERING_HINT;
+        let system_text: String = history
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            system_text.contains("[Loop Detection]") && system_text.contains(hint),
+            "the steering hint must be injected into the agent's next prompt, got: {system_text}"
+        );
+    }
+
+    /// Like [`run_named`] but returns the conversation history alongside the
+    /// collected results, for asserting which system messages a detector
+    /// trip injected.
+    fn run_named_with_history(
+        tool: &str,
+        n: usize,
+        output: &str,
+    ) -> Result<(CollectedResults, Vec<ChatMessage>)> {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
+        for i in 0..n {
+            tool_calls.push(ParsedToolCall {
+                name: tool.to_string(),
+                arguments: serde_json::json!({ "arg_{i}": i }),
+                tool_call_id: None,
+            });
+            ordered.push(Some((tool.to_string(), None, outcome(output, true))));
+        }
+        let collected = collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )?;
+        Ok((collected, history))
     }
 
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {

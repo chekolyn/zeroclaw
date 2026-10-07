@@ -527,6 +527,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_exempt_tools: pacing.no_progress_exempt_tools.clone(),
+            benign_repeat_tools: pacing.benign_repeat_tools.clone(),
         },
     );
 
