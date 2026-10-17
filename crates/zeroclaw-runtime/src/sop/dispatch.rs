@@ -47,6 +47,50 @@ pub enum DispatchResult {
     NoMatch,
 }
 
+impl SopIngressOutcome {
+    /// Compact, log-ready summary of an ingress outcome. Every transport
+    /// adapter MUST log this after `dispatch`: the MQTT listener previously
+    /// DISCARDED the outcome (`ingress.dispatch(...).await;` — no match, no
+    /// log), which made a dedup'd `Skipped` indistinguishable from a dead
+    /// activation and manufactured a false outage hunt (2026-10-17 prod
+    /// evidence, run …821-0004 wake).
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NotInterested => "not-interested: no SOP declares this source".to_string(),
+            Self::Unavailable(reason) => format!("unavailable: {}", reason.as_str()),
+            Self::Dispatched(results) if results.is_empty() => {
+                "dispatched: (no results)".to_string()
+            }
+            Self::Dispatched(results) => {
+                let parts: Vec<String> = results
+                    .iter()
+                    .map(|result| match result {
+                        DispatchResult::Started {
+                            run_id, sop_name, ..
+                        } => format!("started {sop_name} run {run_id}"),
+                        DispatchResult::Skipped { sop_name, reason } => {
+                            format!("skipped {sop_name}: {reason}")
+                        }
+                        DispatchResult::Deferred { sop_name, reason } => {
+                            format!("deferred {sop_name}: {reason}")
+                        }
+                        DispatchResult::Coalesced {
+                            sop_name,
+                            existing_run_id,
+                        } => format!("coalesced {sop_name} into {existing_run_id}"),
+                        DispatchResult::BlockedUnsafe { sop_name, reason } => format!(
+                            "blocked-unsafe {}: {reason}",
+                            sop_name.as_deref().unwrap_or("?")
+                        ),
+                        DispatchResult::NoMatch => "no-match".to_string(),
+                    })
+                    .collect();
+                format!("dispatched: {}", parts.join("; "))
+            }
+        }
+    }
+}
+
 /// Why a fan-in event could not enter the shared SOP dispatch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SopIngressUnavailable {
@@ -3423,5 +3467,88 @@ mod tests {
             SopIngressKind::NotYetLive,
             "the exhaustive registry must not contradict the shipped HTTP routes"
         );
+    }
+
+    // T-B (2026-10-17 prod evidence): the MQTT listener discarded the dispatch
+    // outcome entirely (`ingress.dispatch(...).await;` — no match, no log), so a
+    // dedup'd `Skipped` was indistinguishable from a dead activation and
+    // manufactured a false outage hunt. `SopIngressOutcome::describe()` is the
+    // log-ready summary every transport adapter must log after `dispatch`;
+    // these pins hold the summary contract.
+    #[test]
+    fn describe_covers_every_ingress_outcome() {
+        assert_eq!(
+            SopIngressOutcome::NotInterested.describe(),
+            "not-interested: no SOP declares this source"
+        );
+        assert_eq!(
+            SopIngressOutcome::Unavailable(SopIngressUnavailable::EnginePoisoned).describe(),
+            "unavailable: engine_poisoned"
+        );
+        assert_eq!(
+            SopIngressOutcome::Dispatched(vec![]).describe(),
+            "dispatched: (no results)"
+        );
+    }
+
+    #[test]
+    fn describe_renders_every_dispatch_result_variant() {
+        let started = DispatchResult::Started {
+            run_id: "run-1".into(),
+            sop_name: "deploy-executor".into(),
+            action: Box::new(SopRunAction::ExecuteStep {
+                run_id: "run-1".into(),
+                step: SopStep {
+                    number: 1,
+                    title: "s".into(),
+                    body: "b".into(),
+                    ..SopStep::default()
+                },
+                context: String::new(),
+            }),
+        };
+        let results = vec![
+            started,
+            DispatchResult::Skipped {
+                sop_name: "deploy-executor".into(),
+                reason: "active claim".into(),
+            },
+            DispatchResult::Deferred {
+                sop_name: "deploy-executor".into(),
+                reason: "slots full".into(),
+            },
+            DispatchResult::Coalesced {
+                sop_name: "deploy-executor".into(),
+                existing_run_id: "run-9".into(),
+            },
+            DispatchResult::BlockedUnsafe {
+                sop_name: None,
+                reason: "schema-rejected".into(),
+            },
+            DispatchResult::NoMatch,
+        ];
+        let described = SopIngressOutcome::Dispatched(results).describe();
+        assert!(described.starts_with("dispatched: "), "{described}");
+        assert!(
+            described.contains("started deploy-executor run run-1"),
+            "{described}"
+        );
+        assert!(
+            described.contains("skipped deploy-executor: active claim"),
+            "{described}"
+        );
+        assert!(
+            described.contains("deferred deploy-executor: slots full"),
+            "{described}"
+        );
+        assert!(
+            described.contains("coalesced deploy-executor into run-9"),
+            "{described}"
+        );
+        assert!(
+            described.contains("blocked-unsafe ?: schema-rejected"),
+            "{described}"
+        );
+        assert!(described.contains("no-match"), "{described}");
     }
 }

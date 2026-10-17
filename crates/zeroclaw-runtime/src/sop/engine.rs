@@ -5305,13 +5305,31 @@ impl SopEngine {
         if timeout_secs == 0 {
             return 0;
         }
-        let stuck: Vec<String> = self
+        // Stuck = NO PROGRESS for the timeout, not wall-clock age since start
+        // (2026-10-17 prod evidence: run …503289556-0001 was reaped 86 seconds
+        // after a healthy step promotion — a 5-step run at ~9min/step crosses
+        // any wall-clock hour while never being stuck). The store's
+        // `last_progress_at` is bumped on every transition; a run with no
+        // store row yet falls back to its `started_at`.
+        let candidates: Vec<(String, String)> = self
             .active_runs
             .values()
             .filter(|r| r.status == SopRunStatus::Running)
-            .filter(|r| cooldown_elapsed(&r.started_at, timeout_secs))
-            .map(|r| r.run_id.clone())
+            .map(|r| (r.run_id.clone(), r.started_at.clone()))
             .collect();
+        let mut stuck: Vec<String> = Vec::new();
+        for (run_id, fallback) in candidates {
+            let progress_at = self
+                .store
+                .load_run(&run_id)
+                .ok()
+                .flatten()
+                .map(|row| row.last_progress_at)
+                .unwrap_or(fallback);
+            if cooldown_elapsed(&progress_at, timeout_secs) {
+                stuck.push(run_id);
+            }
+        }
         let mut reaped = 0;
         for run_id in stuck {
             match self.finish_run(
@@ -13100,8 +13118,11 @@ mod tests {
         );
     }
 
-    // T3: a SOP run stuck in `Running` longer than `stuck_run_timeout_secs` must
-    // be reaped to `Failed` by the maintenance tick.
+    // T3: a SOP run with NO PROGRESS for `stuck_run_timeout_secs` must be
+    // reaped to `Failed` by the maintenance tick. Stuck is measured by the
+    // store's `last_progress_at` (bumped on every transition), not wall-clock
+    // `started_at` (2026-10-17: a healthy run crossed the hour and was reaped
+    // mid-promotion; see reap_stuck_running_runs_spares_progressing_run_past_wall_clock).
     #[test]
     fn reap_stuck_running_runs_finalizes_overdue_runs() {
         let mut engine = SopEngine::new(SopConfig {
@@ -13116,10 +13137,13 @@ mod tests {
 
         let action = engine.start_run("s1", manual_event()).unwrap();
         let rid = extract_run_id(&action).to_string();
-        // Force the run's started_at to be ancient (well past the 60s timeout).
+        // Force the run's started_at to be ancient (well past the 60s timeout)
+        // AND backdate the store's progress stamp — stuck is measured by
+        // last_progress_at, so both must be ancient for a genuinely stuck run.
         if let Some(run) = engine.active_runs.get_mut(&rid) {
             run.started_at = "2020-01-01T00:00:00Z".to_string();
         }
+        store_progress_set(&mut engine, &rid, "2020-01-01T00:00:00Z");
 
         let summary = engine.run_maintenance_tick();
         assert_eq!(
@@ -13130,6 +13154,70 @@ mod tests {
         let finished = engine.finished_runs(None);
         assert_eq!(finished.len(), 1, "reaped run should land in finished_runs");
         assert!(matches!(finished[0].status, SopRunStatus::Failed));
+    }
+
+    // T4 (2026-10-17 prod evidence, run …503289556-0001): the reaper must age
+    // runs by PROGRESS — the store's `last_progress_at` ("bumped on every
+    // transition", the `PersistedRun` field's own contract) — not by wall-clock
+    // `started_at`. A healthy 5-step run at ~9min/step crosses any wall-clock
+    // hour while never being stuck: the proposer was killed 86 seconds after a
+    // clean step promotion at run-start+60.75min. Here the store row carries
+    // fresh progress while the in-memory `started_at` is ancient: survive.
+    fn store_progress_set(engine: &mut SopEngine, rid: &str, ts: &str) {
+        let run = engine
+            .active_runs
+            .get(rid)
+            .cloned()
+            .expect("run must be active");
+        match engine.store.load_run(rid).unwrap() {
+            Some(mut row) => {
+                row.revision += 1;
+                row.last_progress_at = ts.to_string();
+                engine.store.save_run(&row).unwrap();
+            }
+            None => {
+                engine
+                    .store
+                    .save_run(&PersistedRun::new(
+                        run,
+                        ts.to_string(),
+                        SopTriggerSource::Manual,
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reap_stuck_running_runs_spares_progressing_run_past_wall_clock() {
+        let mut engine = SopEngine::new(SopConfig {
+            stuck_run_timeout_secs: 60,
+            max_finished_runs: 10,
+            ..SopConfig::default()
+        });
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps = vec![sop.steps[0].clone()];
+        sop.max_concurrent = 10;
+        engine.sops = vec![sop];
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let rid = extract_run_id(&action).to_string();
+        if let Some(run) = engine.active_runs.get_mut(&rid) {
+            run.started_at = "2020-01-01T00:00:00Z".to_string();
+        }
+        // The store's progress stamp stays fresh (made explicit so the test
+        // does not depend on start-persist ordering).
+        store_progress_set(&mut engine, &rid, &now_iso8601());
+
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(
+            summary.reaped_stuck_runs, 0,
+            "a run whose last progress is fresh is not stuck, however old its wall-clock start"
+        );
+        assert!(
+            engine.active_runs.contains_key(&rid),
+            "progressing run must stay active"
+        );
     }
 
     #[test]

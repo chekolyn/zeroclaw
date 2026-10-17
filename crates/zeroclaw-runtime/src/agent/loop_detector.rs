@@ -25,6 +25,14 @@ pub struct LoopDetectorConfig {
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
+    /// Ping-pong (two-tool alternation) kill threshold, in full A→B cycles.
+    /// At `kill_cycles` the detector aborts the run (Break); at
+    /// `kill_cycles - 1` it refuses the call (Block); below that it warns.
+    /// Default 6 — the pre-config behavior (MIN_CYCLES 4 + 2). Raised
+    /// thresholds tolerate legitimate edit→test (TDD-shaped) alternation
+    /// without a rebuild (2026-10-17: a coder's 6-cycle write/shell loop was
+    /// aborted mid-run by the hardcoded threshold).
+    pub kill_cycles: usize,
     /// Tools exempt from the no-progress detector. These are typically
     /// read-only search tools that can legitimately return identical
     /// results for different queries (e.g. content_search returning
@@ -43,12 +51,16 @@ pub struct LoopDetectorConfig {
     pub benign_repeat_tools: Vec<String>,
 }
 
+/// The pre-config ping-pong kill threshold: `MIN_CYCLES + 2`.
+pub const DEFAULT_KILL_CYCLES: usize = 6;
+
 impl Default for LoopDetectorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: vec![
                 "content_search".to_string(),
                 "web_search_tool".to_string(),
@@ -345,12 +357,16 @@ impl LoopDetector {
             }
         }
 
-        if cycles >= MIN_CYCLES + 2 {
+        // Kill/block/warn ladder, threshold-driven: kill at `kill_cycles`,
+        // block at `kill_cycles - 1`, warn below. Clamped to the detection
+        // floor so a mis-set config can't disable the pattern entirely.
+        let kill = self.config.kill_cycles.max(MIN_CYCLES);
+        if cycles >= kill {
             Some(LoopDetectionResult::Break(format!(
                 "Circuit breaker: tools '{}' and '{}' have been alternating for {} cycles",
                 a_name, b_name, cycles
             )))
-        } else if cycles > MIN_CYCLES {
+        } else if cycles >= kill - 1 {
             Some(LoopDetectionResult::Block(format!(
                 "Blocked: tools '{}' and '{}' have been alternating for {} cycles",
                 a_name, b_name, cycles
@@ -454,6 +470,7 @@ mod tests {
             enabled: true,
             window_size: 20,
             max_repeats,
+            kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
         }
@@ -733,6 +750,7 @@ mod tests {
             enabled: true,
             window_size: 5,
             max_repeats: 3,
+            kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
         };
@@ -778,6 +796,52 @@ mod tests {
         }
     }
 
+    // T-C1 (2026-10-17 prod evidence, run …821-0004): the write-path kill at
+    // `MIN_CYCLES + 2 = 6` cycles aborted a legitimate edit→test coder loop
+    // (file_write/shell ping-pong) mid-run. The kill threshold becomes
+    // configurable so a TDD-shaped alternation can be tolerated without a
+    // rebuild. Default MUST stay 6 (behavior-preserving).
+    #[test]
+    fn ping_pong_default_kill_threshold_unchanged() {
+        let mut det = LoopDetector::new(default_config());
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "file_write" } else { "shell" };
+            let result = det.record(name, &json!({"i": i}), &format!("r{i}"));
+            if i == 11 {
+                assert!(
+                    matches!(result, LoopDetectionResult::Break(_)),
+                    "default kill threshold must stay 6 cycles: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ping_pong_kill_threshold_is_configurable() {
+        let config = LoopDetectorConfig {
+            enabled: true,
+            window_size: 20,
+            max_repeats: 3,
+            no_progress_exempt_tools: Vec::new(),
+            benign_repeat_tools: Vec::new(),
+            kill_cycles: 10,
+        };
+        let mut det = LoopDetector::new(config);
+        let mut last = LoopDetectionResult::Ok;
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "file_write" } else { "shell" };
+            last = det.record(name, &json!({"i": i}), &format!("r{i}"));
+            assert!(
+                !matches!(last, LoopDetectionResult::Break(_)),
+                "6-cycle edit-test alternation must not abort under kill_cycles=10: iteration {i}: {last:?}"
+            );
+        }
+        assert!(
+            matches!(last, LoopDetectionResult::Warning(_)),
+            "6 cycles below kill_cycles=10 escalates as a warning, got {last:?}"
+        );
+    }
+
     // ── Window eviction test ────────────────────────────────────
 
     #[test]
@@ -786,6 +850,7 @@ mod tests {
             enabled: true,
             window_size: 6,
             max_repeats: 3,
+            kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
         };
