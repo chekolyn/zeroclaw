@@ -8087,6 +8087,17 @@ mod tests {
             !matches!(action, SopRunAction::Skipped { .. }),
             "a Deterministic SOP with a Capability step must not be skipped, got {action:?}"
         );
+        // The single Capability step dispatches as a DeterministicStep
+        // action (upstream v0.8.6's driver-owned execution); drive it to
+        // completion through the headless seam.
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .drive_headless_deterministic(&run_id, action)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "the single capability step drains headlessly, got {action:?}"
+        );
         assert_eq!(
             engine.active_runs().len(),
             0,
@@ -9420,11 +9431,16 @@ mod tests {
             fail_save: std::sync::atomic::AtomicBool::new(false),
             fail_finish: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut engine = engine_with_sops(vec![test_sop(
+        // A tail Capability step keeps the SOP gateway-runnable: the fork's
+        // skip-at-dispatch would otherwise skip this all-Execute
+        // Deterministic SOP before a run exists (the sidecar-handling
+        // contract), and this test exercises the gateway's step-budget
+        // mechanics, which need a live run.
+        let mut engine = engine_with_sops(vec![with_tail_capability(test_sop(
             "s1",
             SopExecutionMode::Deterministic,
             SopPriority::Normal,
-        )])
+        ))])
         .with_store(store.clone());
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
@@ -14810,11 +14826,19 @@ mod tests {
             .unwrap();
         assert!(matches!(action, SopRunAction::DeterministicStep { .. }));
 
-        // Complete step 2
+        // Complete step 2 — the tail Capability step dispatches as a
+        // DeterministicStep action (upstream v0.8.6's driver-owned
+        // execution); drive it to completion through the headless seam.
         let action = engine
             .advance_deterministic_step(&run_id, serde_json::json!("s2"), None)
             .unwrap();
-        assert!(matches!(action, SopRunAction::Completed { .. }));
+        let action = engine
+            .drive_headless_deterministic(&run_id, action)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "second advance must complete the run, got {action:?}"
+        );
 
         // Check savings
         let savings = engine.deterministic_savings();
@@ -14964,7 +14988,11 @@ type = "manual"
         three.title = "Step three".into();
         three.decide = None;
         sop.steps.push(three);
-        let mut engine = engine_with_sops(vec![sop]);
+        // A tail Capability step keeps the SOP gateway-runnable (the fork's
+        // skip-at-dispatch contract handles all-Execute Deterministic SOPs
+        // on the sidecar path); the engine-level decision semantics need a
+        // live gateway run to exercise.
+        let mut engine = engine_with_sops(vec![with_tail_capability(sop)]);
 
         let action = engine
             .start_run_with_mode(
@@ -14992,8 +15020,14 @@ type = "manual"
             "step 1's output passes over the skip"
         );
 
+        // Upstream v0.8.6 dispatches a Capability step as a DeterministicStep
+        // action for the driver; drive it to completion through the headless
+        // seam.
         let action = engine
             .advance_deterministic_step(&run_id, serde_json::json!({"b": 2}), None)
+            .unwrap();
+        let action = engine
+            .drive_headless_deterministic(&run_id, action)
             .unwrap();
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
@@ -15010,6 +15044,9 @@ type = "manual"
                 (1, SopStepStatus::Completed),
                 (2, SopStepStatus::Skipped),
                 (3, SopStepStatus::Completed),
+                // Step 4 is the tail Capability step (with_tail_capability) —
+                // it runs through the headless drive alongside the rest.
+                (4, SopStepStatus::Completed),
             ]
         );
     }
@@ -15058,9 +15095,15 @@ type = "manual"
                 },
             )
             .unwrap();
+        // The tail Capability step dispatches as a DeterministicStep action
+        // (upstream v0.8.6's driver-owned execution); drive it to completion
+        // through the headless seam.
+        let action = engine
+            .drive_headless_deterministic(&run_id, action)
+            .unwrap();
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
-            "deterministic run should complete after its final step"
+            "deterministic run should complete after its final step, got {action:?}"
         );
     }
 
