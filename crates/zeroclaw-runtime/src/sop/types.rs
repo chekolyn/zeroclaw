@@ -1212,10 +1212,7 @@ pub enum SopRunAction {
     },
     /// No gateway-runnable (Capability) step — the SOP is handled externally
     /// (sidecar). No run was created; the reservation was released.
-    Skipped {
-        sop_name: String,
-        reason: String,
-    },
+    Skipped { sop_name: String, reason: String },
 }
 
 /// Exhaustive sample builder: one representative `SopTrigger` per source.

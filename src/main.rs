@@ -21273,7 +21273,7 @@ mod tests {
             execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
             steps: vec![SopStep {
                 number: 1,

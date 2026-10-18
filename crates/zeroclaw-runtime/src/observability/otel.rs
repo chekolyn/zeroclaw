@@ -3,12 +3,12 @@ use crate::agent::loop_::scrub_for_export;
 use crate::observability::otel_config::OtelContentConfig;
 use crate::util::{truncate_field, truncate_json_leaves};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use opentelemetry::propagation::TextMapCompositePropagator;
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
 use opentelemetry::{Context, KeyValue, global};
-use opentelemetry::propagation::TextMapCompositePropagator;
-use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
@@ -2437,7 +2437,7 @@ mod tests {
 
         use opentelemetry::baggage::{Baggage, BaggageExt};
         use opentelemetry::trace::{
-            SpanContext, SpanId, TraceContextExt as _, TraceId, TraceFlags, TraceState,
+            SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
         };
 
         let span_ctx = SpanContext::new(

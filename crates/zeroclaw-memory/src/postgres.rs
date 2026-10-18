@@ -482,7 +482,10 @@ impl Memory for PostgresMemory {
         // Apply `[memory] category_namespaces`: if the category maps to a
         // namespace, store under that namespace instead of the default.
         let category_key = Self::category_to_str(&category);
-        let ns = self.category_namespaces.get(&category_key).map(String::as_str);
+        let ns = self
+            .category_namespaces
+            .get(&category_key)
+            .map(String::as_str);
         self.store_with_agent(key, content, category, session_id, ns, None, None)
             .await
     }
@@ -814,7 +817,9 @@ impl Memory for PostgresMemory {
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
         let aid = agent_id.map(str::to_string);
-        let ns = namespace.map(str::to_string).unwrap_or_else(|| "default".to_string());
+        let ns = namespace
+            .map(str::to_string)
+            .unwrap_or_else(|| "default".to_string());
         let imp = importance.unwrap_or(0.5);
 
         run_on_os_thread(self.op_timeout, move || -> Result<()> {
@@ -825,8 +830,10 @@ impl Memory for PostgresMemory {
             let id = Uuid::new_v4().to_string();
             client.execute(
                 &stmt,
-                &[&id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp],
-            )?;;
+                &[
+                    &id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp,
+                ],
+            )?;
             Ok(())
         })
         .await
