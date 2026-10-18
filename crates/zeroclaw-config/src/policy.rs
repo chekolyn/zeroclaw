@@ -1016,6 +1016,14 @@ enum QuoteState {
     Double,
 }
 
+/// Public wrapper (C2's DRY ruling — the spec's §3.0): the shell-steering
+/// detector reuses THIS quote-aware segmentation (the `QuoteState` walkers,
+/// heredoc handling, escaped-char tracking) rather than hand-rolling a
+/// parser. The behavior is identical to the private fn.
+pub fn split_unquoted_segments_public(command: &str) -> Vec<String> {
+    split_unquoted_segments(command)
+}
+
 fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
