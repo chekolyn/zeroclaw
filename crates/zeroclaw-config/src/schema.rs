@@ -6890,6 +6890,15 @@ pub struct PacingConfig {
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
     pub loop_detection_no_progress_min_calls: usize,
 
+    /// Ping-pong (two-tool alternation) kill threshold in full A→B cycles:
+    /// at `kill_cycles` the run aborts, at `kill_cycles - 1` the call is
+    /// refused, below that it warns. Defaults to 6. Raise it to tolerate
+    /// legitimate edit→test (TDD-shaped) coder loops without a rebuild
+    /// (2026-10-17: a 6-cycle write/shell loop was aborted mid-run by the
+    /// hardcoded threshold).
+    #[serde(default)]
+    pub loop_detection_kill_cycles: Option<usize>,
+
     /// Read-only search tools exempt from the no-progress loop detector.
     /// These tools can legitimately return identical results (empty results,
     /// "not found", similar content) for different queries, so repeated
@@ -6957,6 +6966,7 @@ impl Default for PacingConfig {
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
             loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
+            loop_detection_kill_cycles: None,
             no_progress_exempt_tools: default_no_progress_exempt_tools(),
             benign_repeat_tools: default_benign_repeat_tools(),
         }
