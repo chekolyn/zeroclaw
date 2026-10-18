@@ -194,7 +194,8 @@ impl Tool for MqttPublishTool {
                     output: format!(
                         "published to {topic} (retain={retain}); \
                          note: if MQTT is unconfigured this was a no-op"
-                    ).into(),
+                    )
+                    .into(),
                     error: None,
                 })
             }

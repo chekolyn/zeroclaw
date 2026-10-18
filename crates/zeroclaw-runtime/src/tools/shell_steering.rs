@@ -40,7 +40,7 @@ impl SteerAdvice {
              `path` defaults to the workspace root). Shell grep is fine for \
              single files and pipe filters; recursive file search belongs to \
              content_search.",
-             self.suggestion
+            self.suggestion
         )
     }
 }
@@ -128,8 +128,8 @@ fn detect_in_stage(stage: &str) -> Option<SteerAdvice> {
     let first = tokens[0].as_str();
     let basename = first.rsplit('/').next().unwrap_or(first);
     let basename = basename.strip_suffix(".exe").unwrap_or(basename);
-    let is_grep = basename == "grep" || basename == "ggrep" || basename == "egrep"
-        || basename == "fgrep";
+    let is_grep =
+        basename == "grep" || basename == "ggrep" || basename == "egrep" || basename == "fgrep";
     if !is_grep {
         return None;
     }
@@ -146,7 +146,8 @@ fn detect_in_stage(stage: &str) -> Option<SteerAdvice> {
             i += 2; // skip the operand — a value, not a flag
             continue;
         }
-        if tok.starts_with("--include=") || tok.starts_with("--exclude=")
+        if tok.starts_with("--include=")
+            || tok.starts_with("--exclude=")
             || tok.starts_with("--include-dir=")
         {
             i += 1; // the = form carries its own value
@@ -158,8 +159,12 @@ fn detect_in_stage(stage: &str) -> Option<SteerAdvice> {
         if tok.contains('i') && tok.starts_with('-') && !tok.starts_with("--") && tok.len() > 2 {
             case_insensitive = true; // a combo carrying -i (e.g. -ril)
         }
-        if tok == "-l" || tok == "--files-with-matches"
-            || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('l') && tok.len() > 2)
+        if tok == "-l"
+            || tok == "--files-with-matches"
+            || (tok.starts_with('-')
+                && !tok.starts_with("--")
+                && tok.contains('l')
+                && tok.len() > 2)
         {
             files_with_matches = true;
         }
@@ -179,7 +184,10 @@ fn detect_in_stage(stage: &str) -> Option<SteerAdvice> {
     if files_with_matches {
         args["output_mode"] = json!("files_with_matches");
     }
-    Some(SteerAdvice { pattern, suggestion: args })
+    Some(SteerAdvice {
+        pattern,
+        suggestion: args,
+    })
 }
 
 /// The entry point (the rules registry's first rule — the spec's §3.0
@@ -190,8 +198,11 @@ fn detect_in_stage(stage: &str) -> Option<SteerAdvice> {
 /// cluster (`grep -n "see grep -ril usage" notes.md`) passes its
 /// single-file shape because its stage carries no recursive flag at a
 /// command position.
-pub fn detect_recursive_grep(command: &str) -> Option<SteerAdvice> {
-    let segments = zeroclaw_config::policy::split_unquoted_segments_public(command);
+pub fn detect_recursive_grep(
+    command: &str,
+    dialect: crate::platform::ShellDialect,
+) -> Option<SteerAdvice> {
+    let segments = zeroclaw_config::policy::split_unquoted_segments_public(command, dialect);
     for segment in &segments {
         // Pipe-split each segment into stages; a quoted | was already
         // kept inside its segment by the quote-aware splitting.
@@ -212,66 +223,119 @@ mod tests {
 
     #[test]
     fn refuses_basic_recursive() {
-        let a = detect_recursive_grep("grep -r x .").unwrap();
+        let a = detect_recursive_grep("grep -r x .", crate::platform::ShellDialect::Posix).unwrap();
         assert_eq!(a.pattern, "x");
     }
 
     #[test]
     fn refuses_uppercase_r() {
-        assert!(detect_recursive_grep("grep -R x dir").is_some());
+        assert!(
+            detect_recursive_grep("grep -R x dir", crate::platform::ShellDialect::Posix).is_some()
+        );
     }
 
     #[test]
     fn refuses_combos() {
-        for cmd in ["grep -ril x .", "grep -rn x .", "grep -rl x .", "grep -inr x ."] {
-            assert!(detect_recursive_grep(cmd).is_some(), "{cmd}");
+        for cmd in [
+            "grep -ril x .",
+            "grep -rn x .",
+            "grep -rl x .",
+            "grep -inr x .",
+        ] {
+            assert!(
+                detect_recursive_grep(cmd, crate::platform::ShellDialect::Posix).is_some(),
+                "{cmd}"
+            );
         }
     }
 
     #[test]
     fn refuses_long_form() {
-        assert!(detect_recursive_grep("grep --recursive x .").is_some());
+        assert!(
+            detect_recursive_grep("grep --recursive x .", crate::platform::ShellDialect::Posix)
+                .is_some()
+        );
     }
 
     #[test]
     fn refuses_flags_after_positional() {
         // The round-1 silent-false-negative class
-        let a = detect_recursive_grep("grep foo -r .").unwrap();
+        let a =
+            detect_recursive_grep("grep foo -r .", crate::platform::ShellDialect::Posix).unwrap();
         assert_eq!(a.pattern, "foo");
-        assert!(detect_recursive_grep("grep --include='*.rs' foo -R dir").is_some());
+        assert!(
+            detect_recursive_grep(
+                "grep --include='*.rs' foo -R dir",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn refuses_pipeline_recursive_stage() {
         // The whole command is refused pre-spawn — the recursive stage is
         // detected anywhere in the pipeline
-        assert!(detect_recursive_grep("grep -ril x . | grep -v y").is_some());
+        assert!(
+            detect_recursive_grep(
+                "grep -ril x . | grep -v y",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn refuses_path_prefixed() {
         // Basename matching (the round-2 ruling)
-        assert!(detect_recursive_grep("/bin/grep -r x .").is_some());
-        assert!(detect_recursive_grep("/usr/bin/ggrep -r x .").is_some());
+        assert!(
+            detect_recursive_grep("/bin/grep -r x .", crate::platform::ShellDialect::Posix)
+                .is_some()
+        );
+        assert!(
+            detect_recursive_grep(
+                "/usr/bin/ggrep -r x .",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_some()
+        );
     }
 
     // ── Pass: the legitimate shapes ──────────────────────────────────
 
     #[test]
     fn passes_single_file() {
-        assert!(detect_recursive_grep("grep -n x file.md").is_none());
+        assert!(
+            detect_recursive_grep("grep -n x file.md", crate::platform::ShellDialect::Posix)
+                .is_none()
+        );
     }
 
     #[test]
     fn passes_pipe_filter() {
-        assert!(detect_recursive_grep("ps aux | grep nginx").is_none());
-        assert!(detect_recursive_grep("cat out | grep -v /git/").is_none());
+        assert!(
+            detect_recursive_grep("ps aux | grep nginx", crate::platform::ShellDialect::Posix)
+                .is_none()
+        );
+        assert!(
+            detect_recursive_grep(
+                "cat out | grep -v /git/",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn passes_quoted_non_command_position() {
         // Quoted segments are data, not command positions
-        assert!(detect_recursive_grep("echo \"run grep -rn foo .\"").is_none());
+        assert!(
+            detect_recursive_grep(
+                "echo \"run grep -rn foo .\"",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -279,25 +343,41 @@ mod tests {
         // A single-file grep whose pattern MENTIONS -ril: no recursive
         // flag at a command position (the -e/-n flag scan sees the
         // quoted pattern as a positional, not a flag)
-        assert!(detect_recursive_grep("grep -n \"see grep -ril usage\" notes.md").is_none());
+        assert!(
+            detect_recursive_grep(
+                "grep -n \"see grep -ril usage\" notes.md",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn passes_e_operand() {
         // -e "-r" is an OPERAND, not a flag
-        assert!(detect_recursive_grep("grep -e \"-r\" file").is_none());
+        assert!(
+            detect_recursive_grep("grep -e \"-r\" file", crate::platform::ShellDialect::Posix)
+                .is_none()
+        );
     }
 
     #[test]
     fn passes_regexp_operand() {
-        assert!(detect_recursive_grep("grep --regexp \"-r\" file").is_none());
+        assert!(
+            detect_recursive_grep(
+                "grep --regexp \"-r\" file",
+                crate::platform::ShellDialect::Posix
+            )
+            .is_none()
+        );
     }
 
     // ── Flag parity + extraction (the spec's §4) ──────────────────────
 
     #[test]
     fn flag_parity_case_insensitive() {
-        let a = detect_recursive_grep("grep -ril x .").unwrap();
+        let a =
+            detect_recursive_grep("grep -ril x .", crate::platform::ShellDialect::Posix).unwrap();
         assert_eq!(a.suggestion["case_sensitive"], json!(false));
         assert_eq!(a.suggestion["output_mode"], json!("files_with_matches"));
         assert_eq!(a.suggestion["pattern"], json!("x"));
@@ -305,14 +385,16 @@ mod tests {
 
     #[test]
     fn flag_parity_files_with_matches() {
-        let a = detect_recursive_grep("grep -rl x .").unwrap();
+        let a =
+            detect_recursive_grep("grep -rl x .", crate::platform::ShellDialect::Posix).unwrap();
         assert_eq!(a.suggestion["output_mode"], json!("files_with_matches"));
         assert!(a.suggestion.get("case_sensitive").is_none());
     }
 
     #[test]
     fn refusal_message_names_content_search() {
-        let a = detect_recursive_grep("grep -r pattern .").unwrap();
+        let a = detect_recursive_grep("grep -r pattern .", crate::platform::ShellDialect::Posix)
+            .unwrap();
         let msg = a.refusal_message();
         assert!(msg.contains("content_search"));
         assert!(msg.contains("pattern"));

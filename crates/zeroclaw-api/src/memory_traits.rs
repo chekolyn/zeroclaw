@@ -802,7 +802,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         let new_content = match existing {
             Some(entry) => {
                 // Try JSON array append first
-                if let Ok(existing_val) = serde_json::from_str::<serde_json::Value>(&entry.content) {
+                if let Ok(existing_val) = serde_json::from_str::<serde_json::Value>(&entry.content)
+                {
                     if let serde_json::Value::Array(mut arr) = existing_val {
                         if let Ok(new_val) = serde_json::from_str(content) {
                             arr.push(new_val);
@@ -1368,13 +1369,24 @@ mod tests {
             tenant_id: None,
             agent_alias: None,
             agent_id: None,
+            principal_id: None,
         }
     }
 
     fn filtered_seed() -> Vec<MemoryEntry> {
         vec![
-            filtered_entry("sop1", "telemetry_sop", MemoryCategory::Custom("sop".into()), "sop:1"),
-            filtered_entry("hb1", "telemetry_heartbeat", MemoryCategory::Custom("heartbeat".into()), "hb:1"),
+            filtered_entry(
+                "sop1",
+                "telemetry_sop",
+                MemoryCategory::Custom("sop".into()),
+                "sop:1",
+            ),
+            filtered_entry(
+                "hb1",
+                "telemetry_heartbeat",
+                MemoryCategory::Custom("heartbeat".into()),
+                "hb:1",
+            ),
             filtered_entry("core1", "default", MemoryCategory::Core, "core:1"),
             filtered_entry("ws1", "ws", MemoryCategory::Daily, "ws:infra:id:1"),
         ]

@@ -242,10 +242,14 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
     // V3 schema fields (optional — old sources may lack them). When present,
     // preserve them so a sqlite→postgres migration keeps per-agent / per-session
     // context instead of flattening every row to the `default` agent.
-    let agent_id_expr = pick_optional_column_expr(&columns, &["agent_id"]).unwrap_or("NULL".to_string());
-    let session_id_expr = pick_optional_column_expr(&columns, &["session_id", "session"]).unwrap_or("NULL".to_string());
-    let namespace_expr = pick_optional_column_expr(&columns, &["namespace"]).unwrap_or("NULL".to_string());
-    let importance_expr = pick_optional_column_expr(&columns, &["importance"]).unwrap_or("NULL".to_string());
+    let agent_id_expr =
+        pick_optional_column_expr(&columns, &["agent_id"]).unwrap_or("NULL".to_string());
+    let session_id_expr = pick_optional_column_expr(&columns, &["session_id", "session"])
+        .unwrap_or("NULL".to_string());
+    let namespace_expr =
+        pick_optional_column_expr(&columns, &["namespace"]).unwrap_or("NULL".to_string());
+    let importance_expr =
+        pick_optional_column_expr(&columns, &["importance"]).unwrap_or("NULL".to_string());
 
     let sql = format!(
         "SELECT {key_expr} AS key, {content_expr} AS content, {category_expr} AS category, \
@@ -1017,9 +1021,9 @@ mod tests {
         config.memory.backend = "postgres.test".to_string();
         // No [storage.postgres.test] configured → storage resolution fails, but
         // the failure must NOT be the builder-path bail.
-        let err = target_memory_backend(&config)
-            .err()
-            .expect("postgres backend should error at storage resolution, not succeed with no storage");
+        let err = target_memory_backend(&config).err().expect(
+            "postgres backend should error at storage resolution, not succeed with no storage",
+        );
         let msg = err.to_string();
         assert!(
             !msg.contains(
@@ -1056,8 +1060,16 @@ mod tests {
         let agents = read_openclaw_sqlite_agents(&db_path).unwrap();
         assert_eq!(agents.len(), 2);
         // Order is unspecified; check both pairs are present.
-        assert!(agents.iter().any(|(id, alias)| id == "src-rocky-id" && alias == "rocky"));
-        assert!(agents.iter().any(|(id, alias)| id == "src-coder-id" && alias == "codereviewer"));
+        assert!(
+            agents
+                .iter()
+                .any(|(id, alias)| id == "src-rocky-id" && alias == "rocky")
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|(id, alias)| id == "src-coder-id" && alias == "codereviewer")
+        );
     }
 
     /// A source with no agents table (legacy) yields an empty agent list, so the

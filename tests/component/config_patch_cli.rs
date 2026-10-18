@@ -64,6 +64,7 @@ fn test_state(config: Config) -> AppState {
     let memory: Arc<dyn zeroclaw_memory::Memory> =
         Arc::new(NoneMemory::new("config-patch-cli-test"));
     AppState {
+        webhook_secret_hash: None,
         config: authority.live_handle(),
         config_authority: authority.clone(),
         agent_lifecycle: authority.agent_lifecycle(),

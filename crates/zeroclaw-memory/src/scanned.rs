@@ -78,9 +78,7 @@ impl<M: Memory> ::zeroclaw_api::attribution::Attributable for ScannedMemory<M> {
 /// summary (2026-10-18 prod evidence: one WARN per withheld entry emitted
 /// 17 identical records in a single second — pure log noise). Returns
 /// (count, unique kinds joined, up to three sample keys).
-fn summarize_withheld(
-    withheld: &[(String, Vec<String>)],
-) -> (usize, String, Vec<String>) {
+fn summarize_withheld(withheld: &[(String, Vec<String>)]) -> (usize, String, Vec<String>) {
     let count = withheld.len();
     let mut kinds: Vec<String> = Vec::new();
     for (_, entry_kinds) in withheld {
@@ -737,14 +735,20 @@ mod tests {
         let withheld = vec![
             ("k1".to_string(), vec!["read_secrets".to_string()]),
             ("k2".to_string(), vec!["read_secrets".to_string()]),
-            ("k3".to_string(), vec!["exfil".to_string(), "read_secrets".to_string()]),
+            (
+                "k3".to_string(),
+                vec!["exfil".to_string(), "read_secrets".to_string()],
+            ),
             ("k4".to_string(), vec!["exfil".to_string()]),
             ("k5".to_string(), vec!["read_secrets".to_string()]),
         ];
         let (count, kinds, samples) = summarize_withheld(&withheld);
         assert_eq!(count, 5);
         assert!(kinds.contains("read_secrets") && kinds.contains("exfil"));
-        assert_eq!(samples, vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]);
+        assert_eq!(
+            samples,
+            vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
+        );
     }
 
     #[test]

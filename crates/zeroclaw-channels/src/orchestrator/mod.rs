@@ -26830,7 +26830,6 @@ api_key = "anthropic-key"
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
-            sop_driver_sink: None,
         })
     }
 

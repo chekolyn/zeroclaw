@@ -218,62 +218,62 @@ impl<'a> SopIngress<'a> {
         // non-Send, which would break `tokio::spawn` callers (the MQTT SOP
         // listener). The span still covers every `.await` in the body.
         let __dispatch_body = async move {
-        let Some(engine) = self.engine else {
-            let reason = if self.audit.is_some() {
-                SopIngressUnavailable::MissingEngine
-            } else {
-                SopIngressUnavailable::MissingEngineAndAudit
-            };
-            log_ingress_unavailable(source, reason, topic);
-            return SopIngressOutcome::Unavailable(reason);
-        };
-
-        let max_bytes = match engine.lock() {
-            Ok(eng) => {
-                if !eng.wants_source(source) {
-                    return SopIngressOutcome::NotInterested;
-                }
-                eng.config().untrusted_payload_max_bytes
-            }
-            Err(e) => {
-                let reason = SopIngressUnavailable::EnginePoisoned;
-                crate::health::mark_component_error(
-                    "sop_dispatch",
-                    format!("SOP engine lock poisoned: {e}"),
-                );
+            let Some(engine) = self.engine else {
+                let reason = if self.audit.is_some() {
+                    SopIngressUnavailable::MissingEngine
+                } else {
+                    SopIngressUnavailable::MissingEngineAndAudit
+                };
                 log_ingress_unavailable(source, reason, topic);
                 return SopIngressOutcome::Unavailable(reason);
-            }
-        };
+            };
 
-        let Some(audit) = self.audit else {
-            let reason = SopIngressUnavailable::MissingAudit;
-            log_ingress_unavailable(source, reason, topic);
-            return SopIngressOutcome::Unavailable(reason);
-        };
+            let max_bytes = match engine.lock() {
+                Ok(eng) => {
+                    if !eng.wants_source(source) {
+                        return SopIngressOutcome::NotInterested;
+                    }
+                    eng.config().untrusted_payload_max_bytes
+                }
+                Err(e) => {
+                    let reason = SopIngressUnavailable::EnginePoisoned;
+                    crate::health::mark_component_error(
+                        "sop_dispatch",
+                        format!("SOP engine lock poisoned: {e}"),
+                    );
+                    log_ingress_unavailable(source, reason, topic);
+                    return SopIngressOutcome::Unavailable(reason);
+                }
+            };
 
-        let results = dispatch_untrusted_fan_in_inner(
-            engine,
-            audit,
-            PreparedSopIngress {
-                source,
-                topic,
-                payload,
-                target_sop,
-                delivery_dedup,
-                active_dedup,
-                max_bytes,
-            },
-        )
-        .await;
-        if let Some(sink) = self.driver_sink {
-            for result in &results {
-                if let DispatchResult::Started { action, .. } = result {
-                    sink.drive(action);
+            let Some(audit) = self.audit else {
+                let reason = SopIngressUnavailable::MissingAudit;
+                log_ingress_unavailable(source, reason, topic);
+                return SopIngressOutcome::Unavailable(reason);
+            };
+
+            let results = dispatch_untrusted_fan_in_inner(
+                engine,
+                audit,
+                PreparedSopIngress {
+                    source,
+                    topic,
+                    payload,
+                    target_sop,
+                    delivery_dedup,
+                    active_dedup,
+                    max_bytes,
+                },
+            )
+            .await;
+            if let Some(sink) = self.driver_sink {
+                for result in &results {
+                    if let DispatchResult::Started { action, .. } = result {
+                        sink.drive(action);
+                    }
                 }
             }
-        }
-        SopIngressOutcome::Dispatched(results)
+            SopIngressOutcome::Dispatched(results)
         };
         ::zeroclaw_log::Instrument::instrument(__dispatch_body, span).await
     }
@@ -3809,7 +3809,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     mod decision_gating {
         use super::*;
         use crate::sop::decision::{
@@ -4252,7 +4251,7 @@ mod tests {
             }
             assert!(misses.is_empty(), "decision misses:\n{}", misses.join("\n"));
         }
-=======
+    }
     // T-B (2026-10-17 prod evidence): the MQTT listener discarded the dispatch
     // outcome entirely (`ingress.dispatch(...).await;` — no match, no log), so a
     // dedup'd `Skipped` was indistinguishable from a dead activation and
@@ -4289,6 +4288,7 @@ mod tests {
                     ..SopStep::default()
                 },
                 context: String::new(),
+                execution_witness: None,
             }),
         };
         let results = vec![
@@ -4334,6 +4334,5 @@ mod tests {
             "{described}"
         );
         assert!(described.contains("no-match"), "{described}");
->>>>>>> 8e15cd6aa (tune(runtime): the apply-lane guard tunes — evidence from the 2026-10-17 prod run deaths (#3))
     }
 }

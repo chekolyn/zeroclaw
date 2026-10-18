@@ -103,9 +103,7 @@ impl Tool for MemoryStoreTool {
         }
 
         let result = if append {
-            self.memory
-                .store_append(key, content, category, None)
-                .await
+            self.memory.store_append(key, content, category, None).await
         } else {
             self.memory.store(key, content, category, None).await
         };
@@ -260,10 +258,7 @@ mod tests {
         assert!(entry.content.contains("line1"));
         assert!(entry.content.contains("line2"));
         // Newline separator between them
-        assert!(
-            entry.content == "line1\nline2"
-                || entry.content == "line2\nline1"
-        );
+        assert!(entry.content == "line1\nline2" || entry.content == "line2\nline1");
     }
 
     #[tokio::test]

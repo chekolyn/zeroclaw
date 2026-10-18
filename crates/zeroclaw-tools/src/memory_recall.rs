@@ -187,12 +187,13 @@ impl Tool for MemoryRecallTool {
         // `scope = "all"` is the audit/debug escape hatch: skip the
         // config-sourced excludes and recall verbatim. Default ("filtered")
         // applies the three-axis excludes via `recall_filtered`.
-        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("filtered");
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("filtered");
         let skip_excludes = scope.eq_ignore_ascii_case("all");
         let recall_result = if skip_excludes {
-            self.memory
-                .recall(query, limit, None, since, until)
-                .await
+            self.memory.recall(query, limit, None, since, until).await
         } else {
             self.memory
                 .recall_filtered(query, limit, None, since, until, &self.excludes)
@@ -212,7 +213,11 @@ impl Tool for MemoryRecallTool {
                 let key_prefix_f = args.get("key_prefix").and_then(|v| v.as_str());
                 let entries: Vec<_> = entries
                     .into_iter()
-                    .filter(|e| category_f.map_or(true, |c| e.category.to_string().to_lowercase() == c.to_lowercase()))
+                    .filter(|e| {
+                        category_f.map_or(true, |c| {
+                            e.category.to_string().to_lowercase() == c.to_lowercase()
+                        })
+                    })
                     .filter(|e| namespace_f.map_or(true, |ns| e.namespace == ns))
                     .filter(|e| key_prefix_f.map_or(true, |kp| e.key.starts_with(kp)))
                     .collect();
@@ -525,15 +530,18 @@ mod tests {
     #[tokio::test]
     async fn recall_prefix_returns_only_matching_keys() {
         let (_tmp, mem) = seeded_mem();
-        mem.store("proj:a:1", "first", MemoryCategory::Core, None).await.unwrap();
-        mem.store("proj:a:2", "second", MemoryCategory::Core, None).await.unwrap();
-        mem.store("proj:b:1", "third", MemoryCategory::Core, None).await.unwrap();
-
-        let tool = MemoryRecallTool::new(mem);
-        let result = tool
-            .execute(json!({"prefix": "proj:a:"}))
+        mem.store("proj:a:1", "first", MemoryCategory::Core, None)
             .await
             .unwrap();
+        mem.store("proj:a:2", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("proj:b:1", "third", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"prefix": "proj:a:"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("proj:a:1"));
         assert!(result.output.contains("proj:a:2"));
@@ -566,7 +574,9 @@ mod tests {
     #[tokio::test]
     async fn recall_prefix_empty_returns_nothing() {
         let (_tmp, mem) = seeded_mem();
-        mem.store("some_key", "value", MemoryCategory::Core, None).await.unwrap();
+        mem.store("some_key", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
 
         let tool = MemoryRecallTool::new(mem);
         let result = tool
@@ -656,9 +666,14 @@ mod tests {
     #[tokio::test]
     async fn filtered_scope_category_exclude_exact_match() {
         let (_tmp, mem) = seeded_mem();
-        mem.store("sop:1", "SOP runbook", MemoryCategory::Custom("sop".into()), None)
-            .await
-            .unwrap();
+        mem.store(
+            "sop:1",
+            "SOP runbook",
+            MemoryCategory::Custom("sop".into()),
+            None,
+        )
+        .await
+        .unwrap();
         mem.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();

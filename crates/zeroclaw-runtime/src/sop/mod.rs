@@ -3397,7 +3397,7 @@ mod tests {
     fn cron_sop(steps: Vec<SopStep>, agent: Option<&str>) -> Sop {
         Sop {
             triggers: vec![SopTrigger::Cron {
-                expression: "* * * * *".into(),
+                expression: Some("* * * * *".into()),
             }],
             agent: agent.map(str::to_string),
             ..authoring_sop(steps)
