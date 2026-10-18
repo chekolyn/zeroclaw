@@ -9,7 +9,7 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 
 use zeroclaw_config::schema::MqttConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::SopIngress;
+use zeroclaw_runtime::sop::dispatch::{SopIngress, SopIngressOutcome};
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::SopTriggerSource;
 
@@ -81,7 +81,11 @@ pub async fn run_mqtt_sop_listener(
                 if let Some(sink) = driver_sink.as_ref() {
                     ingress = ingress.with_driver_sink(sink);
                 }
-                ingress
+                // The outcome MUST be logged: discarding it made a dedup'd
+                // `Skipped` indistinguishable from a dead activation at the
+                // listener (2026-10-17 prod evidence). describe() carries the
+                // per-result summary; Unavailable is WARN-worthy, the rest INFO.
+                let outcome = ingress
                     .dispatch(
                         SopTriggerSource::Mqtt,
                         Some(&msg.topic),
@@ -90,6 +94,25 @@ pub async fn run_mqtt_sop_listener(
                         None,
                     )
                     .await;
+                let summary = outcome.describe();
+                let attrs = ::serde_json::json!({
+                    "topic": msg.topic,
+                    "outcome": summary,
+                });
+                match &outcome {
+                    SopIngressOutcome::Unavailable(_) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(attrs),
+                        &format!("MQTT SOP dispatch: {summary}")
+                    ),
+                    _ => ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(attrs),
+                        &format!("MQTT SOP dispatch: {summary}")
+                    ),
+                }
             }
                     Event::Incoming(Packet::ConnAck(_)) => {
                         ::zeroclaw_log::record!(
