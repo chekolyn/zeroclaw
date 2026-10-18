@@ -98,6 +98,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r'session_id == "cron"',
         "min_count": 1,
     },
+    "sop-active-scope": {
+        "glob": "crates/zeroclaw-runtime/src/sop/active_scope.rs",
+        "pattern": r"HeadlessStepScope",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
