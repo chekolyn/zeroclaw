@@ -24,7 +24,13 @@ use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputForm
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
-const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+/// Wall-clock bound for shell cron jobs (2026-10-18: raised from 120 — the
+/// coder-test-health-sweep's coverage suite legitimately runs minutes on the
+/// in-pod ARM hardware and was killed at 120s every 6h, 5+ consecutive
+/// runs; the fleet's shell crons are otherwise sub-second probes that
+/// complete on their own, so the bound only matters for hung jobs, which
+/// now take 15 min to clear instead of 2).
+const SHELL_JOB_TIMEOUT_SECS: u64 = 900;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
