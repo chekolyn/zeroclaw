@@ -26,6 +26,10 @@ const SOURCE_TREES: [&str; 2] = [
 /// First-party tools with a literal name that stay out of the inventory, and why.
 const OUTSIDE_INVENTORY: &[(&str, &str)] = &[
     (
+        "mqtt_publish",
+        "cheknet fork tool — the event-driven swarm's MQTT bus publisher; registered in the runtime's tool registry (tools/mod.rs), not part of upstream's built-in inventory",
+    ),
+    (
         "sessions_reset",
         "implemented, but the agent registry does not register it",
     ),
