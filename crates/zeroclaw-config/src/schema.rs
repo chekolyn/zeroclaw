@@ -7662,6 +7662,8 @@ impl CostRatesConfig {
     /// Reject rate-sheet values that cannot represent a real USD price.
     /// Deliberate zero-cost entries remain valid and distinguish a configured
     /// free resource from one whose pricing is unavailable.
+    ///
+
     pub fn validate(&self) -> Result<()> {
         fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
             if let Some(value) = value
@@ -13996,6 +13998,50 @@ fn default_always_ask() -> Vec<String> {
 }
 
 impl RiskProfileConfig {
+    /// Wired into [`Config::validate`] so a bad map fails config parsing
+    /// loudly instead of silently arming an exemption that subtracts
+    /// nothing (typo, dead value) or carves an unintended deny rule.
+    fn validate_arg_deny_exemptions(&self, profile_alias: &str) -> Result<(), String> {
+        for (command, tokens) in &self.arg_deny_exemptions {
+            let Some(entries) = crate::policy::deny_entries_for(command) else {
+                let hint = Self::ARG_DENY_EXEMPTION_KEYS_HINT;
+                return Err(format!(
+                    "risk_profiles.{profile_alias}.arg_deny_exemptions: unknown command key '{command}'; keys must name \
+                     one of the built-in arg-deny commands ({hint})"
+                ));
+            };
+            for token in tokens {
+                if token.is_empty() {
+                    return Err(format!(
+                        "risk_profiles.{profile_alias}.arg_deny_exemptions.{command}: values must not be empty"
+                    ));
+                }
+                if token == "*" {
+                    return Err(format!(
+                        "risk_profiles.{profile_alias}.arg_deny_exemptions.{command}: '*' is not a valid exemption; name a \
+                         specific deny entry of the '{command}' arm instead"
+                    ));
+                }
+                if token.chars().any(char::is_whitespace) {
+                    return Err(format!(
+                        "risk_profiles.{profile_alias}.arg_deny_exemptions.{command}: '{token}' must not contain whitespace"
+                    ));
+                }
+                if !entries.iter().any(|entry| entry.token == token.as_str()) {
+                    let valid = entries
+                        .iter()
+                        .map(|entry| entry.token)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "risk_profiles.{profile_alias}.arg_deny_exemptions.{command}: '{token}' is not a deny entry of the \
+                         '{command}' arm (case-sensitive comparison); valid: {valid}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
     /// Legacy serialized marker used by older operators to represent an
     /// explicit deny-all profile before `deny_all_tools` existed.
     pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
@@ -14068,64 +14114,6 @@ impl RiskProfileConfig {
     const ARG_DENY_EXEMPTION_KEYS_HINT: &str =
         "cargo, find, git, node, npm, pip, pip3, python, python3";
 
-    /// Validate [`Self::arg_deny_exemptions`] against the hardcoded
-    /// deny-entry table ([`crate::policy::deny_entries_for`]).
-    ///
-    /// Comparison semantics (pinned — the cased-entry near-miss is a
-    /// config-injection carve if folded):
-    /// - keys compare **exactly** against the table's lowercased command
-    ///   names: `Python = ["-c"]` is an unknown-key error;
-    /// - values compare **case-sensitively** against the entry tokens AS
-    ///   STORED: the `git` arm's cased `-c` entry exempts only `-c`, never
-    ///   `-C` — case-folding here would re-open `git -c` config injection;
-    /// - key validation precedes the empty-list no-op: an unknown key with
-    ///   an empty list is still an error, while a known key with an empty
-    ///   list exempts nothing (today's behavior).
-    ///
-    /// Wired into [`Config::validate`] so a bad map fails config parsing
-    /// loudly instead of silently arming an exemption that subtracts
-    /// nothing (typo, dead value) or carves an unintended deny rule.
-    fn validate_arg_deny_exemptions(&self) -> Result<(), String> {
-        for (command, tokens) in &self.arg_deny_exemptions {
-            let Some(entries) = crate::policy::deny_entries_for(command) else {
-                let hint = Self::ARG_DENY_EXEMPTION_KEYS_HINT;
-                return Err(format!(
-                    "arg_deny_exemptions: unknown command key '{command}'; keys must name \
-                     one of the built-in arg-deny commands ({hint})"
-                ));
-            };
-            for token in tokens {
-                if token.is_empty() {
-                    return Err(format!(
-                        "arg_deny_exemptions.{command}: values must not be empty"
-                    ));
-                }
-                if token == "*" {
-                    return Err(format!(
-                        "arg_deny_exemptions.{command}: '*' is not a valid exemption; name a \
-                         specific deny entry of the '{command}' arm instead"
-                    ));
-                }
-                if token.chars().any(char::is_whitespace) {
-                    return Err(format!(
-                        "arg_deny_exemptions.{command}: '{token}' must not contain whitespace"
-                    ));
-                }
-                if !entries.iter().any(|entry| entry.token == token.as_str()) {
-                    let valid = entries
-                        .iter()
-                        .map(|entry| entry.token)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(format!(
-                        "arg_deny_exemptions.{command}: '{token}' is not a deny entry of the \
-                         '{command}' arm (case-sensitive comparison); valid: {valid}"
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 fn parse_sandbox_backend(name: &str) -> SandboxBackend {
@@ -24980,6 +24968,17 @@ impl Config {
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
             }
+        }
+
+        // `arg_deny_exemptions` must name LIVE deny entries: a key that is
+        // not a deny-arm command, or a value that is not a token of that
+        // arm, would validate as accepted and then silently no-op at
+        // enforcement time (the exemption consult only lifts entries the
+        // table actually carries). Fail loud at parse time instead.
+        for (profile_alias, profile) in self.risk_profiles.iter() {
+            profile
+                .validate_arg_deny_exemptions(profile_alias)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         // Inbound authentication & principals (RFC 7141): one auth-specific

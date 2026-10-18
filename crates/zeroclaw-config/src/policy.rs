@@ -3790,12 +3790,20 @@ impl SecurityPolicy {
         // git delegation hardening (upstream v0.8.6): subcommands such as
         // `remote-https`/`upload-pack` exec external transports. A
         // structural check over the cased args, not a token entry, so it
-        // is not exemption-eligible.
-        if base == "git" && git_delegates_to_external_command(args_cased) {
-            return Err(CommandRejection::ArgDeny {
-                command: base,
-                entry: "<external delegation>".into(),
-            });
+        // is not exemption-eligible. SKIPPED when the effective subcommand
+        // is one the deny table itself models (`config`/`alias`) — the
+        // table + the clause-equality exemption own those verdicts; the
+        // structural check must not preempt an exemption the config
+        // validation admitted.
+        if base == "git" {
+            let table_modeled = git_effective_subcommand_index(args_cased)
+                .is_some_and(|idx| matches!(args_cased[idx].as_str(), "config" | "alias"));
+            if !table_modeled && git_delegates_to_external_command(args_cased) {
+                return Err(CommandRejection::ArgDeny {
+                    command: base,
+                    entry: "<external delegation>".into(),
+                });
+            }
         }
         // Argument denies are table-driven: `deny_entries_for` reifies the
         // per-command arms (token — predicate — case domain) as the single
