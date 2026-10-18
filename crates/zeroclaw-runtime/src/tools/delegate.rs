@@ -2632,7 +2632,7 @@ impl DelegateTool {
     async fn settle_background_task(
         store: &dyn crate::control_plane::TaskRegistry,
         result_path: &Path,
-        result: BackgroundDelegateOutput,
+        result: BackgroundDelegateResult,
         terminal_status: crate::control_plane::TaskStatus,
         terminal_error: Option<String>,
         owner_pid: u32,
@@ -2752,7 +2752,7 @@ impl DelegateTool {
     async fn complete_background_task(
         store: &dyn crate::control_plane::TaskRegistry,
         result_path: &Path,
-        result: BackgroundDelegateOutput,
+        result: BackgroundDelegateResult,
         terminal_status: crate::control_plane::TaskStatus,
         terminal_error: Option<String>,
         owner_pid: u32,
@@ -4327,29 +4327,23 @@ impl DelegateTool {
                     }
                 };
 
-                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
-
-                if let Some(cp) = crate::control_plane::control_plane() {
-                    let cp_status = match final_result.status {
-                        BackgroundTaskStatus::Completed => {
-                            crate::control_plane::TaskStatus::Completed
-                        }
-                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
-                        BackgroundTaskStatus::Cancelled => {
-                            crate::control_plane::TaskStatus::Cancelled
-                        }
-                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
-                    };
-                    let _ = cp
-                        .store
-                        .update_status(
-                            &task_id_clone,
-                            cp_status,
-                            final_result.output.clone(),
-                            final_result.error.clone(),
-                        )
-                        .await;
-                }
+                // Settle through the tool's INJECTED task store (the same
+                // registry the pre-spawn TaskRecord and the await/reader
+                // paths use) — the v0.8.6 control-plane-first lifecycle.
+                // The settlement serializes the fork's superset
+                // `BackgroundDelegateResult` (the sidecar's top-level
+                // contract: agent/status + the R4 event fields stay direct
+                // keys; upstream's reader parses it via the legacy path).
+                let _won = DelegateTool::complete_background_task(
+                    terminal_store.as_ref(),
+                    &result_path,
+                    final_result,
+                    terminal_status,
+                    terminal_error,
+                    terminal_owner_pid,
+                    terminal_owner_boot_id,
+                )
+                .await;
 
                 // R3: publish terminal event to the MQTT bus for the
                 // event-driven swarm engine. No-op when mqtt unconfigured.
@@ -4407,8 +4401,6 @@ impl DelegateTool {
                     });
                 }
 
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels().lock().remove(&task_id_clone);
 
                 // Release both admissions only after the terminal result write
                 // completed (success, failure, or cancellation settlement):
@@ -6824,6 +6816,27 @@ mod tests {
         assert!(value.get("finished_at").is_none());
     }
 
+    /// A minimal [`BackgroundDelegateResult`] for settlement tests: the
+    /// fork's sidecar-facing superset type (the v0.8.6 settlement path
+    /// serializes THIS shape so the persisted artifact stays the top-level
+    /// legacy contract the zc-engine sidecar reads).
+    fn lean_result(task_id: &str, output: Option<String>) -> BackgroundDelegateResult {
+        BackgroundDelegateResult {
+            task_id: task_id.to_string(),
+            agent: "main".to_string(),
+            status: BackgroundTaskStatus::Completed,
+            output,
+            error: None,
+            started_at: "2026-06-21T00:00:00Z".to_string(),
+            finished_at: None,
+            project_id: None,
+            milestone_id: None,
+            chain_id: None,
+            ttl_seconds: default_ttl_seconds(),
+            session_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn output_failure_is_recorded_as_the_terminal_task_failure() {
         let store = SqliteTaskStore::new_in_memory().unwrap();
@@ -6834,10 +6847,7 @@ mod tests {
             .unwrap();
         let temp = TempDir::new().unwrap();
         let missing_parent = temp.path().join("missing").join(format!("{task_id}.json"));
-        let result = BackgroundDelegateOutput {
-            task_id: task_id.into(),
-            output: Some("done".into()),
-        };
+        let result = lean_result(task_id, Some("done".into()));
 
         assert!(
             DelegateTool::settle_background_task(
@@ -6890,10 +6900,7 @@ mod tests {
         let won = DelegateTool::complete_background_task(
             store.as_ref(),
             Path::new("relative-delegate-results/task.json"),
-            BackgroundDelegateOutput {
-                task_id: task_id.into(),
-                output: Some("done".into()),
-            },
+            lean_result(task_id, Some("done".into())),
             TaskStatus::Completed,
             None,
             0,
@@ -6947,10 +6954,7 @@ mod tests {
         let settled = DelegateTool::settle_background_task(
             store.as_ref(),
             Path::new("relative-delegate-results/task.json"),
-            BackgroundDelegateOutput {
-                task_id: task_id.into(),
-                output: Some("stale output".into()),
-            },
+            lean_result(task_id, Some("stale output".into())),
             TaskStatus::Completed,
             None,
             7,
@@ -7129,10 +7133,7 @@ mod tests {
             .unwrap();
         let temp = TempDir::new().unwrap();
         let result_path = temp.path().join(format!("{task_id}.json"));
-        let result = BackgroundDelegateOutput {
-            task_id: task_id.into(),
-            output: Some("done".into()),
-        };
+        let result = lean_result(task_id, Some("done".into()));
 
         assert!(
             DelegateTool::settle_background_task(
@@ -7175,10 +7176,7 @@ mod tests {
         let results_dir = temp.path().join("delegate_results");
         tokio::fs::create_dir_all(&results_dir).await.unwrap();
         let result_path = results_dir.join(format!("{task_id}.json"));
-        let result = BackgroundDelegateOutput {
-            task_id: task_id.into(),
-            output: Some("done".into()),
-        };
+        let result = lean_result(task_id, Some("done".into()));
         let bytes = DelegateTool::serialize_result(&result).unwrap();
         tokio::fs::write(&result_path, &bytes).await.unwrap();
         store
@@ -7216,7 +7214,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(
+            state,
+            BackgroundResultState::Completed,
+            "view error: {error:?}; view: {view}"
+        );
         assert_eq!(view["output"], "done");
         assert!(error.is_none());
     }
@@ -7290,10 +7292,7 @@ mod tests {
 
         tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
         let result_path = tool.results_dir().join(format!("{task_id}.json"));
-        let result = BackgroundDelegateOutput {
-            task_id: task_id.into(),
-            output: Some("recovered child output".into()),
-        };
+        let result = lean_result(task_id, Some("recovered child output".into()));
         let bytes = DelegateTool::serialize_result(&result).unwrap();
         DelegateTool::write_bytes_atomic(&result_path, &bytes)
             .await
@@ -7370,10 +7369,7 @@ mod tests {
         );
         let temp = TempDir::new().unwrap();
         let result_path = temp.path().join(format!("{task_id}.json"));
-        let result = BackgroundDelegateOutput {
-            task_id: task_id.into(),
-            output: Some("late output".into()),
-        };
+        let result = lean_result(task_id, Some("late output".into()));
 
         assert!(
             !DelegateTool::settle_background_task(

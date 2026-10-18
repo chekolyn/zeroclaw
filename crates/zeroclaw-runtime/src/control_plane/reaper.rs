@@ -65,11 +65,24 @@ async fn artifact_validation_error(intent: &TerminalSettlementIntent) -> Option<
         ));
     }
 
+    // The identity check parses minimally (task_id + output shape) rather
+    // than via the lean `BackgroundDelegateOutput` type: the cheknet fork's
+    // settlement serializes the superset `BackgroundDelegateResult` (the
+    // sidecar's top-level contract — agent/status + the R4 event fields are
+    // direct keys), and a deny-unknown-fields lean parse would reject every
+    // fork-settled artifact at recovery time. The fields the check needs are
+    // the same in both shapes.
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct DelegateOutputIdentity {
         task_id: String,
+        #[serde(default)]
         output: serde_json::Value,
+        #[serde(default)]
+        #[allow(dead_code)]
+        agent: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        status: Option<serde_json::Value>,
     }
 
     match serde_json::from_slice::<DelegateOutputIdentity>(&bytes) {
