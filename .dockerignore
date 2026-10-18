@@ -10,9 +10,11 @@ target
 web/node_modules
 web/dist
 
-# Documentation and examples (not needed for runtime)
+# Documentation (not needed for runtime). NOTE: crate-level `examples/`
+# directories must SHIP — v0.8.6's zeroclaw-plugins declares
+# `examples/sign_manifest.rs` as a cargo example target, and cargo fails
+# manifest parse when a declared example is absent from the context.
 docs
-examples
 
 # Markdown files (README, CHANGELOG, etc.)
 *.md
