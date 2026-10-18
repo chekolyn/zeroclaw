@@ -65,6 +65,11 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
     timeout_secs: u64,
+    /// C2 — the recursive-grep steering guard's enable flag (the spec's
+    /// §3.3: read DIRECTLY from `root_config.shell_tool` at the
+    /// `tools/mod.rs` construction site — the anti-shadow decision, NOT
+    /// a SecurityPolicy copy path).
+    steer_recursive_grep: bool,
     /// Environment forwarded from the connected TUI client. When set, these
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
@@ -85,6 +90,7 @@ impl ShellTool {
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
             timeout_secs,
+            steer_recursive_grep: true,
             tui_env: None,
             persistent_writes: true,
         }
@@ -101,9 +107,18 @@ impl ShellTool {
             runtime,
             sandbox,
             timeout_secs,
+            steer_recursive_grep: true,
             tui_env: None,
             persistent_writes: true,
         }
+    }
+
+    /// C2 — set the recursive-grep steering guard's enable flag (the
+    /// construction-site direct read — see tools/mod.rs, where this is
+    /// called with `root_config.shell_tool.steer_recursive_grep`).
+    pub fn with_steer_recursive_grep(mut self, steer: bool) -> Self {
+        self.steer_recursive_grep = steer;
+        self
     }
 
     pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
@@ -279,6 +294,27 @@ impl Tool for ShellTool {
                 output: ToolOutput::default(),
                 error: Some(format!("Path blocked by security policy: {path}")),
             });
+        }
+
+        // C2 — the recursive-grep steering guard (spec:
+        // `docs/superpowers/specs/2026-10-18-c2-unscoped-grep-steering-design.md`,
+        // quorum-approved R3-clean 2026-10-18). The whole command is refused
+        // PRE-SPAWN when it carries a recursive grep shape; the refusal IS
+        // the steer (the same UX channel as a policy denial — "a denial is
+        // a rephrase request, not a breakage"), with the extracted pattern
+        // as a ready-to-call content_search suggestion. 2026-10-18 prod
+        // evidence: the recursive-grep class burned 3× 60s kills + retries
+        // + LLM round-trips per step in the deploy-executor traces.
+        if self.steer_recursive_grep {
+            if let Some(advice) =
+                crate::tools::shell_steering::detect_recursive_grep(command)
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(advice.refusal_message()),
+                });
+            }
         }
 
         // Execute with timeout to prevent hanging commands.
