@@ -447,12 +447,12 @@ impl LoopDetector {
             )));
         }
 
-        if count >= min_calls + 2 {
-            Some(LoopDetectionResult::Break(format!(
-                "Circuit breaker: tool '{}' called {} times with different arguments but identical results — no progress",
-                last.name, count
-            )))
-        } else if count > min_calls {
+        // Upstream v0.8.6 pinned the no-progress ladder to cap at Block
+        // ("this pattern caps at Block — it never terminates the turn");
+        // the fork's v0.8.5-era Break arm at min_calls+2 is dropped in the
+        // v0.8.6 realignment — the kill cases own by the idle-aware
+        // stuck-run reaper and the config-gated ping-pong kill_cycles.
+        if count > min_calls {
             Some(LoopDetectionResult::Block(format!(
                 "Blocked: tool '{}' called {} times with different arguments but identical results",
                 last.name, count
@@ -1273,23 +1273,33 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_non_exempt_tool_still_triggers_break() {
-        // Backward compatibility: a non-exempt tool (e.g. "shell") called 7
-        // times with different args but identical results must still trip
-        // the no-progress circuit breaker.
+    fn no_progress_non_exempt_tool_still_escalates_to_block() {
+        // Upstream v0.8.6 pinned the no-progress ladder to cap at Block —
+        // it never terminates the turn (the kill cases are the
+        // exact-repeat/ping-pong ladders + the stuck-run reaper). A
+        // non-exempt, non-benign tool (e.g. "shell") called past the
+        // threshold escalates to Block and STAYS there: Warning at
+        // min_calls, Block past it, never Break however long it runs.
         let mut det = LoopDetector::new(default_config());
 
-        for i in 0..6 {
+        for i in 0..5 {
             let args = json!({"cmd": format!("echo {i}")});
             det.record("shell", &args, "done");
         }
-        // 7th call: count=7 >= MIN_CALLS(5)+2 -> Break.
-        match det.record("shell", &json!({"cmd": "echo 6"}), "done") {
-            LoopDetectionResult::Break(msg) => {
+        // 6th call: count=6 > min_calls(5) -> Block.
+        match det.record("shell", &json!({"cmd": "echo 5"}), "done") {
+            LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("shell"));
-                assert!(msg.contains("no progress"));
             }
-            other => panic!("expected no-progress Break for non-exempt tool, got {other:?}"),
+            other => panic!("expected no-progress Block for non-exempt tool, got {other:?}"),
+        }
+        // 7th and later calls: Block again — the cap holds, no Break.
+        for i in 7..10 {
+            let r = det.record("shell", &json!({"cmd": format!("echo {i}")}), "done");
+            assert!(
+                matches!(r, LoopDetectionResult::Block(_)),
+                "call {i} must stay capped at Block, got {r:?}"
+            );
         }
     }
 
@@ -1473,12 +1483,15 @@ mod tests {
     }
 
     #[test]
-    fn write_path_no_progress_kill_retained_for_mqtt_publish() {
+    fn write_path_no_progress_blocks_for_mqtt_publish() {
         // RCA incident #2 verbatim: "tool 'mqtt_publish' called 7 times
         // with different arguments but identical results — no progress".
-        // mqtt_publish is a write-path tool — the ruling RETAINS the
-        // run-abort: identical results from writes are a real no-progress
-        // loop.
+        // The v0.8.6 reconciliation: the no-progress ladder BLOCKS
+        // (upstream's cap — the run is not terminated here); the
+        // run-abort for writes stays with the exact-repeat/ping-pong
+        // ladders (see write_path_exact_repeat_kill_retained_for_file_write)
+        // and the stuck-run reaper. mqtt_publish must NOT receive the
+        // benign steering hint — it is a write-path tool.
         let mut det = LoopDetector::new(default_config());
 
         for i in 0..6 {
@@ -1490,12 +1503,23 @@ mod tests {
             &json!({"topic": "zeroclaw/tasks/6", "payload": "x"}),
             "published",
         ) {
-            LoopDetectionResult::Break(msg) => {
+            LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("mqtt_publish"), "{msg}");
-                assert!(msg.contains("no progress"), "{msg}");
                 assert!(!msg.contains(BENIGN_REPEAT_STEERING_HINT), "{msg}");
             }
-            other => panic!("write-path no-progress Break must be retained, got {other:?}"),
+            other => panic!("write-path no-progress must escalate to Block, got {other:?}"),
+        }
+        // The cap holds: no Break however long the loop runs.
+        for i in 7..10 {
+            let r = det.record(
+                "mqtt_publish",
+                &json!({"topic": format!("zeroclaw/tasks/{i}"), "payload": "x"}),
+                "published",
+            );
+            assert!(
+                matches!(r, LoopDetectionResult::Block(_)),
+                "call {i} must stay capped at Block, got {r:?}"
+            );
         }
     }
 
@@ -1542,10 +1566,11 @@ mod tests {
                 assert!(matches!(r, LoopDetectionResult::Warning(_)), "got {r:?}");
             }
         }
-        // A write tool's genuine no-progress loop — the kill ladder must
-        // step through its normal escalation (5th: Warning, 6th: Block,
-        // 7th: Break) exactly as it would without the benign entries in
-        // the window; the steering must not disarm any rung.
+        // A write tool's genuine no-progress loop — the ladder must step
+        // through its normal escalation (5th: Warning, 6th: Block) exactly
+        // as it would without the benign entries in the window; the
+        // steering must not disarm any rung. The ladder caps at Block
+        // (upstream v0.8.6: no-progress never terminates the turn).
         for i in 0..6 {
             let args = json!({"cmd": format!("kubectl get pod p{i}")});
             let r = det.record("shell", &args, "pod not found");
@@ -1564,12 +1589,21 @@ mod tests {
             &json!({"cmd": "kubectl get pod p6"}),
             "pod not found",
         ) {
-            LoopDetectionResult::Break(msg) => {
+            LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("shell"), "{msg}");
-                assert!(msg.contains("no progress"), "{msg}");
             }
-            other => panic!("the write-path Break must survive benign steering, got {other:?}"),
+            other => panic!("the write-path Block must survive benign steering, got {other:?}"),
         }
+        // And the cap holds past it — steering never arms a Break either.
+        let r = det.record(
+            "shell",
+            &json!({"cmd": "kubectl get pod p7"}),
+            "pod not found",
+        );
+        assert!(
+            matches!(r, LoopDetectionResult::Block(_)),
+            "no-progress must stay capped at Block, got {r:?}"
+        );
     }
 
     #[test]
