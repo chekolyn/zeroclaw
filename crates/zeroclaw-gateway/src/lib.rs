@@ -2123,7 +2123,10 @@ pub async fn run_gateway_with_plugin_webhooks(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned)?;
-            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            let path = wh
+                .listen_path
+                .clone()
+                .unwrap_or_else(|| "/webhook".to_string());
             Some((path, Arc::from(secret)))
         })
         .collect();
@@ -2135,7 +2138,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .iter()
         .filter(|(_, wh)| wh.enabled)
         .filter_map(|(alias, wh)| {
-            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            let path = wh
+                .listen_path
+                .clone()
+                .unwrap_or_else(|| "/webhook".to_string());
             Some((path, alias.clone()))
         })
         .collect();
@@ -2147,7 +2153,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .iter()
         .filter(|(_, wh)| wh.enabled)
         .map(|(_, wh)| {
-            let path = wh.listen_path.clone().unwrap_or_else(|| "/webhook".to_string());
+            let path = wh
+                .listen_path
+                .clone()
+                .unwrap_or_else(|| "/webhook".to_string());
             let header = wh.signature_header.clone();
             (path, header)
         })
@@ -4375,6 +4384,7 @@ fn gateway_fixture_turn_datetime() -> chrono::DateTime<chrono::Local> {
     chrono::DateTime::parse_from_rfc3339("2026-06-25T12:00:00+00:00")
         .expect("fixed gateway fixture timestamp")
         .with_timezone(&chrono::Local)
+}
 
 #[cfg(feature = "channel-webhook")]
 /// POST /<configured-path> — generic webhook endpoint for dynamic routes registered from [channels.webhook.*] config.
@@ -4477,7 +4487,14 @@ async fn handle_generic_webhook(
     let session_id = None::<String>;
     let agent_override = Some(channel_alias);
 
-    match run_gateway_chat_with_tools(&state, &message, session_id.as_deref(), agent_override.as_deref()).await {
+    match run_gateway_chat_with_tools(
+        &state,
+        &message,
+        session_id.as_deref(),
+        agent_override.as_deref(),
+    )
+    .await
+    {
         Ok(GatewayChatOutcome {
             response,
             input_tokens,
@@ -6056,6 +6073,7 @@ mod tests {
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         }
     }
 
@@ -7533,6 +7551,7 @@ path = "{trigger_path}"
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -7622,6 +7641,7 @@ path = "{trigger_path}"
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -7892,6 +7912,7 @@ path = "{trigger_path}"
             config_authority: state_authority.clone(),
             agent_lifecycle: state_authority.agent_lifecycle(),
             pairing: Arc::new(guard),
+            webhook_secret_hash: None,
             ..crate::api::tests::test_state(Config::default())
         }
     }
@@ -8302,7 +8323,7 @@ path = "{trigger_path}"
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
-            sop_driver_handles: None,
+            webhook_secret_hash: None,
         }
     }
 
@@ -9891,6 +9912,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -10813,6 +10835,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         // An idempotency key on a rejected request must NOT be consumed.
@@ -10937,6 +10960,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = handle_webhook(
@@ -11040,6 +11064,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let headers = HeaderMap::new();
@@ -11249,6 +11274,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = handle_webhook(
@@ -11339,6 +11365,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -11434,6 +11461,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -11534,6 +11562,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -11629,6 +11658,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -11732,6 +11762,7 @@ data: [DONE]\n\n";
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -11884,6 +11915,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -12774,6 +12806,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         }
     }
 
@@ -12862,6 +12895,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         };
 
         let response = Box::pin(handle_linq_webhook_alias(
@@ -13477,6 +13511,7 @@ data: [DONE]\n\n";
             sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_secret_hash: None,
         }
     }
 

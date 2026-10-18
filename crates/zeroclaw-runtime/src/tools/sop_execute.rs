@@ -181,9 +181,7 @@ impl Tool for SopExecuteTool {
                         format!("SOP run {run_id} pending before step {step}: {reason}")
                     }
                     SopRunAction::Skipped { sop_name, reason } => {
-                        format!(
-                            "SOP '{sop_name}' skipped at dispatch (no run created): {reason}"
-                        )
+                        format!("SOP '{sop_name}' skipped at dispatch (no run created): {reason}")
                     }
                 };
                 Ok(ToolResult {

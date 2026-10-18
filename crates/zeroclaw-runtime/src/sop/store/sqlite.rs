@@ -169,6 +169,8 @@ fn quarantine_poison_row(
             },
             frame_marker_id: String::new(),
             status: SopRunStatus::Failed,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
             current_step: 0,
             total_steps: 0,
             started_at: now.clone(),

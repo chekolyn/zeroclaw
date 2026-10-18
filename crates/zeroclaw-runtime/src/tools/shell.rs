@@ -306,9 +306,10 @@ impl Tool for ShellTool {
         // evidence: the recursive-grep class burned 3× 60s kills + retries
         // + LLM round-trips per step in the deploy-executor traces.
         if self.steer_recursive_grep {
-            if let Some(advice) =
-                crate::tools::shell_steering::detect_recursive_grep(command)
-            {
+            if let Some(advice) = crate::tools::shell_steering::detect_recursive_grep(
+                command,
+                self.runtime.shell_dialect(),
+            ) {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),

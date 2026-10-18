@@ -482,6 +482,7 @@ mod tests {
             kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -812,6 +813,7 @@ mod tests {
             kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
+            ..Default::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -884,6 +886,7 @@ mod tests {
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
             kill_cycles: 10,
+            ..Default::default()
         };
         let mut det = LoopDetector::new(config);
         let mut last = LoopDetectionResult::Ok;
@@ -911,6 +914,7 @@ mod tests {
             kill_cycles: DEFAULT_KILL_CYCLES,
             no_progress_exempt_tools: Vec::new(),
             benign_repeat_tools: Vec::new(),
+            ..Default::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});

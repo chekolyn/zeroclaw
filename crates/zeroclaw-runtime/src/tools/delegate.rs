@@ -1466,7 +1466,10 @@ impl DelegateTool {
     ) -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryRecallTool::new_with_excludes(memory.clone(), excludes)),
+            Box::new(MemoryRecallTool::new_with_excludes(
+                memory.clone(),
+                excludes,
+            )),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
             Box::new(MemoryPurgeTool::new(memory, security)),
@@ -3483,13 +3486,16 @@ impl DelegateTool {
         let agent_name_owned = agent_name.to_string();
 
         // The workspace artifact scopes listing and stores output, but never owns
+        // lifecycle status. Status is created atomically in the task store below.
+
         // R4: parse event-driven args (project/milestone/chain/ttl/session) from
         // the tool args, for the MQTT topic hierarchy and the result struct.
         let event_args = parse_delegate_event_args(args);
 
-        // lifecycle status. Status is created atomically in the task store below.
         let initial_result = BackgroundDelegateResult {
             task_id: task_id.clone(),
+            agent: agent_name_owned.clone(),
+            status: BackgroundTaskStatus::Running,
             output: None,
             error: None,
             started_at: started_at.clone(),
@@ -3510,9 +3516,10 @@ impl DelegateTool {
         // milestone_id is None — the sidecar schema requires both as non-empty
         // strings, so there is no 'unassigned' placeholder.
         #[cfg(feature = "channel-mqtt")]
-        if let (Some(proj), Some(ms)) =
-            (event_args.project_id.as_deref(), event_args.milestone_id.as_deref())
-        {
+        if let (Some(proj), Some(ms)) = (
+            event_args.project_id.as_deref(),
+            event_args.milestone_id.as_deref(),
+        ) {
             let topic = task_started_topic().to_string();
             let payload = build_task_started_payload(
                 proj,
@@ -3525,9 +3532,7 @@ impl DelegateTool {
             )
             .to_string();
             tokio::spawn(async move {
-                let _ = crate::mqtt_bus::publish(
-                    &topic, payload.into_bytes(), false,
-                ).await;
+                let _ = crate::mqtt_bus::publish(&topic, payload.into_bytes(), false).await;
             });
         }
 
@@ -3779,6 +3784,7 @@ impl DelegateTool {
                 drop(full_prompt);
                 drop(workspace_dir);
                 drop(child_token);
+                let finished_at = chrono::Utc::now().to_rfc3339();
                 let (terminal_status, terminal_error, final_result) = match outcome {
                     Ok(output) => (
                         crate::control_plane::TaskStatus::Completed,
@@ -3798,7 +3804,6 @@ impl DelegateTool {
                             session_id: event_args.session_id.clone(),
                         },
                     ),
-                let finished_at = chrono::Utc::now().to_rfc3339();
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
                             crate::control_plane::TaskStatus::Cancelled
@@ -3919,6 +3924,10 @@ impl DelegateTool {
                 // caller workspace owner this task writes into.
                 drop(caller_execution_admission);
                 drop(target_execution_admission);
+                            }
+                        )
+                    )
+                )
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -5271,16 +5280,14 @@ impl DelegateTool {
                         .memory_for_target_agent(target_config, agent_name)
                         .await
                     {
-                        Ok(Some(memory)) => {
-                            Self::memory_tools_for_target(
-                                memory,
-                                Arc::clone(&target_policy),
-                                recall_excludes,
-                            )
-                                .into_iter()
-                                .map(|tool| (tool.name().to_string(), tool))
-                                .collect()
-                        }
+                        Ok(Some(memory)) => Self::memory_tools_for_target(
+                            memory,
+                            Arc::clone(&target_policy),
+                            recall_excludes,
+                        )
+                        .into_iter()
+                        .map(|tool| (tool.name().to_string(), tool))
+                        .collect(),
                         Ok(None) => HashMap::new(),
                         Err(e) => {
                             return Ok(ToolResult {
@@ -5902,6 +5909,11 @@ mod tests {
                 error: None,
                 started_at: "2026-06-21T00:00:00Z".into(),
                 finished_at: Some("2026-06-21T00:00:30Z".into()),
+                project_id: None,
+                milestone_id: None,
+                chain_id: None,
+                ttl_seconds: default_ttl_seconds(),
+                session_id: None,
             },
         )
         .await
@@ -5936,6 +5948,11 @@ mod tests {
                 error: None,
                 started_at: "2026-06-21T00:00:00Z".into(),
                 finished_at: Some("2026-06-21T00:00:30Z".into()),
+                project_id: None,
+                milestone_id: None,
+                chain_id: None,
+                ttl_seconds: default_ttl_seconds(),
+                session_id: None,
             },
         )
         .await
@@ -7532,6 +7549,13 @@ mod tests {
                         error,
                         started_at: view["started_at"].as_str().unwrap_or_default().to_string(),
                         finished_at: view["finished_at"].as_str().map(str::to_string),
+                        project_id: view["project_id"].as_str().map(str::to_string),
+                        milestone_id: view["milestone_id"].as_str().map(str::to_string),
+                        chain_id: view["chain_id"].as_str().map(str::to_string),
+                        ttl_seconds: view["ttl_seconds"]
+                            .as_u64()
+                            .unwrap_or_else(default_ttl_seconds),
+                        session_id: view["session_id"].as_str().map(str::to_string),
                     };
                 }
                 last_status = Some(state);
@@ -10092,15 +10116,17 @@ mod tests {
         let agent_id = inner.ensure_agent_uuid("target").await.unwrap();
         let memory = scoped_sqlite_memory(inner, &agent_id);
 
-        memory.store(
-            "sop:1",
-            "SOP runbook",
-            MemoryCategory::Custom("sop".into()),
-            None,
-        )
-        .await
-        .unwrap();
-        memory.store("core:1", "User prefers Rust", MemoryCategory::Core, None)
+        memory
+            .store(
+                "sop:1",
+                "SOP runbook",
+                MemoryCategory::Custom("sop".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store("core:1", "User prefers Rust", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -10116,7 +10142,10 @@ mod tests {
             .expect("memory_recall tool present in target memory tools");
         let result = recall.execute(json!({})).await.unwrap();
         assert!(result.success, "recall failed: {result:?}");
-        assert!(result.output.contains("Rust"), "non-excluded core entry must be recalled");
+        assert!(
+            result.output.contains("Rust"),
+            "non-excluded core entry must be recalled"
+        );
         assert!(
             !result.output.contains("SOP runbook"),
             "delegate target recall must apply config excludes (drop telemetry by default)"
@@ -12995,9 +13024,8 @@ mod tests {
             "zeroclaw_delegate_results_dir_default_{}",
             uuid::Uuid::new_v4()
         ));
-        let tool =
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone());
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
         assert_eq!(
             tool.results_dir(),
             workspace.join("delegate_results"),
@@ -13015,10 +13043,9 @@ mod tests {
             results_dir: Some("event_engine/tasks".into()),
             ..DelegateToolConfig::default()
         };
-        let tool =
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_delegate_config(cfg)
-                .with_workspace_dir(workspace.clone());
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_delegate_config(cfg)
+            .with_workspace_dir(workspace.clone());
         assert_eq!(
             tool.results_dir(),
             workspace.join("event_engine/tasks"),
@@ -19774,9 +19801,15 @@ command = "rm independent-delegate-marker"
         assert_eq!(payload["session_id"], "sess-1");
         assert_eq!(payload["ttl_seconds"], 600);
         // No 'agent' field — it lives in the delegate result file.
-        assert!(payload.get("agent").is_none(), "agent must not be in the payload");
+        assert!(
+            payload.get("agent").is_none(),
+            "agent must not be in the payload"
+        );
         // No 'started_at' field — single canonical 'timestamp'.
-        assert!(payload.get("started_at").is_none(), "started_at must not be in the payload");
+        assert!(
+            payload.get("started_at").is_none(),
+            "started_at must not be in the payload"
+        );
     }
 
     #[test]
@@ -22217,25 +22250,25 @@ command = "rm independent-delegate-marker"
             "configless delegate must surface a clean tool error: {result:?}"
         );
 
-    #[test]
-    fn parameter_schema_includes_event_args() {
-        // Verify the 5 event-driven args are present in the parameter schema.
-        let config = Arc::new(zeroclaw_config::schema::Config::default());
-        let tool = delegate_tool_for_config(config);
-        let schema = crate::tools::Tool::parameters_schema(&tool);
-        for key in [
-            "project_id",
-            "milestone_id",
-            "chain_id",
-            "ttl_seconds",
-            "session_id",
-        ] {
-            assert!(
-                schema["properties"].get(key).is_some(),
-                "delegate parameter schema must carry {key} for the event-driven swarm",
-            );
+        #[test]
+        fn parameter_schema_includes_event_args() {
+            // Verify the 5 event-driven args are present in the parameter schema.
+            let config = Arc::new(zeroclaw_config::schema::Config::default());
+            let tool = delegate_tool_for_config(config);
+            let schema = crate::tools::Tool::parameters_schema(&tool);
+            for key in [
+                "project_id",
+                "milestone_id",
+                "chain_id",
+                "ttl_seconds",
+                "session_id",
+            ] {
+                assert!(
+                    schema["properties"].get(key).is_some(),
+                    "delegate parameter schema must carry {key} for the event-driven swarm",
+                );
+            }
         }
-    }
     }
 }
 
@@ -22388,7 +22421,10 @@ mod lever2b_bg_notify_directive_tests {
     #[test]
     fn bg_directive_appended_to_plain_prompt() {
         let out = DelegateTool::apply_bg_notify_directive("Run the tests.".to_string());
-        assert!(out.starts_with("Run the tests."), "append-only: the original prompt leads");
+        assert!(
+            out.starts_with("Run the tests."),
+            "append-only: the original prompt leads"
+        );
         assert!(out.contains("[Completion notification — required]"));
         assert!(out.contains("sessions_send(sessions_current(), \"<summary>\")"));
     }
@@ -22400,22 +22436,32 @@ mod lever2b_bg_notify_directive_tests {
         assert!(out.contains("[Task]\ndo work"), "composition preserved");
         let task_pos = out.find("[Task]\ndo work").unwrap();
         let directive_pos = out.find("[Completion notification — required]").unwrap();
-        assert!(directive_pos > task_pos, "the directive appends AFTER the composition");
+        assert!(
+            directive_pos > task_pos,
+            "the directive appends AFTER the composition"
+        );
     }
 
     #[test]
     fn bg_directive_yields_when_parent_already_instructs_sessions_send_current() {
         let parent = "Do the work; on completion call sessions_send(sessions_current(), \"done\").";
         let out = DelegateTool::apply_bg_notify_directive(parent.to_string());
-        assert_eq!(out, parent, "idempotency: a law-abiding parent is not double-prompted");
+        assert_eq!(
+            out, parent,
+            "idempotency: a law-abiding parent is not double-prompted"
+        );
     }
 
     #[test]
     fn bg_directive_yields_when_parent_specifies_alternate_notify_target() {
         // The §4 re-delegation case: the dispatcher routes the notification to a
         // DIFFERENT session (the explicit target session id in the prompt).
-        let parent = "Re-dispatch this; notify the original owner via sessions_send(ses_abc123, \"done\").";
+        let parent =
+            "Re-dispatch this; notify the original owner via sessions_send(ses_abc123, \"done\").";
         let out = DelegateTool::apply_bg_notify_directive(parent.to_string());
-        assert_eq!(out, parent, "explicit-re-target-wins: the tool never overrides a deliberate routing choice");
+        assert_eq!(
+            out, parent,
+            "explicit-re-target-wins: the tool never overrides a deliberate routing choice"
+        );
     }
 }

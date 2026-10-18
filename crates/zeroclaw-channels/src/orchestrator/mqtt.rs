@@ -76,48 +76,57 @@ pub async fn run_mqtt_sop_listener(
                 record_poll_alive();
                 match event {
                     Event::Incoming(Packet::Publish(msg)) => {
-                let payload_raw = String::from_utf8_lossy(&msg.payload);
-                let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
-                if let Some(sink) = driver_sink.as_ref() {
-                    ingress = ingress.with_driver_sink(sink);
-                }
-                // The outcome MUST be logged: discarding it made a dedup'd
-                // `Skipped` indistinguishable from a dead activation at the
-                // listener (2026-10-17 prod evidence). describe() carries the
-                // per-result summary; Unavailable is WARN-worthy, the rest INFO.
-                let outcome = ingress
-                    .dispatch(
-                        SopTriggerSource::Mqtt,
-                        Some(&msg.topic),
-                        Some(&payload_raw),
-                        None,
-                        None,
-                    )
-                    .await;
-                let summary = outcome.describe();
-                let attrs = ::serde_json::json!({
-                    "topic": msg.topic,
-                    "outcome": summary,
-                });
-                match &outcome {
-                    SopIngressOutcome::Unavailable(_) => ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(attrs),
-                        &format!("MQTT SOP dispatch: {summary}")
-                    ),
-                    _ => ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(attrs),
-                        &format!("MQTT SOP dispatch: {summary}")
-                    ),
-                }
-            }
+                        let payload_raw = String::from_utf8_lossy(&msg.payload);
+                        let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
+                        if let Some(sink) = driver_sink.as_ref() {
+                            ingress = ingress.with_driver_sink(sink);
+                        }
+                        // The outcome MUST be logged: discarding it made a dedup'd
+                        // `Skipped` indistinguishable from a dead activation at the
+                        // listener (2026-10-17 prod evidence). describe() carries the
+                        // per-result summary; Unavailable is WARN-worthy, the rest INFO.
+                        let outcome = ingress
+                            .dispatch(
+                                SopTriggerSource::Mqtt,
+                                Some(&msg.topic),
+                                Some(&payload_raw),
+                                None,
+                                None,
+                            )
+                            .await;
+                        let summary = outcome.describe();
+                        let attrs = ::serde_json::json!({
+                            "topic": msg.topic,
+                            "outcome": summary,
+                        });
+                        match &outcome {
+                            SopIngressOutcome::Unavailable(_) => ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(attrs),
+                                &format!("MQTT SOP dispatch: {summary}")
+                            ),
+                            _ => ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(attrs),
+                                &format!("MQTT SOP dispatch: {summary}")
+                            ),
+                        }
+                    }
                     Event::Incoming(Packet::ConnAck(_)) => {
                         ::zeroclaw_log::record!(
                             INFO,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
                             "MQTT SOP listener: connected to broker"
                         );
                     }
@@ -341,7 +350,6 @@ mod tests {
     }
 }
 
-
 /// Records that the MQTT event loop completed a poll successfully — the
 /// steady-state proof of channel life. Called for EVERY Ok poll outcome:
 /// PingResp arrives every `keep_alive_secs` (30s) even when the wire is
@@ -391,7 +399,10 @@ mod loop_liveness_stamp_tests {
             m["last_ok"].is_string(),
             "a successful poll must stamp mqtt.last_ok (the staleness probe keys on its age); got {m}"
         );
-        assert_eq!(m["status"], "ok", "a successful poll must mark the component ok");
+        assert_eq!(
+            m["status"], "ok",
+            "a successful poll must mark the component ok"
+        );
     }
 
     #[test]

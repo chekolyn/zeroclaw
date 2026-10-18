@@ -8009,6 +8009,7 @@ mod tests {
             deterministic: true,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
             agent: None,
         }
     }
@@ -8040,6 +8041,7 @@ mod tests {
             deterministic: true,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
             agent: None,
         }
     }
@@ -17403,6 +17405,8 @@ type = "manual"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(

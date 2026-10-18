@@ -32,12 +32,7 @@ pub async fn init(config: &Config) -> Result<()> {
     }
 
     // Find the first enabled MQTT channel.
-    let mqtt_cfg = config
-        .channels
-        .mqtt
-        .values()
-        .find(|c| c.enabled)
-        .cloned();
+    let mqtt_cfg = config.channels.mqtt.values().find(|c| c.enabled).cloned();
 
     let Some(cfg) = mqtt_cfg else {
         // No enabled MQTT channel — publisher stays None; publish() will no-op.
@@ -78,10 +73,7 @@ pub async fn init(config: &Config) -> Result<()> {
                 Err(e) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(
-                            module_path!(),
-                            ::zeroclaw_log::Action::Note
-                        ),
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                         format!("mqtt_bus: eventloop poll error: {e}")
                     );
                     // rumqttc auto-reconnects; brief backoff to avoid spin.
@@ -96,7 +88,10 @@ pub async fn init(config: &Config) -> Result<()> {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-        format!("mqtt_bus: publisher initialized for broker {}", cfg.broker_url)
+        format!(
+            "mqtt_bus: publisher initialized for broker {}",
+            cfg.broker_url
+        )
     );
 
     Ok(())
@@ -141,10 +136,7 @@ pub async fn publish(topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> 
 /// // ["projects","Foo Bar/Baz"] -> "zeroclaw/projects/foo_bar_baz"
 /// ```
 pub fn topic_for(parts: &[&str]) -> String {
-    let sanitized: Vec<String> = parts
-        .iter()
-        .map(|p| sanitize_segment(p))
-        .collect();
+    let sanitized: Vec<String> = parts.iter().map(|p| sanitize_segment(p)).collect();
     let joined = sanitized.join("/");
     format!("zeroclaw/{joined}")
 }
@@ -232,10 +224,7 @@ mod tests {
             "zeroclaw/projects/debops/milestones/m1/tasks/t1"
         );
         // Control chars replaced
-        assert_eq!(
-            topic_for(&["test", "seg\tment"]),
-            "zeroclaw/test/seg_ment"
-        );
+        assert_eq!(topic_for(&["test", "seg\tment"]), "zeroclaw/test/seg_ment");
     }
 
     #[tokio::test]
@@ -243,6 +232,9 @@ mod tests {
         // With no init() call, the global PUBLISHER is None.
         // publish() should return Ok(()) and not panic.
         let result = publish("test/topic", b"payload".to_vec(), false).await;
-        assert!(result.is_ok(), "publish() should return Ok when unconfigured");
+        assert!(
+            result.is_ok(),
+            "publish() should return Ok when unconfigured"
+        );
     }
 }

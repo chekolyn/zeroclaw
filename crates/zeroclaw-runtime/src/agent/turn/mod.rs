@@ -1805,13 +1805,10 @@ async fn run_tool_call_loop_impl<'a>(
             enabled: pacing.loop_detection_enabled,
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
-<<<<<<< HEAD
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
-=======
             kill_cycles: pacing
                 .loop_detection_kill_cycles
                 .unwrap_or(crate::agent::loop_detector::DEFAULT_KILL_CYCLES),
->>>>>>> 8e15cd6aa (tune(runtime): the apply-lane guard tunes — evidence from the 2026-10-17 prod run deaths (#3))
             no_progress_exempt_tools: pacing.no_progress_exempt_tools.clone(),
             benign_repeat_tools: pacing.benign_repeat_tools.clone(),
         },
@@ -4690,6 +4687,21 @@ async fn drive_live_sop_actions(
                                 "reason": reason,
                             })),
                         "SOP live executor pending on step dependencies"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Skipped { sop_name, reason } => {
+                    // The SOP is handled externally (the sidecar): no run was
+                    // created and there is nothing to drive inside this live
+                    // turn. Log and stop driving this run's chain.
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name,
+                                "reason": reason,
+                            })),
+                        "SOP live executor received a skipped (externally-handled) run"
                     );
                     break;
                 }
