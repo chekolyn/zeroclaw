@@ -30,6 +30,7 @@ pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
+pub mod shell_steering;
 pub(crate) mod shell_env;
 pub(crate) mod shell_output;
 pub mod skill_http;
@@ -1617,6 +1618,7 @@ fn all_tools_with_runtime_on_thread(
                 } else {
                     root_config.shell_tool.timeout_secs
                 })
+                .with_steer_recursive_grep(root_config.shell_tool.steer_recursive_grep)
                 .with_shared_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),

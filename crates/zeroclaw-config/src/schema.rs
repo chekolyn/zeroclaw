@@ -9169,6 +9169,18 @@ pub struct ShellToolConfig {
     /// Maximum shell command execution time in seconds (default: 60).
     #[serde(default = "default_shell_tool_timeout_secs")]
     pub timeout_secs: u64,
+    /// C2 — the recursive-grep steering guard (spec:
+    /// `docs/superpowers/specs/2026-10-18-c2-unscoped-grep-steering-design.md`,
+    /// quorum-approved R3-clean 2026-10-18). When `true` (the default), a
+    /// shell command carrying a recursive-grep shape is refused pre-spawn
+    /// and redirected to the native `content_search` with the extracted
+    /// pattern as a ready-to-call suggestion. The escape hatch for a
+    /// genuine edge case. **The anti-shadow decision (the spec's §3.3)**:
+    /// this field is read DIRECTLY from `root_config.shell_tool` at the
+    /// construction site (`tools/mod.rs`) — NOT via a SecurityPolicy/
+    /// RuntimeProfileConfig copy path (the shadow that bit `timeout_secs`).
+    #[serde(default = "default_true")]
+    pub steer_recursive_grep: bool,
 }
 
 fn default_shell_tool_timeout_secs() -> u64 {
@@ -9179,6 +9191,7 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+            steer_recursive_grep: true,
         }
     }
 }
