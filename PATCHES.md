@@ -130,6 +130,7 @@ allowlist: 85228ece8 — realignment-fixup: Cargo.lock sync — entries missing 
 allowlist: 7c09b8026 — docs: PATCHES.md — the v0.8.5 patch entry (Lever-2b + the test-target debt repair)
 allowlist: 7f574e28a — docs: PATCHES.md — the arg_deny_exemptions entry
 allowlist: 61e2163d4 — realignment-fixup: the v0.8.6 conflict resolutions compiled coherent (upstreamed headless/migration/steering surfaces adopted; the fork carries merged; AppState/LoopDetectorConfig/memory-entry test fixtures threaded; the loop-detector knobs both-threaded)
+allowlist: 6a3530e48 — realignment-fixup: the v0.8.6 test-suite reconciliation (the no-progress ladder adopts upstream's Block cap — the fork's Break arm dropped, 3 fork tests re-pinned; the ADE exemption validation rehomed per-profile with the alias path prefix; the git delegation check skips table-modeled subcommands; mqtt_publish in OUTSIDE_INVENTORY)
 
 ## Realignment notes (v0.8.3 → v0.8.4)
 
@@ -279,6 +280,7 @@ old-table rows (the class-b rows below `gateway`/`delegate-*`).
 | 7ddef6c19 | a | ADE-7 | arg_deny_exemptions — the complete §1.9 deny matrix (both dialect entry points, map absent + present) |
 | 7f574e28a | c | docs | PATCHES.md — the arg_deny_exemptions entry |
 | 61e2163d4 | c | 61e2163d4 | the v0.8.6 conflict resolutions compiled coherent (upstreamed surfaces adopted, fork carries merged, test fixtures threaded) |
+| 6a3530e48 | c | 6a3530e48 | the v0.8.6 test-suite reconciliation — the no-progress ladder adopts upstream's Block cap; ADE validation rehomed per-profile; git delegation check skips table-modeled subcommands |
 | bd538814a | a | U1 | the allow_scripts subagent propagation fix — cherry-picked from cheknet-pached `352672c02` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 | 8fa54cdec | a | U2 | the cron chat-leak fix — cherry-picked from cheknet-pached `69dd83ed4` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 | 57f410566 | a | SOP-POISON-QUARANTINE | the SOP ledger poison-row quarantine — tolerant restore scans + terminal tombstones + the reaped_stuck_runs reporting fix (the 2026-10-03..05 restore-wedge / slots-full root cause) |
