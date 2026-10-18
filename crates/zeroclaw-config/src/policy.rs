@@ -1621,6 +1621,14 @@ fn split_unquoted_segments_checked(
 /// command. Either guess is a bypass, so the command is refused.
 struct UnreadableHeredoc;
 
+/// Public wrapper (C2's DRY ruling — the spec's §3.0): the shell-steering
+/// detector reuses THIS quote-aware segmentation (the `QuoteState` walkers,
+/// heredoc handling, escaped-char tracking) rather than hand-rolling a
+/// parser. The behavior is identical to the private fn.
+pub fn split_unquoted_segments_public(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments(command, dialect)
+}
+
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     split_unquoted_segments_checked(command, dialect).unwrap_or_default()
 }
