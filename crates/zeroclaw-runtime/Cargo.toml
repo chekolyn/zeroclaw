@@ -63,6 +63,7 @@ strum = "0.28"
 strum_macros = "0.28"
 sha2 = "0.10"
 shellexpand = "3.1"
+yaml_serde.workspace = true
 sys-locale.workspace = true
 # Pinned to 0.36 because 0.37+ requires rustc 1.88; workspace MSRV is 1.87.
 # Used only by `process_stats.rs` to sample this process's RSS/CPU% across

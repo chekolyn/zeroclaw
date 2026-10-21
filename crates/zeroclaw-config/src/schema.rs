@@ -13911,6 +13911,91 @@ pub struct BuiltinHooksConfig {
     #[serde(default)]
     #[nested]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the rules hook (pod-side instruction loading).
+    ///
+    /// Absent (default) = disabled, preserving current behavior on every other
+    /// deployment. When enabled, ships the same `rules/*.md` corpus the
+    /// opencode `rules-bind` plugin manifest-injects, as a manifest + core
+    /// block appended to the system prompt with deterministic `applyTo`/`agents:`
+    /// attach.
+    #[serde(default)]
+    #[nested]
+    pub rules: RulesHookConfig,
+}
+
+/// Configuration for the rules builtin hook.
+///
+/// Implements VS Code-style instruction loading (additive global / workspace /
+/// repo scopes) over a `rules/*.md` corpus with YAML frontmatter
+/// (`name`, `description`, optional `applyTo` glob, optional `agents: [alias]`,
+/// `core: true`). Absence of any field falls back to its serde default;
+/// the whole table defaulting to `enabled = false` is the one-flag rollback.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.builtin.rules"]
+pub struct RulesHookConfig {
+    /// Enable the rules hook. Default: `false` (fail-closed).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Shared swarm rules corpus (the organization-equivalent scope).
+    /// Absolute path when `enabled`.
+    #[serde(default)]
+    pub global_dir: String,
+    /// The per-agent rules scope, workspace-relative (the user-equivalent
+    /// scope). Default: `.agents/rules`.
+    #[serde(default = "default_workspace_dir")]
+    pub workspace_dir: String,
+    /// Dynamically resolve the checked-out repo's own `.agents/rules` from the
+    /// session workspace / working directory. Default: `true`.
+    #[serde(default = "default_true")]
+    pub repo_discovery: bool,
+    /// Maximum active repo corpora per turn. Default: `4`.
+    #[serde(default = "default_repo_roots_max")]
+    pub repo_roots_max: u32,
+    /// Chars budget for the manifest + core block per call. Default: `7500`.
+    #[serde(default = "default_manifest_budget")]
+    pub manifest_budget: usize,
+    /// Chars budget for attached rule bodies per call. Default: `8000`.
+    #[serde(default = "default_attach_budget")]
+    pub attach_budget: usize,
+    /// Last-N modified/attached paths retained per session. Default: `50`.
+    #[serde(default = "default_in_play_paths")]
+    pub in_play_paths: usize,
+}
+
+fn default_workspace_dir() -> String {
+    ".agents/rules".to_string()
+}
+
+fn default_repo_roots_max() -> u32 {
+    4
+}
+
+fn default_manifest_budget() -> usize {
+    7500
+}
+
+fn default_attach_budget() -> usize {
+    8000
+}
+
+fn default_in_play_paths() -> usize {
+    50
+}
+
+impl Default for RulesHookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            global_dir: String::new(),
+            workspace_dir: default_workspace_dir(),
+            repo_discovery: true,
+            repo_roots_max: default_repo_roots_max(),
+            manifest_budget: default_manifest_budget(),
+            attach_budget: default_attach_budget(),
+            in_play_paths: default_in_play_paths(),
+        }
+    }
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -52266,6 +52351,45 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    #[::core::prelude::v1::test]
+    fn rules_hook_config_defaults_disabled_with_budget_and_scope_defaults() {
+        let default = RulesHookConfig::default();
+        assert!(!default.enabled, "rules hook must default to disabled");
+        assert_eq!(default.global_dir, "");
+        assert_eq!(default.workspace_dir, ".agents/rules");
+        assert!(default.repo_discovery);
+        assert_eq!(default.repo_roots_max, 4);
+        assert_eq!(default.manifest_budget, 7500);
+        assert_eq!(default.attach_budget, 8000);
+        assert_eq!(default.in_play_paths, 50);
+    }
+
+    #[::core::prelude::v1::test]
+    fn rules_hook_config_round_trips_from_toml() {
+        let toml_str = r#"
+enabled = true
+global_dir = "/storage/shared/rules"
+workspace_dir = ".agents/rules"
+repo_discovery = true
+repo_roots_max = 4
+manifest_budget = 7500
+attach_budget = 8000
+in_play_paths = 50
+"#;
+        let parsed: RulesHookConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.global_dir, "/storage/shared/rules");
+        assert_eq!(parsed.manifest_budget, 7500);
+        assert_eq!(parsed.attach_budget, 8000);
+        assert_eq!(parsed.in_play_paths, 50);
+    }
+
+    #[::core::prelude::v1::test]
+    fn empty_builtin_hooks_table_disables_rules() {
+        let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
+        assert!(!from_empty.rules.enabled);
     }
 
     #[test]
