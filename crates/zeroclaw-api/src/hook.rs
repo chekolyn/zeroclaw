@@ -1,10 +1,69 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::channel::ChannelMessage;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
+
+/// Typed correlation context for one prompt-build hook phase.
+///
+/// Carries the fields a prompt-modifying hook needs to attribute the prompt to
+/// a specific agent and turn: the effective agent alias, the agent's workspace,
+/// the session identifier (where one exists at the build site), and the turn
+/// id. `turn_id` is deliberately present because the tool-call hook's
+/// [`ToolCallHookContext`] exposes only an opaque `invocation_id` shaped
+/// `turn_id:iteration:call_index`; correlating a tool event back to the turn's
+/// prompt build requires the same `turn_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PromptBuildHookContext {
+    alias: String,
+    workspace: PathBuf,
+    session_id: String,
+    turn_id: String,
+}
+
+impl PromptBuildHookContext {
+    /// Create a prompt-build context.
+    ///
+    /// `session_id` may be empty when the build site has no session
+    /// identifier; callers should use the best harness-session identifier
+    /// available at that site and document the choice.
+    pub fn new(
+        alias: impl Into<String>,
+        workspace: impl Into<PathBuf>,
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            alias: alias.into(),
+            workspace: workspace.into(),
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+
+    /// The effective agent alias this prompt is being built for.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// The agent's workspace directory.
+    pub fn workspace(&self) -> &PathBuf {
+        &self.workspace
+    }
+
+    /// The session identifier, possibly empty where the build site has none.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The turn identifier.
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+}
 
 /// Opaque runtime context for one tool-call hook phase.
 ///
@@ -142,6 +201,21 @@ pub trait HookHandler: Send + Sync {
 
     async fn before_prompt_build(&self, prompt: String) -> HookResult<String> {
         HookResult::Continue(prompt)
+    }
+
+    /// Inspect or modify a prompt build with explicit correlation context.
+    ///
+    /// Runners that can attribute the prompt to an agent and turn dispatch
+    /// this variant instead of [`HookHandler::before_prompt_build`]; the
+    /// default delegates there, dropping the context. Handlers that key on the
+    /// agent alias, workspace, or correlate prompt builds with tool events via
+    /// `turn_id` should override this variant.
+    async fn before_prompt_build_with_context(
+        &self,
+        _context: &PromptBuildHookContext,
+        prompt: String,
+    ) -> HookResult<String> {
+        self.before_prompt_build(prompt).await
     }
 
     async fn before_llm_call(
@@ -388,5 +462,74 @@ mod tests {
             .await;
         hook.on_tool_call_abandoned(&ToolCallHookContext::uncorrelated("legacy"), "shell")
             .await;
+    }
+
+    #[test]
+    fn prompt_build_context_carries_alias_workspace_session_turn() {
+        let ctx = PromptBuildHookContext::new(
+            "director",
+            std::path::PathBuf::from("/storage/agents/director/workspace"),
+            "sess-1",
+            "turn-9",
+        );
+        assert_eq!(ctx.alias(), "director");
+        assert_eq!(
+            ctx.workspace(),
+            &std::path::PathBuf::from("/storage/agents/director/workspace")
+        );
+        assert_eq!(ctx.session_id(), "sess-1");
+        assert_eq!(ctx.turn_id(), "turn-9");
+    }
+
+    #[test]
+    fn prompt_build_context_allows_empty_session() {
+        let ctx = PromptBuildHookContext::new(
+            "worker",
+            std::path::PathBuf::from("/storage/agents/worker/workspace"),
+            "",
+            "turn-2",
+        );
+        assert!(ctx.session_id().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_aware_prompt_build_defaults_to_legacy_hook() {
+        use std::sync::{Arc, Mutex};
+
+        struct LegacyPromptHook {
+            seen: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for LegacyPromptHook {
+            fn name(&self) -> &str {
+                "legacy-prompt"
+            }
+
+            async fn before_prompt_build(&self, prompt: String) -> HookResult<String> {
+                *self.seen.lock().unwrap() = Some(prompt.clone());
+                HookResult::Continue(format!("{prompt}_v2"))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let hook = LegacyPromptHook {
+            seen: Arc::clone(&seen),
+        };
+        let ctx = PromptBuildHookContext::new(
+            "director",
+            std::path::PathBuf::from("/storage/agents/director/workspace"),
+            "sess-1",
+            "turn-9",
+        );
+
+        match hook
+            .before_prompt_build_with_context(&ctx, "hello".into())
+            .await
+        {
+            HookResult::Continue(p) => assert_eq!(p, "hello_v2"),
+            HookResult::Cancel(_) => panic!("legacy prompt hook must continue"),
+        }
+        assert_eq!(*seen.lock().unwrap(), Some("hello".to_string()));
     }
 }

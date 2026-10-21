@@ -3537,6 +3537,50 @@ impl Agent {
         Ok(())
     }
 
+    /// Run the typed `before_prompt_build_with_context` hook chain over the
+    /// turn's assembled system prompt.
+    ///
+    /// The context is derived from state available on every agent prompt-build
+    /// path: the retained alias, the agent workspace, the memory session id
+    /// (empty when the agent has no session — documented), and the turn id.
+    /// A missing hook runner is a no-op; a cancelled hook is treated as a
+    /// no-op here per the hook contract for prompt-building, so a hook can
+    /// never break a turn.
+    async fn apply_prompt_build_hooks(&mut self, turn_id: &str) -> Result<()> {
+        let Some(hooks) = self.hook_runner.clone() else {
+            return Ok(());
+        };
+        let context = crate::hooks::PromptBuildHookContext::new(
+            self.agent_alias.clone(),
+            self.agent_workspace_dir.clone(),
+            self.memory_session_id.clone().unwrap_or_default(),
+            turn_id.to_string(),
+        );
+        let Some(ConversationMessage::Chat(first)) = self.history.first_mut() else {
+            return Ok(());
+        };
+        if first.role != "system" {
+            return Ok(());
+        }
+        match hooks
+            .run_before_prompt_build_with_context(&context, first.content.clone())
+            .await
+        {
+            crate::hooks::HookResult::Continue(prompt) => {
+                first.content = prompt;
+            }
+            crate::hooks::HookResult::Cancel(reason) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"reason": reason})),
+                    "before_prompt_build cancelled by hook; proceeding with the assembled prompt"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn rebuild_streamed_system_prompt_for_active_provider(
         &mut self,
         loop_history: &mut [ChatMessage],
@@ -4045,6 +4089,13 @@ impl Agent {
             let _ = self.trim_history(Some(&turn_id));
             return Err(error);
         }
+        // ── Hook: before_prompt_build (typed, with context) ─────────────
+        // The rules hook and future prompt-modifying builtins run here, once
+        // per turn, after the dispatcher-specific prompt is assembled and the
+        // turn id exists for tool-event correlation. The context carries the
+        // effective alias, the agent workspace, the memory session id (empty
+        // where none), and the turn id.
+        self.apply_prompt_build_hooks(&turn_id).await?;
         let tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {

@@ -10415,6 +10415,28 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
+    // ── Hook: before_prompt_build (typed, with context) ─────────────
+    // The rules hook and future prompt-modifying builtins run once per
+    // channel turn, over the assembled system prompt carried by `history[0]`.
+    // Context: the channel agent alias, its workspace dir, the session key
+    // (`history_key`), and the turn id. A missing runner is a no-op; a cancel
+    // is treated as a no-op so a hook can never break a turn.
+    if let Some(hooks) = ctx.hooks.as_ref() {
+        let context = zeroclaw_runtime::hooks::PromptBuildHookContext::new(
+            ctx.agent_alias.as_ref().clone(),
+            ctx.workspace_dir.as_ref().clone(),
+            history_key.clone(),
+            turn_id.clone(),
+        );
+        if let Some(first) = history.first_mut()
+            && first.role == "system"
+            && let zeroclaw_runtime::hooks::HookResult::Continue(prompt) = hooks
+                .run_before_prompt_build_with_context(&context, first.content.clone())
+                .await
+        {
+            first.content = prompt;
+        }
+    }
     let execution_tree_budget = ExecutionTreeBudget::from_limit(
         ctx.prompt_config
             .effective_max_execution_tree_iterations(&ctx.agent_alias),
