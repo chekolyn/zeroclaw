@@ -3845,7 +3845,7 @@ impl DelegateTool {
                 let _won = DelegateTool::complete_background_task(
                     terminal_store.as_ref(),
                     &result_path,
-                    final_result,
+                    final_result.clone(),
                     terminal_status,
                     terminal_error,
                     terminal_owner_pid,
