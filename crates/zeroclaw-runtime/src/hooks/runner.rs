@@ -350,6 +350,36 @@ impl HookRunner {
         HookResult::Continue(prompt)
     }
 
+    pub async fn run_before_prompt_build_with_context(
+        &self,
+        context: &zeroclaw_api::hook::PromptBuildHookContext,
+        mut prompt: String,
+    ) -> HookResult<String> {
+        for h in &self.handlers {
+            let hook_name = h.name();
+            match AssertUnwindSafe(h.before_prompt_build_with_context(context, prompt.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(HookResult::Continue(p)) => prompt = p,
+                Ok(HookResult::Cancel(reason)) => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_prompt_build cancelled by hook");
+                    return HookResult::Cancel(reason);
+                }
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
+                        "before_prompt_build hook panicked; continuing with previous value"
+                    );
+                }
+            }
+        }
+        HookResult::Continue(prompt)
+    }
+
     pub async fn run_before_llm_call(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -1468,6 +1498,73 @@ mod tests {
             0,
             "pass-through hook after the canceller must NOT run"
         );
+    }
+
+    #[tokio::test]
+    async fn context_aware_prompt_build_dispatches_to_context_hook() {
+        struct ContextPromptHook {
+            suffix: String,
+        }
+        #[async_trait]
+        impl HookHandler for ContextPromptHook {
+            fn name(&self) -> &str {
+                "context-prompt"
+            }
+
+            async fn before_prompt_build_with_context(
+                &self,
+                context: &zeroclaw_api::hook::PromptBuildHookContext,
+                prompt: String,
+            ) -> HookResult<String> {
+                // Prove the context threads alias + workspace + turn through.
+                HookResult::Continue(format!(
+                    "{prompt}|{}-{}-{}",
+                    context.alias(),
+                    context.turn_id(),
+                    self.suffix
+                ))
+            }
+        }
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ContextPromptHook {
+            suffix: "ctx".into(),
+        }));
+        let context = zeroclaw_api::hook::PromptBuildHookContext::new(
+            "director",
+            std::path::PathBuf::from("/storage/agents/director/workspace"),
+            "sess-1",
+            "turn-9",
+        );
+        match runner
+            .run_before_prompt_build_with_context(&context, "hello".into())
+            .await
+        {
+            HookResult::Continue(p) => assert_eq!(p, "hello|director-turn-9-ctx"),
+            HookResult::Cancel(_) => panic!("context prompt hook must continue"),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_prompt_hook_unaffected_by_context_dispatch() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(UppercasePromptHook {
+            name: "upper".into(),
+            priority: 0,
+        }));
+        let context = zeroclaw_api::hook::PromptBuildHookContext::new(
+            "director",
+            std::path::PathBuf::from("/storage/agents/director/workspace"),
+            "sess-1",
+            "turn-9",
+        );
+        match runner
+            .run_before_prompt_build_with_context(&context, "hello".into())
+            .await
+        {
+            HookResult::Continue(p) => assert_eq!(p, "HELLO"),
+            HookResult::Cancel(_) => panic!("legacy prompt hook must continue"),
+        }
     }
 
     // ── from_config and lifecycle tests ──────────────────────────

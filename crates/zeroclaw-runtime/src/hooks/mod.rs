@@ -9,4 +9,5 @@ pub(crate) use runner::tool_call_hook_context;
 // external integrations and future plugin authors.
 #[allow(unused_imports)]
 pub use traits::{HookHandler, HookResult};
+pub use zeroclaw_api::hook::PromptBuildHookContext;
 pub use zeroclaw_api::hook::ToolCallHookContext;
