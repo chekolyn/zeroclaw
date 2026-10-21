@@ -946,6 +946,61 @@ pub(crate) fn build_system_prompt_for_turn(
     ))
 }
 
+/// Run the typed `before_prompt_build_with_context` hook chain over an assembled
+/// system prompt (the `process_message` / webhook / ACI turn path).
+///
+/// This is the counterpart of `agent.rs::Agent::apply_prompt_build_hooks` and
+/// the channels-orchestrator seam. The `process_message` path builds its system
+/// prompt inline (via `build_system_prompt_for_turn` + `finalize_system_prompt`)
+/// without the `Agent`/orchestrator machinery, so the hook chain is applied here
+/// directly. A `None` runner (hooks disabled) is a no-op; a cancel is treated as
+/// a no-op so a hook can never break a turn.
+pub(crate) async fn apply_prompt_build_hooks_with_context(
+    hooks: Option<&crate::hooks::HookRunner>,
+    alias: &str,
+    workspace: &std::path::Path,
+    session_id: Option<&str>,
+    turn_id: &str,
+    prompt: String,
+) -> String {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({
+                "hook": "rules",
+                "alias": alias,
+                "turn_id": turn_id,
+                "runner_present": hooks.is_some(),
+            })),
+        "process_message prompt-build hook chain invoked"
+    );
+    let Some(hooks) = hooks else {
+        return prompt;
+    };
+    let context = crate::hooks::PromptBuildHookContext::new(
+        alias,
+        workspace.to_path_buf(),
+        session_id.unwrap_or_default(),
+        turn_id,
+    );
+    let original = prompt.clone();
+    match hooks
+        .run_before_prompt_build_with_context(&context, prompt)
+        .await
+    {
+        crate::hooks::HookResult::Continue(prompt) => prompt,
+        crate::hooks::HookResult::Cancel(reason) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"reason": reason})),
+                "before_prompt_build cancelled by hook; proceeding with the assembled prompt"
+            );
+            original
+        }
+    }
+}
+
 pub fn make_query_summary(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
@@ -3694,6 +3749,28 @@ async fn process_message_inner(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
+        // Prompt-build hook runner for the `process_message` / webhook turn
+        // path. Mirrors `agent.rs::AgentBuilder::hook_runner` and the channels
+        // orchestrator: built once per turn from the settled config, so the
+        // rules hook (and any future prompt-modifying builtin) fires here too.
+        // The webhook/ACI path otherwise skips the hook chain entirely.
+        let prompt_build_hooks: Option<Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "hook": "rules",
+                        "alias": agent_alias,
+                        "hooks.enabled": true,
+                        "rules.enabled": config.hooks.builtin.rules.enabled,
+                        "rules.global_dir": config.hooks.builtin.rules.global_dir,
+                    })),
+                "process_message building prompt-build hook runner"
+            );
+            Some(Arc::new(crate::hooks::HookRunner::from_root_config(&config)))
+        } else {
+            None
+        };
         let (provider_name, provider_alias, agent_model_provider) = match config
             .resolved_model_provider_for_agent(agent_alias)
         {
@@ -4176,6 +4253,25 @@ async fn process_message_inner(
         } else {
             format!("{context}[{now}] {effective_message}")
         };
+
+        // ── Hook: before_prompt_build (typed, with context) ─────────────
+        // The rules hook and future prompt-modifying builtins run here, once
+        // per turn, after the dispatcher-specific prompt is assembled and the
+        // turn id exists for tool-event correlation. This is the
+        // `process_message` / webhook / ACI analogue of
+        // `agent.rs::Agent::apply_prompt_build_hooks` and the channels
+        // orchestrator seam — without it this turn path never injects the
+        // rules manifest. The context carries the effective alias, the agent
+        // workspace, the memory session id (empty where none), and the turn id.
+        let system_prompt = apply_prompt_build_hooks_with_context(
+            prompt_build_hooks.as_deref(),
+            agent_alias,
+            &agent_workspace,
+            session_id,
+            &turn_id,
+            system_prompt,
+        )
+        .await;
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
@@ -20502,6 +20598,85 @@ Let me check the result."#;
             "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
              before provider setup; observed {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_message_prompt_build_hook_injects_rules_manifest() {
+        // The webhook/ACI turn path (`process_message`) must apply the
+        // `before_prompt_build_with_context` hook chain — without it the rules
+        // manifest never reaches the assembled prompt on that path (the bug the
+        // P1 AFTER eval caught: rules block 0 chars on every captured call).
+        //
+        // This drives the exact helper `process_message` now calls, against a
+        // real `RulesHook` from_root_config with a one-file corpus, and asserts
+        // the <instructions> manifest + the rule name land in the prompt.
+        use zeroclaw_config::schema::{HooksConfig, RulesHookConfig};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rules_dir = temp.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).expect("create rules dir");
+        std::fs::write(
+            rules_dir.join("event-driven-swarm.md"),
+            "---\nname: event-driven-swarm\ndescription: Binds when doing async work.\ncore: true\n---\n\n# Body\nNever sleep-poll.\n",
+        )
+        .expect("write rule");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.hooks = HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                rules: RulesHookConfig {
+                    enabled: true,
+                    global_dir: rules_dir.to_string_lossy().into_owned(),
+                    workspace_dir: ".agents/rules".to_string(),
+                    repo_discovery: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let runner = crate::hooks::HookRunner::from_root_config(&config);
+
+        let workspace = temp.path().join("ws");
+        let prompt = super::apply_prompt_build_hooks_with_context(
+            Some(&runner),
+            "some-agent",
+            &workspace,
+            Some("sess-1"),
+            "turn-7",
+            "ASSEMBLED SYSTEM PROMPT".to_string(),
+        )
+        .await;
+
+        assert!(
+            prompt.contains("ASSEMBLED SYSTEM PROMPT"),
+            "the original prompt must be preserved; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("<instructions>"),
+            "the rules manifest must be injected on the process_message path; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("event-driven-swarm"),
+            "the corpus rule must be indexed in the injected manifest; got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_prompt_build_hook_is_noop_without_runner() {
+        // Hooks disabled: the helper returns the prompt unchanged and never
+        // panics (a missing runner is a no-op, so a hook can never break a
+        // turn).
+        let prompt = super::apply_prompt_build_hooks_with_context(
+            None,
+            "some-agent",
+            std::path::Path::new("/tmp/ws"),
+            None,
+            "turn-1",
+            "PLAIN PROMPT".to_string(),
+        )
+        .await;
+        assert_eq!(prompt, "PLAIN PROMPT");
     }
 
     #[tokio::test]
