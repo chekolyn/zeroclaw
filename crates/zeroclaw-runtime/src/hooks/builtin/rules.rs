@@ -551,10 +551,20 @@ impl RulesHook {
         let in_play = read_in_play_paths(ctx.alias(), ctx.session_id());
         for path in in_play {
             let p = Path::new(&path);
-            let dir = if p.is_file() {
-                p.parent().map(Path::to_path_buf).unwrap_or_default()
-            } else {
+            // In-play paths come from tool args and are usually WORKSPACE-
+            // RELATIVE (e.g. `demo-repo/HELLO.md`); the daemon's CWD is not the
+            // agent workspace, so a bare relative path resolves against the
+            // wrong root (or fails) and the nested repo is never found. Anchor
+            // relative paths to the session workspace before probing.
+            let anchored = if p.is_absolute() {
                 p.to_path_buf()
+            } else {
+                ctx.workspace().join(p)
+            };
+            let dir = if anchored.is_file() {
+                anchored.parent().map(Path::to_path_buf).unwrap_or_default()
+            } else {
+                anchored
             };
             if let Some(root) = resolve_repo_root(&dir)
                 && seen.insert(root.clone())
@@ -1303,6 +1313,77 @@ mod tests {
             }
             HookResult::Cancel(_) => panic!("rules hook must continue"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_scope_resolves_from_workspace_relative_in_play_path() {
+        // CONTEXT-LAYERS-REPO-SCOPE-ANCHOR: an in-play path recorded from a
+        // tool arg is workspace-RELATIVE (`demo-repo/HELLO.md`), but the
+        // daemon's CWD is not the agent workspace — the bare relative path
+        // resolved against `git -C`/ancestor-walk from the wrong root, so a
+        // nested repo's rules were never discovered. The path must be anchored
+        // to the session workspace before repo-root resolution.
+        let dir = std::env::temp_dir().join(format!("zc-rules-repo-{}", std::process::id()));
+        let ws = dir.join("workspace");
+        let repo = ws.join("demo-repo");
+        let rules_dir = repo.join(".agents").join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("demo-scope.md"),
+            "---\nname: demo-scope\ndescription: binds when working inside demo-repo.\n---\nBody.\n",
+        )
+        .unwrap();
+        // A real git repo so `git rev-parse --show-toplevel` resolves, and a
+        // touch file so the in-play path's parent is a filename's parent.
+        std::fs::write(repo.join("HELLO.md"), "# hi\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .arg("-q")
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "seed"])
+            .status();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            repo_roots_max: 4,
+            manifest_budget: 8192,
+            attach_budget: 8000,
+            ..RulesHookConfig::default()
+        });
+
+        // Record a workspace-relative in-play path (the tool-arg shape).
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+        record_in_play_path("director", "sess", "demo-repo/HELLO.md", 50);
+
+        // The `director` replica of the workspace model the prompt build uses:
+        // the workspace is `ws`, the in-play path is relative.
+        let ctx = PromptBuildHookContext::new("director", ws.clone(), "sess", "turn-1");
+        let roots = hook.resolve_repo_roots(&ctx);
+        // git resolves the repo root canonically (macOS `/var` → `/private/var`),
+        // so compare canonicalized.
+        let expected = repo.canonicalize().unwrap_or(repo.clone());
+        assert!(
+            roots.iter().any(|r| r.canonicalize().map(|c| c == expected).unwrap_or(false)),
+            "a workspace-relative in-play path must resolve its nested repo root; got {roots:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
