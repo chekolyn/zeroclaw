@@ -672,7 +672,13 @@ impl RulesHook {
         for rule in rules {
             let name = rule.name();
             instructions.push_str("<instruction>\n");
-            instructions.push_str(&format!("<file>{}</file>\n", rule.path.display()));
+            // Pod-form: emit the rule's file name (basename, i.e. its `name`),
+            // not the absolute on-disk path. The absolute path is noisy and
+            // inflates the manifest (~25 chars × N rules) well past
+            // `manifest_budget` for the global scope — the spec's measured
+            // 6.8k assumed relative paths. The agent reads the rule by name
+            // from its active scopes.
+            instructions.push_str(&format!("<file>{name}.md</file>\n"));
             instructions.push_str(&format!("<description>{}</description>\n", rule.frontmatter.description));
             if !rule.frontmatter.apply_to.is_empty() {
                 instructions.push_str(&format!(
@@ -792,13 +798,46 @@ impl RulesHook {
         let (attach, attached_count, attached_chars) =
             self.build_attach_block(&rules, ctx.alias(), ctx.session_id());
 
-        // Budget the manifest + core block (head-truncate with a note).
+        // Budget the manifest + core block (head-truncate with a note). The
+        // `<instructions>` block must STAY well-formed even when truncated: cut
+        // the inner entries and re-append the closing tag, so a downstream
+        // consumer (or the inventory parser) always sees a closed block. Only
+        // the instruction index itself is truncated; the core block (already
+        // counted in the manifest) is head-truncated too when it is what
+        // overflows.
         let mut manifest_truncated = false;
         let manifest = if manifest.len() > self.config.manifest_budget {
             manifest_truncated = true;
-            let mut m = head_truncate(&manifest, self.config.manifest_budget).to_string();
-            m.push_str("\n[... instruction index truncated]\n");
-            m
+            let mut budget = self.config.manifest_budget;
+            let mut out = String::new();
+            if let Some((head, tail)) = split_manifest_tail(&manifest) {
+                // head = everything through the closing ``</instructions>`` (or
+                // the whole manifest when unclosed); tail = the core block.
+                if head.len() <= budget {
+                    // The instruction index fits; truncate the core tail only.
+                    out.push_str(&head);
+                    budget -= head.len();
+                    if !tail.is_empty() && budget > 0 {
+                        out.push_str(&head_truncate(&tail, budget));
+                    }
+                    out.push_str("\n[... instruction index truncated]\n");
+                } else {
+                    // The instruction index itself overflows: keep the opening
+                    // tag + as many entries as fit + a re-closed tag.
+                    let open_len = "<instructions>\n".len();
+                    let close_len = "</instructions>\n".len();
+                    let inner_budget = budget.saturating_sub(open_len + close_len);
+                    out.push_str("<instructions>\n");
+                    let body = &manifest[open_len..manifest.rfind("</instructions>").unwrap_or(manifest.len())];
+                    out.push_str(&head_truncate(body, inner_budget));
+                    out.push_str("\n[... instruction index truncated]\n");
+                    out.push_str("</instructions>\n");
+                }
+            } else {
+                out.push_str(&head_truncate(&manifest, budget));
+                out.push_str("\n[... instruction index truncated]\n");
+            }
+            out
         } else {
             manifest
         };
@@ -824,6 +863,25 @@ fn head_truncate(s: &str, max_chars: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Split the rendered manifest into `(instruction_index_through_closing_tag,
+/// trailing_core_block)`. The instruction index is everything through the
+/// closing ``</instructions>``; the core block (``## Core``) trails it. When
+/// the manifest is not as expected, returns the whole thing with an empty tail
+/// so the caller can safely head-truncate.
+fn split_manifest_tail(manifest: &str) -> Option<(String, String)> {
+    let close_marker = "</instructions>\n";
+    match manifest.find(close_marker) {
+        Some(idx) => {
+            let end = idx + close_marker.len();
+            Some((
+                manifest[..end].to_string(),
+                manifest[end..].to_string(),
+            ))
+        }
+        None => Some((manifest.to_string(), String::new())),
+    }
 }
 
 #[async_trait]
@@ -1112,6 +1170,58 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         let ed = deduped.iter().find(|r| r.name() == "event-driven-swarm").unwrap();
         assert_eq!(ed.scope, "repo:/repo");
+    }
+
+    #[tokio::test]
+    async fn prompt_build_manifest_truncation_preserves_closing_tag() {
+        // When the manifest is over `manifest_budget`, the `<instructions>`
+        // block must STAY well-formed: the closing `</instructions>` tag must
+        // survive so downstream parsers (the eval inventory) see a closed block
+        // — the P1 AFTER run caught the old head-truncate cutting the close tag
+        // and leaving a dangling block.
+        let dir = std::env::temp_dir().join(format!("zc-rules-trunc-{}", std::process::id()));
+        let rules_dir = dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        // A corpus large enough to overflow a deliberately tiny budget.
+        for i in 0..40 {
+            std::fs::write(
+                rules_dir.join(format!("rule-{i:02}.md")),
+                format!(
+                    "---\nname: rule-{i:02}\ndescription: binds when doing rule-{i:02} work with a long enough description to fill the manifest quickly\n---\nBody {i}.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: rules_dir.to_string_lossy().into_owned(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: false,
+            manifest_budget: 1024, // force truncation
+            attach_budget: 8000,
+            ..RulesHookConfig::default()
+        });
+        let ctx = PromptBuildHookContext::new("director", dir.clone(), "sess-1", "turn-1");
+        match hook
+            .before_prompt_build_with_context(&ctx, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(prompt) => {
+                assert!(prompt.contains("<instructions>"), "opening tag present");
+                assert!(
+                    prompt.contains("</instructions>"),
+                    "closing tag must survive truncation — got a dangling block"
+                );
+                assert!(
+                    prompt.contains("instruction index truncated"),
+                    "the truncation note is emitted"
+                );
+            }
+            HookResult::Cancel(_) => panic!("rules hook must continue"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
