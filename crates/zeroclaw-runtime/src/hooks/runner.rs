@@ -113,6 +113,11 @@ impl HookRunner {
                 }
             }
         }
+        if hooks.builtin.rules.enabled {
+            runner.register(Box::new(super::builtin::RulesHook::new(
+                hooks.builtin.rules.clone(),
+            )));
+        }
         runner
     }
 
@@ -1614,6 +1619,7 @@ mod tests {
             builtin: zeroclaw_config::schema::BuiltinHooksConfig {
                 command_logger: false,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+                ..Default::default()
             },
         };
         let runner = HookRunner::from_config(&config);
@@ -1630,6 +1636,7 @@ mod tests {
             builtin: zeroclaw_config::schema::BuiltinHooksConfig {
                 command_logger: true,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+                ..Default::default()
             },
         };
         let runner = HookRunner::from_config(&config);
@@ -1651,6 +1658,7 @@ mod tests {
                     url: "http://example.com/audit".to_string(),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         };
 
