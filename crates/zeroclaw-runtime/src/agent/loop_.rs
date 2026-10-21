@@ -1223,8 +1223,26 @@ async fn agent_turn_with_sop_reassembly(
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+<<<<<<< HEAD
     capability_binding: Option<&crate::composition::BoundCapabilities>,
+=======
+    // The hook runner to thread into the turn's `ResolvedIo.hooks`, so the
+    // rules hook's `on_after_tool_call` attach-trigger fires in THIS turn path
+    // (the webhook / `process_message` route) exactly as it does in the
+    // `agent.rs::Agent` and channels orchestrator paths. `None` on the plain
+    // `agent_turn` wrapper and in hooks-disabled configs.
+    hooks: Option<&crate::hooks::HookRunner>,
+>>>>>>> 850f30d4c0 (fix(runtime): thread hook runner into the process_message turn's tool-call hooks)
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(hook) = AGENT_TURN_HOOKS_WIRED_TEST_HOOK
+        .lock()
+        .expect("agent-turn hooks-wired test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(hooks.is_some());
+    }
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let shared_budget = ExecutionTreeBudget::current()
         .map(|budget| budget.child())
@@ -1297,7 +1315,7 @@ async fn agent_turn_with_sop_reassembly(
                 approval,
                 multimodal_config,
                 config,
-                hooks: None,
+                hooks,
                 activated_tools,
                 model_switch_callback,
                 receipt_generator: None,
@@ -1563,6 +1581,38 @@ static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
     Mutex<Option<AgentTurnSopReassemblyTestHook>>,
 > = LazyLock::new(|| Mutex::new(None));
 
+<<<<<<< HEAD
+=======
+/// Test-only probe: records whether `agent_turn_with_sop_reassembly` threaded a
+/// `HookRunner` into the turn's `ResolvedIo.hooks`. Exists to pin the
+/// CONTEXT-LAYERS-TOOL-HOOK-WIRING defect (the webhook turn path hardcoded
+/// `hooks: None`, so the rules hook's `on_after_tool_call` attach trigger never
+/// fired — the same seam class as the prompt-build fix, one turn path over).
+#[cfg(test)]
+type AgentTurnHooksWiredTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+#[cfg(test)]
+static AGENT_TURN_HOOKS_WIRED_TEST_HOOK: LazyLock<
+    Mutex<Option<AgentTurnHooksWiredTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+fn api_key_and_uri_for_provider(
+    config: &zeroclaw_config::schema::Config,
+    provider_name: &str,
+    fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
+) -> (Option<String>, Option<String>) {
+    if let Some((fam, al)) = provider_name.split_once('.')
+        && let Some(entry) = config.providers.models.find(fam, al)
+    {
+        return (entry.api_key.clone(), entry.uri.clone());
+    }
+    (
+        fallback.and_then(|e| e.api_key.clone()),
+        fallback.and_then(|e| e.uri.clone()),
+    )
+}
+
+>>>>>>> 850f30d4c0 (fix(runtime): thread hook runner into the process_message turn's tool-call hooks)
 /// Project a typed terminal-completion failure only at the direct CLI boundary.
 ///
 /// The typed error's `Display` remains the stable diagnostic used by provider
@@ -4499,7 +4549,16 @@ async fn process_message_inner(
                         live_config,
                         memory_owner: mem.principal_scope(),
                     }),
+<<<<<<< HEAD
                     Some(&bound_capabilities),
+=======
+                    // The same prompt-build hook runner is threaded into the
+                    // turn's tool-call hooks, so the rules hook's
+                    // `on_after_tool_call` attach trigger fires on THIS turn
+                    // path (the webhook / process_message route) — matching the
+                    // agent.rs + channels seams. CONTEXT-LAYERS-TOOL-HOOK-WIRING.
+                    prompt_build_hooks.as_deref(),
+>>>>>>> 850f30d4c0 (fix(runtime): thread hook runner into the process_message turn's tool-call hooks)
                 ),
             )
             .await
@@ -21108,6 +21167,90 @@ Let me check the result."#;
         )
         .await;
         assert_eq!(prompt, "PLAIN PROMPT");
+    }
+
+    #[tokio::test]
+    async fn process_message_threads_hook_runner_into_agent_turn() {
+        // CONTEXT-LAYERS-TOOL-HOOK-WIRING: the webhook / process_message turn
+        // path must thread the configured HookRunner into the turn's
+        // ResolvedIo.hooks, so the rules hook's on_after_tool_call attach
+        // trigger fires here too. Before the fix this path hardcoded
+        // `hooks: None` (only the prompt-build hook was wired), so a tool
+        // write via the webhook never populated the in-play set. This test
+        // pins the defect via the AGENT_TURN_HOOKS_WIRED_TEST_HOOK probe.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, HooksConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("process-message-hooks-wiring-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "process-message-hooks-wiring-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.hooks = HooksConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let wired = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let wired_for_hook = Arc::clone(&wired);
+        {
+            let mut hook = super::AGENT_TURN_HOOKS_WIRED_TEST_HOOK
+                .lock()
+                .expect("hooks-wired test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |is_some| {
+                wired_for_hook
+                    .lock()
+                    .expect("wired lock should not be poisoned")
+                    .push(is_some);
+            }));
+        }
+
+        // The provider is unreachable, so the turn fails — but the hook runner
+        // is threaded into agent_turn_with_sop_reassembly regardless of the
+        // provider outcome, which is exactly what the probe records.
+        let _ = super::process_message(
+            config,
+            "process-message-hooks-wiring-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+            None,
+        )
+        .await;
+
+        {
+            let mut hook = super::AGENT_TURN_HOOKS_WIRED_TEST_HOOK
+                .lock()
+                .expect("hooks-wired test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let wired = wired.lock().expect("wired lock should not be poisoned");
+        assert!(
+            wired.iter().any(|is_some| *is_some),
+            "process_message must thread a HookRunner into the turn's ResolvedIo.hooks; observed {wired:?}"
+        );
     }
 
     #[tokio::test]
