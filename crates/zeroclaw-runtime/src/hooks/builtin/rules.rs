@@ -55,6 +55,10 @@ pub(crate) struct Rule {
     pub mtime_secs: u64,
     /// Raw body (text after the frontmatter block).
     pub body: String,
+    /// Depth of the rule's path relative to its scope root, in path
+    /// components. Used by deepest-wins dedup (§4.10/N4): when the same name
+    /// appears twice within a scope, the deeper (more nested) file wins.
+    pub depth: usize,
 }
 
 impl Rule {
@@ -77,6 +81,40 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ── AGENTS.md delivery (§4.10) ──────────────────────────────────
+
+/// The stable block-start marker for idempotent injection (I1). On build, if
+/// this marker is already present in the prompt, the hook replaces everything
+/// from the marker to the end rather than appending — a body delivered twice
+/// within a turn, or re-sent across turns, cannot accumulate.
+const RULES_HOOK_MARKER: &str = "<!-- rules-hook:v1 -->";
+
+/// Chars cap for a repo-root `AGENTS.md` body delivered once per session.
+///
+/// Mirrors the engine's own `COMPACT_BOOTSTRAP_MAX_CHARS` (6000) so a repo
+/// `AGENTS.md` delivered by the hook fits the same headroom the engine
+/// itself assumes for bootstrap files. Over-budget bodies are head-truncated
+/// with an explicit note (§4.10 "bounded digest when over budget").
+const AGENTS_MD_ROOT_BODY_MAX_CHARS: usize = 6000;
+
+/// A discovered `AGENTS.md` delivery item (§4.10): VS Code's root + nested
+/// `AGENTS.md` listing, with the pod's location-driven attach replacing the
+/// model's judgment.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentsMd {
+    /// Absolute path to the `AGENTS.md` file.
+    pub path: PathBuf,
+    /// The directory containing this file — its implicit `applyTo: <dir>/**`.
+    pub dir: PathBuf,
+    /// Scope: `"workspace"` or `"repo:<root>"`.
+    pub scope: String,
+    /// Whether this is the scope's ROOT `AGENTS.md` (delivered once per
+    /// session) rather than a nested one (implicit-dir attach).
+    pub is_root: bool,
+    /// Raw body text.
+    pub body: String,
 }
 
 // ── The matcher (§4.5) ─────────────────────────────────────────
@@ -256,6 +294,38 @@ fn scan_rules_dir(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Recursively scan a directory for `AGENTS.md` files (§4.10).
+///
+/// Returns `(path, is_root)` pairs: the directory's own `AGENTS.md` is the
+/// root (`is_root = true`); any `AGENTS.md` in a subdirectory is nested
+/// (`is_root = false`). Unlike the rules corpus, AGENTS.md files are NOT
+/// skipped here — the exclusion of the agent-workspace ROOT `AGENTS.md`
+/// (engine bootstrap) happens at the call sites that know which of these is
+/// the workspace floor.
+fn scan_agents_md(dir: &Path) -> Vec<(PathBuf, bool)> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return out;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("AGENTS.md") {
+                let is_root = path.parent() == Some(dir);
+                out.push((path, is_root));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Resolve a repo scope root for a working directory.
 ///
 /// Order: `git rev-parse --show-toplevel`, then the nearest ancestor
@@ -299,8 +369,14 @@ struct SessionInPlay {
 /// TTL evicted. Shared across the three `HookRunner::from_root_config` sites
 /// so tool events populate the in-play set the prompt build reads regardless
 /// of which runner instance dispatches them.
+///
+/// `delivered_roots` carries the once-per-session repo-root `AGENTS.md`
+/// delivery set (§4.10), keyed by the SAME `(alias, session_id)` as the
+/// in-play set — the spec's single session registry. Each value holds the
+/// canonicalised repo-root `AGENTS.md` paths already delivered this session.
 struct Registry {
     sessions: HashMap<(String, String), SessionInPlay>,
+    delivered_roots: HashMap<(String, String), HashSet<String>>,
     order: Vec<(String, String)>,
 }
 
@@ -314,6 +390,7 @@ fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
     let reg = guard.get_or_insert_with(|| Registry {
         sessions: HashMap::new(),
+        delivered_roots: HashMap::new(),
         order: Vec::new(),
     });
     f(reg)
@@ -363,11 +440,31 @@ impl Registry {
         while self.order.len() > SESSION_REGISTRY_CAPACITY {
             if let Some(evicted) = self.order.first().cloned() {
                 self.sessions.remove(&evicted);
+                self.delivered_roots.remove(&evicted);
                 self.order.remove(0);
             } else {
                 break;
             }
         }
+    }
+
+    /// Record that a repo-root `AGENTS.md` path was delivered this session.
+    fn record_delivered_root(&mut self, alias: &str, session_id: &str, path: &str) {
+        let key = (alias.to_string(), session_id.to_string());
+        self.delivered_roots
+            .entry(key.clone())
+            .or_default()
+            .insert(path.to_string());
+        self.touch(&key);
+    }
+
+    /// Whether a repo-root `AGENTS.md` path was already delivered this session.
+    fn root_delivered(&mut self, alias: &str, session_id: &str, path: &str) -> bool {
+        let key = (alias.to_string(), session_id.to_string());
+        self.delivered_roots
+            .get(&key)
+            .map(|set| set.contains(path))
+            .unwrap_or(false)
     }
 }
 
@@ -380,6 +477,16 @@ fn record_in_play_path(alias: &str, session_id: &str, path: &str, cap: usize) {
 fn read_in_play_paths(alias: &str, session_id: &str) -> Vec<String> {
     let now = now_secs();
     with_registry(|reg| reg.in_play(alias, session_id, now))
+}
+
+/// Mark a repo-root `AGENTS.md` as delivered this session (§4.10 once-per-
+/// session delivery, tracked in the same registry key as the in-play set).
+fn record_root_agents_delivered(alias: &str, session_id: &str, path: &str) {
+    with_registry(|reg| reg.record_delivered_root(alias, session_id, path));
+}
+
+fn root_agents_delivered(alias: &str, session_id: &str, path: &str) -> bool {
+    with_registry(|reg| reg.root_delivered(alias, session_id, path))
 }
 
 // ── Tool-arg path extraction (best-effort) ──────────────────────
@@ -492,7 +599,7 @@ impl RulesHook {
             let dir = PathBuf::from(&self.config.global_dir);
             if dir.is_dir() {
                 for p in scan_rules_dir(&dir) {
-                    if let Some(rule) = self.load_rule(&p, "global".to_string()) {
+                    if let Some(rule) = self.load_rule(&p, "global".to_string(), &dir) {
                         rules.push(rule);
                     }
                 }
@@ -508,7 +615,7 @@ impl RulesHook {
             .join(&self.config.workspace_dir);
         if ws_dir.is_dir() {
             for p in scan_rules_dir(&ws_dir) {
-                if let Some(rule) = self.load_rule(&p, "workspace".to_string()) {
+                if let Some(rule) = self.load_rule(&p, "workspace".to_string(), &ws_dir) {
                     rules.push(rule);
                 }
             }
@@ -523,7 +630,7 @@ impl RulesHook {
                 if rules_root.is_dir() {
                     for p in scan_rules_dir(&rules_root) {
                         if let Some(rule) =
-                            self.load_rule(&p, format!("repo:{}", root.display()))
+                            self.load_rule(&p, format!("repo:{}", root.display()), &rules_root)
                         {
                             rules.push(rule);
                         }
@@ -595,7 +702,7 @@ impl RulesHook {
         roots
     }
 
-    fn load_rule(&self, path: &Path, scope: String) -> Option<Rule> {
+    fn load_rule(&self, path: &Path, scope: String, scope_root: &Path) -> Option<Rule> {
         // Cache is keyed by path+mtime via the frontmatter parse below; we
         // re-read on mtime change. A `cached` map is kept process-global.
         let Ok(raw) = std::fs::read_to_string(path) else {
@@ -633,17 +740,24 @@ impl RulesHook {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Scope-relative depth (path components) drives deepest-wins dedup.
+        let depth = path
+            .strip_prefix(scope_root)
+            .map(|rel| rel.components().count())
+            .unwrap_or(0);
         Some(Rule {
             path: path.to_path_buf(),
             frontmatter,
             scope,
             mtime_secs,
             body,
+            depth,
         })
     }
 
     /// Build the deduped union of rules across scopes, repo instance wins over
-    /// shared copy when both are active.
+    /// shared copy when both are active; within a scope, the deepest (most
+    /// nested) scope-relative path wins and the winner is logged (N4/§4.10).
     fn dedup_by_name(&self, rules: Vec<Rule>) -> Vec<Rule> {
         let mut by_name: HashMap<String, Rule> = HashMap::new();
         for rule in rules {
@@ -651,13 +765,39 @@ impl RulesHook {
             if name.is_empty() {
                 continue;
             }
-            let entry = by_name.entry(name.clone()).or_insert_with(|| rule.clone());
-            // A repo instance (scope starts with "repo:") wins over a global/
-            // workspace shared copy; the first that isn't a repo keeps its spot.
-            let is_repo = rule.scope.starts_with("repo:");
-            let existing_is_repo = entry.scope.starts_with("repo:");
-            if is_repo && !existing_is_repo {
-                *entry = rule.clone();
+            let replace = match by_name.get(&name) {
+                None => true,
+                Some(existing) => {
+                    let is_repo = rule.scope.starts_with("repo:");
+                    let existing_is_repo = existing.scope.starts_with("repo:");
+                    if is_repo && !existing_is_repo {
+                        // Repo instance beats a global/workspace shared copy.
+                        true
+                    } else if !is_repo && existing_is_repo {
+                        // A shared copy never displaces a repo instance.
+                        false
+                    } else if rule.scope == existing.scope {
+                        // Same scope: deepest scope-relative path wins (N4).
+                        let deeper = rule.depth > existing.depth;
+                        if deeper {
+                            log_once(
+                                &format!("rules-deepest-wins:{name}"),
+                                &format!(
+                                    "rules hook: same name '{name}' at depth {} overrides depth {} in scope '{}'",
+                                    rule.depth, existing.depth, rule.scope
+                                ),
+                            );
+                        }
+                        deeper
+                    } else {
+                        // Different non-repo scopes (global vs workspace): the
+                        // first discovery order wins (global comes first).
+                        false
+                    }
+                }
+            };
+            if replace {
+                by_name.insert(name, rule.clone());
             }
         }
         let mut out: Vec<Rule> = by_name.into_values().collect();
@@ -801,12 +941,206 @@ impl RulesHook {
         (out, attached_count, attached_chars)
     }
 
+    /// Discover `AGENTS.md` delivery items across the active scopes (§4.10).
+    ///
+    /// Repo scopes contribute their ROOT `AGENTS.md` (deliver once per session)
+    /// plus every NESTED `AGENTS.md` (implicit `applyTo: <dir>/**` attach). The
+    /// workspace contributes only its NESTED `AGENTS.md` files: the workspace
+    /// ROOT `AGENTS.md` is the engine bootstrap file and is never re-listed.
+    /// Discovered files are deduped by canonicalised path so a repo root that
+    /// coincides with the workspace floor is not listed twice.
+    fn discover_agents_md(&self, ctx: &PromptBuildHookContext) -> Vec<AgentsMd> {
+        let mut out: Vec<AgentsMd> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        // Workspace scope — nested AGENTS.md only (root = engine bootstrap).
+        let ws = ctx.workspace();
+        if ws.is_dir() {
+            for (path, is_root) in scan_agents_md(ws) {
+                if is_root {
+                    continue; // engine bootstrap, never re-listed
+                }
+                if let Some(md) = self.load_agents_md(&path, "workspace".to_string(), false)
+                    && seen.insert(path.clone())
+                {
+                    out.push(md);
+                }
+            }
+        }
+
+        // Repo scopes — root + nested AGENTS.md.
+        if self.config.repo_discovery {
+            for root in self.resolve_repo_roots(ctx) {
+                if !root.is_dir() {
+                    continue;
+                }
+                for (path, is_root) in scan_agents_md(&root) {
+                    if let Some(md) = self.load_agents_md(
+                        &path,
+                        format!("repo:{}", root.display()),
+                        is_root,
+                    ) && seen.insert(path.clone())
+                    {
+                        out.push(md);
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| a.scope.cmp(&b.scope).then(a.path.cmp(&b.path)));
+        out
+    }
+
+    fn load_agents_md(&self, path: &Path, scope: String, is_root: bool) -> Option<AgentsMd> {
+        let Ok(body) = std::fs::read_to_string(path) else {
+            log_once(
+                &format!("agents-md-unreadable:{}", path.display()),
+                "rules hook: unreadable AGENTS.md skipped",
+            );
+            return None;
+        };
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Some(AgentsMd {
+            path: path.to_path_buf(),
+            dir,
+            scope,
+            is_root,
+            body,
+        })
+    }
+
+    /// Build the AGENTS.md delivery block (§4.10).
+    ///
+    /// - Repo-root `AGENTS.md`: the first repo-scope turn delivers the body
+    ///   (bounded digest), later turns emit the one-line pointer. Delivery is
+    ///   tracked in the session registry so the body is injected exactly once
+    ///   per session per repo root.
+    /// - Nested `AGENTS.md`: when an in-play (modified) path is under its
+    ///   directory, the body attaches (bounded by `attach_budget`); otherwise
+    ///   it contributes an index entry with its folder description.
+    ///
+    /// Returns the block text and the count of root bodies delivered.
+    fn build_agents_md_block(&self, ctx: &PromptBuildHookContext) -> (String, usize) {
+        let agents = self.discover_agents_md(ctx);
+        if agents.is_empty() {
+            return (String::new(), 0);
+        }
+
+        let alias = ctx.alias();
+        let session_id = ctx.session_id();
+        let in_play: Vec<PathBuf> = read_in_play_paths(alias, session_id)
+            .into_iter()
+            .map(|p| {
+                let path = Path::new(&p);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    ctx.workspace().join(path)
+                }
+            })
+            .collect();
+
+        let mut root_bodies: Vec<&AgentsMd> = Vec::new();
+        let mut root_pointers: Vec<&AgentsMd> = Vec::new();
+        let mut nested_attached: Vec<&AgentsMd> = Vec::new();
+        let mut nested_indexed: Vec<&AgentsMd> = Vec::new();
+
+        for md in &agents {
+            if md.is_root {
+                let key = md
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| md.path.clone());
+                let key = key.to_string_lossy();
+                if root_agents_delivered(alias, session_id, &key) {
+                    root_pointers.push(md);
+                } else {
+                    root_bodies.push(md);
+                    record_root_agents_delivered(alias, session_id, &key);
+                }
+            } else {
+                let under_dir = in_play.iter().any(|p| p.starts_with(&md.dir));
+                if under_dir {
+                    nested_attached.push(md);
+                } else {
+                    nested_indexed.push(md);
+                }
+            }
+        }
+
+        let mut out = String::new();
+        let mut delivered = 0usize;
+
+        // 1. Root bodies (once per session).
+        for md in root_bodies {
+            if out.is_empty() {
+                out.push_str("\n## Repo instructions (AGENTS.md)\n");
+            }
+            delivered += 1;
+            let heading = format!("### {} {}\n", md.scope, md.path.display());
+            out.push_str(&heading);
+            let (head, truncated) = bounded_digest(&md.body, AGENTS_MD_ROOT_BODY_MAX_CHARS);
+            out.push_str(head);
+            if truncated {
+                out.push_str("\n[... AGENTS.md truncated — read the file for full content]\n");
+            }
+            out.push('\n');
+        }
+
+        // 2. Root pointers (already delivered this session).
+        for md in root_pointers {
+            if out.is_empty() {
+                out.push_str("\n## Repo instructions (AGENTS.md)\n");
+            }
+            out.push_str(&format!(
+                "{} — repo instructions loaded (AGENTS.md, {} chars) — re-read with file_read if needed\n",
+                md.scope,
+                md.body.chars().count()
+            ));
+        }
+
+        // 3. Nested attached bodies (in-play dir match).
+        let mut nested_budget = self.config.attach_budget;
+        for md in nested_attached {
+            let block =
+                format!("### {} {}\n{}", md.scope, md.path.display(), md.body);
+            if nested_budget == 0 {
+                break;
+            }
+            if block.len() > nested_budget {
+                let head = head_truncate(&block, nested_budget);
+                out.push_str("\n## Attached AGENTS.md — in-play directory\n");
+                out.push_str(head);
+                out.push_str("\n[... attached AGENTS.md truncated]\n");
+                break;
+            }
+            out.push_str("\n## Attached AGENTS.md — in-play directory\n");
+            out.push_str(&block);
+            nested_budget -= block.len();
+        }
+
+        // 4. Nested indexed-only entries (out of play): folder description.
+        for md in nested_indexed {
+            if out.is_empty() {
+                out.push_str("\n## AGENTS.md index\n");
+            }
+            out.push_str(&format!(
+                "<instruction>\n<file>{}</file>\n<folder>{}</folder>\n</instruction>\n",
+                md.scope,
+                md.dir.display()
+            ));
+        }
+
+        (out, delivered)
+    }
+
     /// Compose the full rules block appended to the prompt.
     fn build_block(&self, ctx: &PromptBuildHookContext) -> (String, usize, usize, usize, bool) {
         let rules = self.dedup_by_name(self.discover(ctx));
         let manifest = self.render_manifest(&rules);
         let (attach, attached_count, attached_chars) =
             self.build_attach_block(&rules, ctx.alias(), ctx.session_id());
+        let (agents_md_block, _agents_delivered) = self.build_agents_md_block(ctx);
 
         // Budget the manifest + core block (head-truncate with a note). The
         // `<instructions>` block must STAY well-formed even when truncated: cut
@@ -854,6 +1188,7 @@ impl RulesHook {
 
         let mut block = manifest;
         block.push_str(&attach);
+        block.push_str(&agents_md_block);
         (
             block,
             rules.len(),
@@ -873,6 +1208,51 @@ fn head_truncate(s: &str, max_chars: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Head-truncate a body to `max_chars`, returning `(head, truncated)`.
+fn bounded_digest(body: &str, max_chars: usize) -> (&str, bool) {
+    if body.len() <= max_chars {
+        (body, false)
+    } else {
+        (head_truncate(body, max_chars), true)
+    }
+}
+
+/// Apply the rules block to the prompt idempotently (I1).
+///
+/// The block (if non-empty) is emitted after the `<!-- rules-hook:v1 -->`
+/// marker at the block start. If the marker is already present in the prompt,
+/// everything from the marker to the end is replaced rather than appended, so
+/// running the hook twice on one prompt yields exactly one block. When the
+/// block is empty and a prior block is present, the prior block is stripped.
+fn apply_rules_hook(prompt: String, block: &str) -> String {
+    let block = block.trim_matches('\n');
+    if let Some(idx) = prompt.find(RULES_HOOK_MARKER) {
+        // Replace from the marker to the end.
+        let mut out = prompt[..idx].to_string();
+        if !block.is_empty() {
+            let _ = out.pop(); // drop the trailing newline before the marker
+            out.push('\n');
+            out.push_str(RULES_HOOK_MARKER);
+            out.push('\n');
+            out.push_str(block);
+            out.push('\n');
+        }
+        out
+    } else if block.is_empty() {
+        prompt
+    } else {
+        let mut out = prompt;
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(RULES_HOOK_MARKER);
+        out.push('\n');
+        out.push_str(block);
+        out.push('\n');
+        out
+    }
 }
 
 /// Split the rendered manifest into `(instruction_index_through_closing_tag,
@@ -931,7 +1311,9 @@ impl HookHandler for RulesHook {
                 "rules block injected into system prompt"
             );
         }
-        HookResult::Continue(format!("{prompt}\n\n{block}"))
+        // I1 idempotency: emit the marker at the block start; if it is already
+        // present in the prompt, replace from the marker rather than append.
+        HookResult::Continue(apply_rules_hook(prompt, &block))
     }
 
     async fn on_after_tool_call_with_context_and_args(
@@ -1160,7 +1542,7 @@ mod tests {
     #[test]
     fn dedup_by_name_repo_wins_over_global() {
         let hook = RulesHook::new(RulesHookConfig::default());
-        let mk = |name: &str, scope: &str| Rule {
+        let mk = |name: &str, scope: &str, depth: usize| Rule {
             path: PathBuf::from(format!("/{scope}/{name}.md")),
             frontmatter: RuleFrontmatter {
                 name: name.to_string(),
@@ -1170,16 +1552,53 @@ mod tests {
             scope: scope.to_string(),
             mtime_secs: 0,
             body: String::new(),
+            depth,
         };
         let rules = vec![
-            mk("event-driven-swarm", "global"),
-            mk("event-driven-swarm", "repo:/repo"),
-            mk("quorum-review", "global"),
+            mk("event-driven-swarm", "global", 0),
+            mk("event-driven-swarm", "repo:/repo", 0),
+            mk("quorum-review", "global", 0),
         ];
         let deduped = hook.dedup_by_name(rules);
         assert_eq!(deduped.len(), 2);
         let ed = deduped.iter().find(|r| r.name() == "event-driven-swarm").unwrap();
         assert_eq!(ed.scope, "repo:/repo");
+    }
+
+    #[test]
+    fn dedup_by_name_deepest_wins_within_scope() {
+        // N4/§4.10: the same rule name within a scope resolves to the deepest
+        // (most nested) scope-relative path; repo still beats global across
+        // scopes regardless of depth.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let mk = |name: &str, scope: &str, depth: usize| Rule {
+            path: PathBuf::from(format!("/{scope}/{name}.md")),
+            frontmatter: RuleFrontmatter {
+                name: name.to_string(),
+                description: "when".into(),
+                ..Default::default()
+            },
+            scope: scope.to_string(),
+            mtime_secs: 0,
+            body: String::new(),
+            depth,
+        };
+        // Same global scope, two depths → the deeper (depth 2) wins.
+        let global_shallow = mk("shared-rule", "global", 0);
+        let global_deep = mk("shared-rule", "global", 2);
+        let deduped = hook.dedup_by_name(vec![global_shallow.clone(), global_deep.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].depth, 2, "deepest within a scope wins");
+
+        // Repo still beats global even when the repo instance is shallower.
+        let repo_shallow = mk("shared-rule", "repo:/repo", 0);
+        let global_deep2 = mk("shared-rule", "global", 5);
+        let deduped2 = hook.dedup_by_name(vec![global_deep2, repo_shallow]);
+        assert_eq!(deduped2.len(), 1);
+        assert_eq!(
+            deduped2[0].scope, "repo:/repo",
+            "repo still beats global across scopes, depth notwithstanding"
+        );
     }
 
     #[tokio::test]
@@ -1383,6 +1802,210 @@ mod tests {
         assert!(
             roots.iter().any(|r| r.canonicalize().map(|c| c == expected).unwrap_or(false)),
             "a workspace-relative in-play path must resolve its nested repo root; got {roots:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_agents_md_lists_root_and_nested() {
+        let dir = std::env::temp_dir().join(format!("zc-agents-scan-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "root\n").unwrap();
+        std::fs::write(dir.join("sub").join("AGENTS.md"), "nested\n").unwrap();
+
+        let found = scan_agents_md(&dir);
+        assert_eq!(found.len(), 2);
+        let by_name: Vec<(bool, String)> = found
+            .iter()
+            .map(|(p, is_root)| (*is_root, p.to_string_lossy().into_owned()))
+            .collect();
+        assert!(by_name.iter().any(|(r, p)| *r && p.ends_with("AGENTS.md") && !p.contains("/sub/")));
+        assert!(by_name.iter().any(|(r, p)| !*r && p.contains("/sub/AGENTS.md")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_root_agents_md_delivers_once_then_pointer() {
+        // §4.10: the repo-root AGENTS.md body is delivered exactly once per
+        // session; later turns emit the one-line pointer instead of the body.
+        let dir = std::env::temp_dir().join(format!("zc-agents-root-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let body = "PROJECT LAW: never sleep-poll.\n";
+        std::fs::write(repo.join("AGENTS.md"), body).unwrap();
+        // Make it a git repo so resolve_repo_root returns the repo root.
+        let _ = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
+            .status();
+
+        // Isolate the registry.
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            ..RulesHookConfig::default()
+        });
+
+        let ctx = PromptBuildHookContext::new("director", repo.clone(), "sess-root", "turn-1");
+        match hook
+            .before_prompt_build_with_context(&ctx, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(p) => {
+                assert!(p.contains("PROJECT LAW: never sleep-poll"), "first turn delivers body");
+            }
+            HookResult::Cancel(_) => panic!("must continue"),
+        }
+
+        // Second turn: pointer, not body.
+        let ctx2 = PromptBuildHookContext::new("director", repo.clone(), "sess-root", "turn-2");
+        match hook
+            .before_prompt_build_with_context(&ctx2, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(p) => {
+                assert!(
+                    p.contains("repo instructions loaded (AGENTS.md"),
+                    "later turns emit the pointer"
+                );
+                assert!(
+                    !p.contains("PROJECT LAW: never sleep-poll"),
+                    "body is not re-delivered"
+                );
+            }
+            HookResult::Cancel(_) => panic!("must continue"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_root_agents_md_is_excluded() {
+        // §4.10: the agent-workspace ROOT AGENTS.md is the engine bootstrap
+        // file and never appears in the hook's index.
+        let dir = std::env::temp_dir().join(format!("zc-agents-ws-excl-{}", std::process::id()));
+        let ws = dir.join("workspace");
+        std::fs::create_dir_all(ws.join("pkg")).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "bootstrap root\n").unwrap();
+        std::fs::write(ws.join("pkg").join("AGENTS.md"), "nested pkg\n").unwrap();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: false,
+            ..RulesHookConfig::default()
+        });
+        let ctx = PromptBuildHookContext::new("director", ws.clone(), "sess", "turn-1");
+        let agents = hook.discover_agents_md(&ctx);
+        assert_eq!(
+            agents.len(),
+            1,
+            "only the nested AGENTS.md is discovered; the root is excluded"
+        );
+        assert!(!agents[0].is_root);
+        assert!(agents[0].path.ends_with("pkg/AGENTS.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn nested_agents_md_attaches_on_in_play_dir_match() {
+        // §4.10: a nested AGENTS.md attaches its body when a modified in-play
+        // path is under its directory (implicit applyTo: <dir>/**).
+        let dir = std::env::temp_dir().join(format!("zc-agents-nested-{}", std::process::id()));
+        let ws = dir.join("workspace");
+        let sub = ws.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "PKG RULE: only touch pkg files.\n").unwrap();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: false,
+            ..RulesHookConfig::default()
+        });
+
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+        // An in-play path under the nested AGENTS.md's dir.
+        record_in_play_path("director", "sess-nested", "pkg/main.rs", 50);
+
+        let ctx = PromptBuildHookContext::new("director", ws.clone(), "sess-nested", "turn-1");
+        match hook
+            .before_prompt_build_with_context(&ctx, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(p) => {
+                assert!(
+                    p.contains("PKG RULE: only touch pkg files"),
+                    "nested AGENTS.md body attaches on in-play dir match"
+                );
+            }
+            HookResult::Cancel(_) => panic!("must continue"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_injection_yields_one_block() {
+        // I1: running the hook twice on one prompt yields exactly one
+        // `<!-- rules-hook:v1 -->` marker and one block (no double injection).
+        let dir = std::env::temp_dir().join(format!("zc-agents-idem-{}", std::process::id()));
+        let ws = dir.join("workspace");
+        let rules_dir = ws.join(".agents").join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("idem-rule.md"),
+            "---\nname: idem-rule\ndescription: when idempotent work is done\n---\nBody.\n",
+        )
+        .unwrap();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: false,
+            ..RulesHookConfig::default()
+        });
+
+        let ctx = PromptBuildHookContext::new("director", ws.clone(), "sess-idem", "turn-1");
+        let first = match hook
+            .before_prompt_build_with_context(&ctx, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(p) => p,
+            HookResult::Cancel(_) => panic!("must continue"),
+        };
+        let second = match hook
+            .before_prompt_build_with_context(&ctx, first)
+            .await
+        {
+            HookResult::Continue(p) => p,
+            HookResult::Cancel(_) => panic!("must continue"),
+        };
+
+        assert_eq!(
+            second.matches(RULES_HOOK_MARKER).count(),
+            1,
+            "exactly one marker after two builds"
+        );
+        assert_eq!(
+            second.matches("<instructions>").count(),
+            1,
+            "exactly one instruction block"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
