@@ -267,13 +267,27 @@ fn parse_frontmatter(yaml: &str) -> Result<RuleFrontmatter, String> {
 
 /// Recursively scan a directory for `*.md` rules files, skipping `AGENTS.md`
 /// (which is engine bootstrap territory, not the rules corpus).
+///
+/// Symlink-safety (N6): a symlinked directory is NOT followed. Following a
+/// self-referential symlink recurses forever, and following a symlink back up
+/// the tree re-scans already-seen files. We track canonicalised directory
+/// paths in `seen` and skip any directory whose canonical path was already
+/// visited; a symlink resolves to its target's canonical path, so a loop or a
+/// back-dip lands on an already-seen path and is skipped.
 fn scan_rules_dir(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !dir.is_dir() {
         return out;
     }
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
+        if let Ok(canon) = std::fs::canonicalize(&current)
+            && !seen.insert(canon)
+        {
+            // Already visited (directly or via a symlink) — skip.
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
@@ -291,6 +305,7 @@ fn scan_rules_dir(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort();
+    out.dedup();
     out
 }
 
@@ -307,8 +322,14 @@ fn scan_agents_md(dir: &Path) -> Vec<(PathBuf, bool)> {
     if !dir.is_dir() {
         return out;
     }
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
+        if let Ok(canon) = std::fs::canonicalize(&current)
+            && !seen.insert(canon)
+        {
+            continue; // already visited (directly or via a symlink) — skip
+        }
         let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
@@ -323,6 +344,7 @@ fn scan_agents_md(dir: &Path) -> Vec<(PathBuf, bool)> {
         }
     }
     out.sort();
+    out.dedup();
     out
 }
 
@@ -1429,6 +1451,64 @@ fn log_once(condition: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_rules_dir_does_not_follow_symlink_dirs() {
+        // N6: a symlinked directory inside the corpus must not be followed —
+        // following a self-referential symlink recurses forever (or, for a
+        // non-cyclic but duplicating symlink, double-scans the same files).
+        let dir = std::env::temp_dir().join(format!("zc-rules-symlink-{}", std::process::id()));
+        let rules = dir.join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(
+            rules.join("real-rule.md"),
+            "---\nname: real-rule\ndescription: when\n---\nBody.\n",
+        )
+        .unwrap();
+        // A self-referential symlink (would loop forever if followed) AND a
+        // symlink back up to the parent (would re-scan real-rule.md twice).
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(".", rules.join("self-loop"));
+            let _ = std::os::unix::fs::symlink("..", rules.join("up"));
+        }
+
+        let found = scan_rules_dir(&rules);
+        // Only the single real rule, once — no cycle, no duplicates.
+        let real: Vec<_> = found
+            .iter()
+            .filter(|p| p.file_name().map(|n| n == "real-rule.md").unwrap_or(false))
+            .collect();
+        assert_eq!(
+            real.len(),
+            1,
+            "real-rule.md must be discovered exactly once (no symlink cycle/dup); got {found:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_agents_md_does_not_follow_symlink_dirs() {
+        // N6 (AGENTS.md twin): the same symlink-cycle hazard in scan_agents_md.
+        let dir = std::env::temp_dir().join(format!("zc-agents-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "root\n").unwrap();
+        std::fs::write(dir.join("sub").join("AGENTS.md"), "nested\n").unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(".", dir.join("self-loop"));
+        }
+
+        let found = scan_agents_md(&dir);
+        let real: Vec<_> = found
+            .iter()
+            .filter(|(p, _)| p.file_name().map(|n| n == "AGENTS.md").unwrap_or(false))
+            .collect();
+        assert_eq!(real.len(), 2, "root + nested only, no symlink re-scan; got {found:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn apply_to_matches_always_match_patterns() {
