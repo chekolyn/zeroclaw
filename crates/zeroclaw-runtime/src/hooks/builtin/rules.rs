@@ -1157,7 +1157,21 @@ impl RulesHook {
     }
 
     /// Compose the full rules block appended to the prompt.
-    fn build_block(&self, ctx: &PromptBuildHookContext) -> (String, usize, usize, usize, bool) {
+    ///
+    /// Returns ``(block, manifest_count, attached_count, attached_chars,
+    /// manifest_chars, agents_md_chars, manifest_truncated)`` — the three
+    /// component sizes in addition to the combined block so the caller (and the
+    /// ``rules block injected`` log line) can assert each budget independently:
+    /// ``manifest_chars ≤ manifest_budget`` (index + core), ``attached_chars ≤
+    /// attach_budget`` (attached rule bodies), and ``agents_md_chars`` (the
+    /// once-per-session AGENTS.md delivery, budgeted SEPARATELY by
+    /// ``AGENTS_MD_ROOT_BODY_MAX_CHARS`` — NOT counted against
+    /// ``manifest_budget``). ``injected_chars`` (computed by the caller from
+    /// ``block.len()``) remains the truthful TOTAL of all three.
+    fn build_block(
+        &self,
+        ctx: &PromptBuildHookContext,
+    ) -> (String, usize, usize, usize, usize, usize, bool) {
         let rules = self.dedup_by_name(self.discover(ctx));
         let manifest = self.render_manifest(&rules);
         let (attach, attached_count, attached_chars) =
@@ -1208,7 +1222,7 @@ impl RulesHook {
             manifest
         };
 
-        let mut block = manifest;
+        let mut block = manifest.clone();
         block.push_str(&attach);
         block.push_str(&agents_md_block);
         (
@@ -1216,6 +1230,8 @@ impl RulesHook {
             rules.len(),
             attached_count,
             attached_chars,
+            manifest.len(),
+            agents_md_block.len(),
             manifest_truncated,
         )
     }
@@ -1312,8 +1328,15 @@ impl HookHandler for RulesHook {
         prompt: String,
     ) -> HookResult<String> {
         self.record_turn(ctx);
-        let (block, manifest_count, attached_count, attached_chars, manifest_truncated) =
-            self.build_block(ctx);
+        let (
+            block,
+            manifest_count,
+            attached_count,
+            attached_chars,
+            manifest_chars,
+            agents_md_chars,
+            manifest_truncated,
+        ) = self.build_block(ctx);
         let injected_chars = block.len();
         if !block.is_empty() {
             ::zeroclaw_log::record!(
@@ -1325,6 +1348,8 @@ impl HookHandler for RulesHook {
                         "alias": ctx.alias(),
                         "turn_id": ctx.turn_id(),
                         "injected_chars": injected_chars,
+                        "manifest_chars": manifest_chars,
+                        "agents_md_chars": agents_md_chars,
                         "manifest_count": manifest_count,
                         "attached_count": attached_count,
                         "attached_chars": attached_chars,
@@ -1963,6 +1988,88 @@ mod tests {
             }
             HookResult::Cancel(_) => panic!("must continue"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_block_accounts_agents_md_separately_from_manifest_budget() {
+        // The manifest budget scopes index + core ONLY. The once-per-session
+        // repo-root AGENTS.md body is budgeted by AGENTS_MD_ROOT_BODY_MAX_CHARS
+        // and must NOT count against manifest_budget — otherwise a long
+        // AGENTS.md body (≈6,000 chars) would trip manifest_truncated or push
+        // `manifest_chars` past budget. The combined `block.len()` (what the
+        // log reports as `injected_chars`) legitimately EXCEEDS manifest_budget
+        // when an AGENTS.md body is delivered; the accounting must keep the
+        // three components separable so a consumer can assert the manifest
+        // budget independently.
+        let dir = std::env::temp_dir().join(format!("zc-agents-acct-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join(".agents").join("rules")).unwrap();
+        // One rule so the manifest (index) is small; a body under the default
+        // cap so nothing is digested away, but large enough to blow a small
+        // manifest_budget if it were (wrongly) counted against it.
+        std::fs::write(
+            repo.join(".agents").join("rules").join("demo-rule.md"),
+            "---\nname: demo-rule\ndescription: binds on demo work\n---\nBody.\n",
+        )
+        .unwrap();
+        let agents_body = format!("{}LAW: prove-the-budget.\n", "X".repeat(4000));
+        std::fs::write(repo.join("AGENTS.md"), &agents_body).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
+            .status();
+
+        // Isolate the registry (the build path reads in-play + delivered sets).
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            // A manifest budget generous enough to hold the tiny index but far
+            // smaller than the 4,000-char AGENTS.md body.
+            manifest_budget: 1024,
+            attach_budget: 8000,
+            ..RulesHookConfig::default()
+        });
+
+        let ctx = PromptBuildHookContext::new("director", repo.clone(), "sess-acct", "turn-1");
+        let (block, _count, _ac, _ac_chars, manifest_chars, agents_md_chars, manifest_truncated) =
+            hook.build_block(&ctx);
+
+        // The AGENTS.md body WAS delivered (once-per-session root) …
+        assert!(
+            agents_md_chars > 0,
+            "a repo-root AGENTS.md body must be delivered on turn 1 (agents_md_chars={agents_md_chars})"
+        );
+        assert!(
+            block.contains("LAW: prove-the-budget"),
+            "the AGENTS.md body text is present in the delivered block"
+        );
+        // … and it is tracked SEPARATELY: the manifest (index + core) must not
+        // be inflated by it. The index itself is tiny, so a correct accounting
+        // keeps manifest_chars ≤ budget even though the combined block exceeds
+        // it.
+        assert!(
+            manifest_chars <= 1024,
+            "manifest_cars must stay within manifest_budget=1024 (got {manifest_chars}) — the AGENTS.md body is a separate budget"
+        );
+        // The combined block (what injected_chars reports) DOES exceed the
+        // manifest budget — that is expected and correct, but only because the
+        // AGENTS.md body is inside it.
+        assert!(
+            block.len() > 1024,
+            "combined block (injected_chars) exceeds manifest_budget when an AGENTS.md body is delivered — expected"
+        );
+        assert!(
+            !manifest_truncated,
+            "the small index must NOT be truncated (manifest_truncated=false)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
