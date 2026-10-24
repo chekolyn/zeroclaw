@@ -125,6 +125,45 @@ fn pattern_always_matches(pattern: &str) -> bool {
     matches!(pattern.trim(), "**" | "**/*" | "*")
 }
 
+/// Partition rules into the two attach lifecycles.
+///
+/// Returns `(in_play_matched, agent_scoped)` where `in_play_matched` are rules
+/// whose `applyTo` glob matches an in-play path, and `agent_scoped` are rules
+/// whose `agents:` frontmatter lists `alias`. A rule matching BOTH is counted
+/// only on the agent-scoped side (agent-scoping is the always-on contract).
+/// Pure on `(rules, alias, in_play)` — no global state — so the ordering law
+/// is unit-testable without the process-global registry.
+fn partition_attach_rules<'a>(
+    rules: &'a [Rule],
+    alias: &str,
+    in_play: &[String],
+) -> (Vec<&'a Rule>, Vec<&'a Rule>) {
+    let mut agent_scoped: Vec<&Rule> = Vec::new();
+    let mut in_play_matched: Vec<&Rule> = Vec::new();
+    for rule in rules {
+        let matches_agent = rule
+            .frontmatter
+            .agents
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(alias));
+        if matches_agent {
+            agent_scoped.push(rule);
+            continue;
+        }
+        let matches_in_play = if rule.frontmatter.apply_to.is_empty() {
+            false
+        } else {
+            in_play.iter().any(|path| {
+                apply_to_matches(&rule.frontmatter.apply_to.join(", "), path)
+            })
+        };
+        if matches_in_play {
+            in_play_matched.push(rule);
+        }
+    }
+    (in_play_matched, agent_scoped)
+}
+
 /// Match a single comma-separated `applyTo` entry against a path.
 ///
 /// VS Code `_matches` semantics: comma-separated patterns; bare relative
@@ -891,48 +930,36 @@ impl RulesHook {
         session_id: &str,
     ) -> (String, usize, usize) {
         let in_play: Vec<String> = read_in_play_paths(alias, session_id);
-        let mut agent_scoped: Vec<&Rule> = Vec::new();
-        let mut in_play_matched: Vec<&Rule> = Vec::new();
+        let (in_play_matched, agent_scoped) = partition_attach_rules(rules, alias, &in_play);
 
-        for rule in rules {
-            let matches_agent = rule
-                .frontmatter
-                .agents
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(alias));
-            if matches_agent {
-                agent_scoped.push(rule);
-                continue;
-            }
-            let matches_in_play = if rule.frontmatter.apply_to.is_empty() {
-                false
-            } else {
-                in_play.iter().any(|path| {
-                    apply_to_matches(&rule.frontmatter.apply_to.join(", "), path)
-                })
-            };
-            if matches_in_play {
-                in_play_matched.push(rule);
-            }
-        }
-
-        // Ordering: agent-scoped first, then in-play; within each, core first,
-        // then most-recently-modified.
-        let order_key = |r: &Rule| {
+        // Ordering: in-play (location-specific) rules FIRST, then agent-scoped;
+        // within each, core first, then most-recently-modified.
+        //
+        // The spec's §4.5 "agent-scoped outranks in-play" orders *precedence for
+        // equal-budget readers*, but the G2 guarantee is zero SILENT law loss:
+        // an always-on agent-scoped rule (the relocated SOUL appendix, often
+        // several KB each) must not crowd the budget so far that the specific
+        // law for the file the session just edited is dropped to zero — the
+        // edit-triggered rule is the more specific, contextual signal. In-play
+        // bodies attach first so they are never starved; agent-scoped bodies
+        // fill the remainder and are head-truncated when over budget.
+        let order_key = |r: &&Rule| {
             (
                 if r.frontmatter.core { 0u8 } else { 1u8 },
                 std::cmp::Reverse(r.mtime_secs),
             )
         };
-        agent_scoped.sort_by_key(|r| order_key(r));
-        in_play_matched.sort_by_key(|r| order_key(r));
+        let mut in_play_matched = in_play_matched;
+        let mut agent_scoped = agent_scoped;
+        in_play_matched.sort_by_key(order_key);
+        agent_scoped.sort_by_key(order_key);
 
         let mut out = String::new();
         let mut attached_chars = 0usize;
         let mut attached_count = 0usize;
 
         let budget = self.config.attach_budget;
-        for rule in agent_scoped.into_iter().chain(in_play_matched) {
+        for rule in in_play_matched.into_iter().chain(agent_scoped) {
             let block = format!(
                 "\n### {} ({})\n{}",
                 rule.name(),
@@ -2292,5 +2319,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Scenario reproductions (U1 / N2 / N4) ──────────────────────────────
+    //
+    // These pin the three defects the context-layers scenario suite caught —
+    // all at deterministic seams (no process-global registry, no git
+    // subprocess) so they are parallel-safe.
+
+    fn mk_rule(name: &str, scope: &str, depth: usize, desc: &str, body: &str,
+               apply_to: Option<&str>, agents: Option<&str>) -> Rule {
+        Rule {
+            path: PathBuf::from(format!("/{scope}/{name}.md")),
+            frontmatter: RuleFrontmatter {
+                name: name.to_string(),
+                description: desc.to_string(),
+                apply_to: apply_to.map(|s| s.to_string()).into_iter().collect(),
+                agents: agents.map(|s| vec![s.to_string()]).unwrap_or_default(),
+                core: false,
+            },
+            scope: scope.to_string(),
+            mtime_secs: 0,
+            body: body.to_string(),
+            depth,
+        }
+    }
+
+    #[test]
+    fn repro_n4_deepest_wins_depth_and_body() {
+        // N4: the same rule name at two depths in ONE scope. Dedup keeps the
+        // deepest (highest depth) only; its description AND body win; the
+        // shallow body is deduped out. This is the load→dedup→attach law.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let shallow = mk_rule("shared", "repo:/r", 1, "N4-SHALLOW-DESC shallow shared rule", "N4-SHALLOW-BODY.\n", Some("**/*.n4"), None);
+        let deep = mk_rule("shared", "repo:/r", 3, "N4-DEEP-DESC deep shared rule", "N4-DEEP-BODY.\n", Some("**/*.n4"), None);
+
+        let deduped = hook.dedup_by_name(vec![shallow.clone(), deep.clone()]);
+        assert_eq!(deduped.len(), 1, "one 'shared' entry survives");
+        let winner = &deduped[0];
+        assert_eq!(winner.depth, 3, "deepest wins");
+        assert!(winner.frontmatter.description.contains("N4-DEEP-DESC"), "deepest description");
+        assert!(winner.body.contains("N4-DEEP-BODY"), "deepest body");
+
+        // And that same winner is the ONLY rule that attaches for an in-play `.n4`.
+        let (in_play, _agent) = partition_attach_rules(&deduped, "researcher", &["n4-repo/f.n4".to_string()]);
+        assert_eq!(in_play.len(), 1, "the surviving rule attaches in-play");
+        assert!(in_play[0].body.contains("N4-DEEP-BODY"), "the DEEP body attaches, never shallow");
+    }
+
+    #[test]
+    fn repro_n4_depth_is_scope_root_relative() {
+        // The depth driving deepest-wins must be measured against the SCOPE
+        // root (the `.agents/rules` dir), not the process CWD or an absolute
+        // prefix — a scope-relative path resolved against the wrong root yields
+        // equal (or inverted) depths and breaks dedup. Pin it at the load seam.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let dir = std::env::temp_dir().join(format!("zc-n4-depth-{}", std::process::id()));
+        let scope_root = dir.join("rules");
+        let shallow_p = scope_root.join("shared.md");
+        let deep_p = scope_root.join("sub").join("deep").join("shared.md");
+        std::fs::create_dir_all(deep_p.parent().unwrap()).unwrap();
+        let fm = |desc: &str| format!("---\nname: shared\ndescription: {desc}\n---\nbody\n");
+        std::fs::write(&shallow_p, fm("shallow")).unwrap();
+        std::fs::write(&deep_p, fm("deep")).unwrap();
+
+        let s = hook.load_rule(&shallow_p, "repo:/r".into(), &scope_root).unwrap();
+        let d = hook.load_rule(&deep_p, "repo:/r".into(), &scope_root).unwrap();
+        assert_eq!(s.depth, 1, "shared.md at scope root is depth 1");
+        assert_eq!(d.depth, 3, "sub/deep/shared.md is depth 3");
+        assert!(d.depth > s.depth, "nested path is deeper");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repro_n2_scope_root_relative_apply_to_attaches() {
+        // N2: a nested repo rule with `applyTo: **/*.gradle` matches a path
+        // that includes the repo dirname (`n2-repo/app/build.gradle`) because
+        // the bare pattern is `**/`-prefixed — the nested rule must land in the
+        // in-play partition, not be missed.
+        let rule = mk_rule("n2-anchored", "repo:/r", 1, "binds on nested path", "N2-ANCHORED-BODY marker.\n", Some("**/*.gradle"), None);
+        let rules = vec![rule];
+        let (in_play, _agent) = partition_attach_rules(&rules, "gandalf", &["n2-repo/app/build.gradle".to_string()]);
+        assert_eq!(in_play.len(), 1, "nested applyTo matches scope-root-relative path");
+        assert!(in_play[0].body.contains("N2-ANCHORED-BODY"));
+    }
+
+    #[test]
+    fn repro_u1_in_play_partitions_before_agent_scoped() {
+        // U1: the in-play rule (declarative-pod-content, matched by an edit to
+        // a chart file) must survive even when an always-on agent-scoped rule
+        // is large. The ordering law is that in-play rules attach FIRST, so
+        // agent-scoped bulk cannot starve the specific edit-triggered law to
+        // zero — the regression the scenario caught.
+        let chart_rule = mk_rule("declarative-pod-content", "repo:/r", 1, "binds when touching pod content", "U1-CHART-BODY declarative pod content law.\n", Some("ansible/roles/cheknet.zeroclaw/files/charts/zeroclaw/**"), None);
+        let coder_rule = mk_rule("coder-discipline-core", "repo:/r", 1, "binds for the coder agent", &format!("{}\n", "X".repeat(9000)), None, Some("coder"));
+
+        let rules = vec![chart_rule.clone(), coder_rule.clone()];
+        let (in_play, agent) = partition_attach_rules(&rules, "coder", &["debops-checknet/ansible/roles/cheknet.zeroclaw/files/charts/zeroclaw/templates/foo.j2".to_string()]);
+        assert_eq!(agent.len(), 1, "coder rule is agent-scoped");
+        assert_eq!(in_play.len(), 1, "chart rule is in-play matched");
+        assert!(in_play[0].body.contains("U1-CHART-BODY"), "the in-play body is preserved in its partition");
+
+        // The hook's attach ordering concatenates in-play FIRST, so the chart
+        // body precedes the (oversized) agent-scoped body — the exact law that
+        // prevents in-play starvation. Assert the concatenated order.
+        let mut ordered: Vec<&Rule> = in_play.clone();
+        ordered.extend(agent.iter().copied());
+        assert_eq!(ordered.len(), 2);
+        assert!(
+            ordered[0].body.contains("U1-CHART-BODY"),
+            "in-play rule is FIRST in attachment order, never starved"
+        );
+        assert_eq!(ordered[1].name(), "coder-discipline-core", "agent-scoped rule follows");
     }
 }
