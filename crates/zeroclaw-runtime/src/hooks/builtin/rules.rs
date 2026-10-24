@@ -91,6 +91,39 @@ fn now_secs() -> u64 {
 /// within a turn, or re-sent across turns, cannot accumulate.
 const RULES_HOOK_MARKER: &str = "<!-- rules-hook:v1 -->";
 
+/// The inline `<!-- core -->` marker. The IDENTICAL marker opens AND closes
+/// extraction (a toggle state machine) — ported from the opencode
+/// `rules-bind` plugin's `extractCoreBlock` (spec §3.5a/§4.4). Only the lines
+/// BETWEEN marker pairs are eager-injected as the core block; an ODD marker
+/// count yields no extraction (never capture-to-EOF).
+const CORE_MARKER: &str = "<!-- core -->";
+
+/// The toggle-state-machine core extractor (the `rules-bind` plugin's
+/// `extractCoreBlock`, ported). Each `<!-- core -->` line toggles extraction;
+/// the identical marker opens AND closes, and multiples are handled (a file
+/// may carry several pairs). Returns `None` on an odd marker count — the
+/// caller treats the rule as contributing nothing to the core block rather
+/// than capturing the trailing un-closed region to EOF (the odd-marker parity
+/// guarantee, spec §4.4).
+fn extract_core_block(body: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_core = false;
+    for line in body.lines() {
+        if line.trim() == CORE_MARKER {
+            in_core = !in_core;
+            continue;
+        }
+        if in_core {
+            out.push(line);
+        }
+    }
+    if in_core {
+        // Odd marker count: an un-closed pair — refuse to capture-to-EOF.
+        return None;
+    }
+    Some(out.join("\n").trim().to_string())
+}
+
 /// Chars cap for a repo-root `AGENTS.md` body delivered once per session.
 ///
 /// Mirrors the engine's own `COMPACT_BOOTSTRAP_MAX_CHARS` (6000) so a repo
@@ -899,12 +932,21 @@ impl RulesHook {
             }
             instructions.push_str("</instruction>\n");
             if rule.frontmatter.core {
-                for line in rule.body.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    core_lines.push(format!("{}: {trimmed}", name));
+                // Port the `rules-bind` toggle extraction (§4.4): only the
+                // lines INSIDE the `<!-- core -->` markers are eager-injected
+                // as the core block — NOT the rule's full body (the defect: the
+                // full body of every `core: true` rule was injected, inflating
+                // the core block to ~47k chars and truncating it to ~1%,
+                // falsifying the "core never skipped" guarantee). An odd marker
+                // count or a `core: true` rule with no markers contributes
+                // nothing (fail-open, never capture-to-EOF).
+                if let Some(block) = extract_core_block(&rule.body)
+                    && !block.is_empty()
+                {
+                    // Match the plugin's format: a `<!-- from <name> -->`
+                    // comment prefix, then the extracted block.
+                    core_lines.push(format!("<!-- from {name} -->"));
+                    core_lines.push(block);
                 }
             }
         }
@@ -1659,6 +1701,129 @@ mod tests {
         assert!(!fm.core);
     }
 
+    // ── The `<!-- core -->` toggle extraction (§4.4) ──────────────────────
+    //
+    // The defect: `render_manifest` injected the FULL BODY of every
+    // `core: true` rule into the core block (47k chars for 5 rules), instead
+    // of extracting only the `<!-- core -->`-marked lines (the rules-bind
+    // plugin's `extractCoreBlock` toggle semantics + spec §4.4). These tests
+    // pin the toggle state machine at the `extract_core_block` seam.
+
+    #[test]
+    fn extract_core_block_yields_only_marked_lines() {
+        let body = "leading prose\n<!-- core -->\nALWAYS LAW ONE\nALWAYS LAW TWO\n<!-- core -->\ntrailing prose\n";
+        let out = extract_core_block(body).expect("even markers extract");
+        assert_eq!(out, "ALWAYS LAW ONE\nALWAYS LAW TWO", "only the marked lines are emitted");
+        assert!(!out.contains("leading prose"), "text before the open marker is dropped");
+        assert!(!out.contains("trailing prose"), "text after the close marker is dropped");
+    }
+
+    #[test]
+    fn extract_core_block_handles_multiple_pairs() {
+        // The identical marker opens AND closes; multiples are handled (the
+        // rules-bind plugin verified canary-main-reconciliation.md carries two
+        // pairs: l.21/23 and l.133/135).
+        let body = "<!-- core -->\nPAIR ONE\n<!-- core -->\nbetween\n<!-- core -->\nPAIR TWO\n<!-- core -->\n";
+        let out = extract_core_block(body).expect("two even pairs extract");
+        assert_eq!(out, "PAIR ONE\nPAIR TWO", "both pairs' interiors are emitted");
+        assert!(!out.contains("between"), "text between the pairs is dropped");
+    }
+
+    #[test]
+    fn extract_core_block_odd_markers_yield_none() {
+        // An odd marker count (unclosed pair) yields NO extraction — never
+        // capture-to-EOF (the odd-marker parity guarantee).
+        let body = "<!-- core -->\nALWAYS LAW\n(unclosed)";
+        assert!(extract_core_block(body).is_none(), "odd markers → no extraction");
+    }
+
+    #[test]
+    fn extract_core_block_no_markers_yields_empty() {
+        assert_eq!(extract_core_block("no markers here\n").unwrap(), "", "no markers → empty block");
+    }
+
+    #[test]
+    fn render_manifest_core_true_without_markers_contributes_nothing() {
+        // §4.4 + the litmus: a `core: true` rule with NO `<!-- core -->`
+        // markers (or an odd count) contributes NOTHING to the core block —
+        // the fix's fail-open contract (never capture the full body, never
+        // capture-to-EOF).
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let rule = Rule {
+            path: PathBuf::from("/global/no-marker-core.md"),
+            frontmatter: RuleFrontmatter {
+                name: "no-marker-core".into(),
+                description: "when".into(),
+                core: true,
+                ..Default::default()
+            },
+            scope: "global".into(),
+            mtime_secs: 0,
+            body: "The FULL body must NOT be injected.\n".into(),
+            depth: 0,
+        };
+        let manifest = hook.render_manifest(&[rule]);
+        assert!(
+            !manifest.contains("## Core (never skipped)"),
+            "a core rule with no markers emits no core block"
+        );
+        assert!(
+            !manifest.contains("The FULL body"),
+            "the full body is never injected as core"
+        );
+    }
+
+    #[test]
+    fn render_manifest_core_char_count_drops_to_marked_size() {
+        // The manifest char count must drop to the ~index + marked-core size —
+        // NOT the index + full-body size the defect produced. A large
+        // `core: true` body of 40,000 chars with a tiny marked interior yields
+        // a manifest far below the body size (and below the 11,000 budget the
+        // post-fix spec cleanly fits).
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let raw = format!(
+            "---\nname: big-core\ndescription: marks a tiny core over a huge body\ncore: true\n---\n{}\n<!-- core -->\nONLY THIS IS CORE\nAND THIS\n<!-- core -->\n{}\n",
+            "X".repeat(40_000),
+            "Y".repeat(20_000),
+        );
+        let (_, body) = split_frontmatter(&raw).unwrap();
+        let rule = Rule {
+            path: PathBuf::from("/global/big-core.md"),
+            frontmatter: RuleFrontmatter {
+                name: "big-core".into(),
+                description: "marks a tiny core over a huge body".into(),
+                core: true,
+                ..Default::default()
+            },
+            scope: "global".into(),
+            mtime_secs: 0,
+            body,
+            depth: 0,
+        };
+        let manifest = hook.render_manifest(&[rule]);
+        assert!(
+            manifest.contains("ONLY THIS IS CORE"),
+            "the marked interior is emitted"
+        );
+        assert!(
+            manifest.contains("AND THIS"),
+            "the second marked line is emitted"
+        );
+        assert!(
+            manifest.len() < 11_000,
+            "the manifest (index + marked core) must fit under the post-fix 11,000 budget — got {}",
+            manifest.len()
+        );
+        assert!(
+            !manifest.contains(&"X".repeat(40_000)),
+            "the 40k-char bulk section is not in the manifest"
+        );
+        assert!(
+            !manifest.contains(&"Y".repeat(20_000)),
+            "the 20k-char trailing section is not in the manifest"
+        );
+    }
+
     #[test]
     fn extract_path_write_read_shell() {
         assert_eq!(
@@ -1818,7 +1983,7 @@ mod tests {
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::write(
             rules_dir.join("event-driven-swarm.md"),
-            "---\nname: event-driven-swarm\ndescription: binds when doing async work\ncore: true\n---\nNever sleep-poll; watch.\n",
+            "---\nname: event-driven-swarm\ndescription: binds when doing async work\ncore: true\n---\nPreamble prose (NOT core — outside the markers).\n<!-- core -->\nNever sleep-poll; watch.\nSecond core line.\n<!-- core -->\nTrailing prose (NOT core).\n",
         )
         .unwrap();
         std::fs::write(
@@ -1852,7 +2017,20 @@ mod tests {
                 assert!(prompt.contains("event-driven-swarm"), "rule indexed");
                 assert!(prompt.contains("quorum-review"), "rule indexed");
                 assert!(prompt.contains("## Core (never skipped)"), "core block present");
-                assert!(prompt.contains("Never sleep-poll"), "core line injected");
+                assert!(prompt.contains("Never sleep-poll"), "marked core line injected");
+                assert!(prompt.contains("Second core line."), "second marked line injected");
+                assert!(
+                    prompt.contains("<!-- from event-driven-swarm -->"),
+                    "the core block carries the source rule name as a comment prefix"
+                );
+                assert!(
+                    !prompt.contains("Preamble prose"),
+                    "text OUTSIDE the markers is NOT in the core block"
+                );
+                assert!(
+                    !prompt.contains("Trailing prose"),
+                    "trailing text after the closing marker is NOT in the core block"
+                );
                 assert!(
                     !prompt.contains("Body here."),
                     "no in-play paths → no attach body"
