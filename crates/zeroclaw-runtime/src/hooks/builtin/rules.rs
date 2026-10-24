@@ -972,39 +972,64 @@ impl RulesHook {
     /// Discovered files are deduped by canonicalised path so a repo root that
     /// coincides with the workspace floor is not listed twice.
     fn discover_agents_md(&self, ctx: &PromptBuildHookContext) -> Vec<AgentsMd> {
-        let mut out: Vec<AgentsMd> = Vec::new();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let roots = if self.config.repo_discovery {
+            self.resolve_repo_roots(ctx)
+        } else {
+            Vec::new()
+        };
+        self.discover_agents_md_from_roots(roots, ctx.workspace())
+    }
 
-        // Workspace scope — nested AGENTS.md only (root = engine bootstrap).
-        let ws = ctx.workspace();
-        if ws.is_dir() {
-            for (path, is_root) in scan_agents_md(ws) {
-                if is_root {
-                    continue; // engine bootstrap, never re-listed
-                }
-                if let Some(md) = self.load_agents_md(&path, "workspace".to_string(), false)
-                    && seen.insert(path.clone())
+    /// The deterministic part of AGENTS.md discovery: given the resolved repo
+    /// roots + the workspace, classify root vs nested and dedupe. Separated
+    /// from [`Self::discover_agents_md`] so the classification law (repo-first,
+    /// deepest-first, canonical dedup) is unit-testable without the
+    /// process-global in-play registry.
+    fn discover_agents_md_from_roots(&self, roots: Vec<PathBuf>, ws: &Path) -> Vec<AgentsMd> {
+        let mut out: Vec<AgentsMd> = Vec::new();
+        // Dedupe by CANONICALISED path: a repo root from `git rev-parse` is
+        // canonical (macOS `/var` → `/private/var`), while the workspace path
+        // may not be — the same on-disk file must not be listed twice.
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
+        // Repo scopes FIRST — root + nested AGENTS.md. A repo root that is also
+        // a workspace subdirectory must keep its repo-root classification
+        // (deliver-once-per-session), so the repo scan claims the path before
+        // the workspace nested scan can mis-classify it. This mirrors the
+        // rules dedup law (a repo instance beats the shared workspace copy).
+        // Deeper roots scan first: when both a parent (workspace floor) and an
+        // inner git repo are resolved, the inner repo must claim its own root
+        // AGENTS.md as a root (not be swallowed as a parent-nested file).
+        let mut roots = roots;
+        roots.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
+        for root in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            for (path, is_root) in scan_agents_md(&root) {
+                if let Some(md) = self.load_agents_md(
+                    &path,
+                    format!("repo:{}", root.display()),
+                    is_root,
+                ) && seen.insert(canon(&path))
                 {
                     out.push(md);
                 }
             }
         }
 
-        // Repo scopes — root + nested AGENTS.md.
-        if self.config.repo_discovery {
-            for root in self.resolve_repo_roots(ctx) {
-                if !root.is_dir() {
-                    continue;
+        // Workspace scope — nested AGENTS.md only (root = engine bootstrap),
+        // and only when the repo scope above has not already claimed the path.
+        if ws.is_dir() {
+            for (path, is_root) in scan_agents_md(ws) {
+                if is_root {
+                    continue; // engine bootstrap, never re-listed
                 }
-                for (path, is_root) in scan_agents_md(&root) {
-                    if let Some(md) = self.load_agents_md(
-                        &path,
-                        format!("repo:{}", root.display()),
-                        is_root,
-                    ) && seen.insert(path.clone())
-                    {
-                        out.push(md);
-                    }
+                if let Some(md) = self.load_agents_md(&path, "workspace".to_string(), false)
+                    && seen.insert(canon(&path))
+                {
+                    out.push(md);
                 }
             }
         }
@@ -2100,6 +2125,77 @@ mod tests {
         );
         assert!(!agents[0].is_root);
         assert!(agents[0].path.ends_with("pkg/AGENTS.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repo_root_agents_md_in_workspace_subdir_wins_root_classification() {
+        // N3b: a git repo cloned INSIDE the agent workspace has its own root
+        // AGENTS.md. When both the workspace floor and the inner git repo are
+        // resolved repo roots, the repo's root AGENTS.md must be classified as
+        // a REPO ROOT (delivered once per session), NOT as a workspace-NESTED
+        // AGENTS.md (implicit applyTo attach). The workspace-first nested scan
+        // previously poisoned the seen-set so a repo root that is also a
+        // workspace subdirectory was mis-classified as nested and never got
+        // once-per-session delivery. Tested at the `_from_roots` seam (no
+        // process-global in-play registry) so the classification law is
+        // deterministic.
+        let dir = std::env::temp_dir().join(format!(
+            "zc-agents-repo-sub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = dir.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        // The workspace has the (empty) workspace scope, mimicking the shipped
+        // deployment whose workspace always carries `.agents/rules`.
+        std::fs::create_dir_all(ws.join(".agents").join("rules")).unwrap();
+        // A nested git repo with its own root AGENTS.md + a nested one.
+        let repo = ws.join("checkout");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "REPO ROOT LAW.\n").unwrap();
+        std::fs::write(repo.join("pkg").join("AGENTS.md"), "nested pkg law.\n").unwrap();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            repo_roots_max: 4,
+            ..RulesHookConfig::default()
+        });
+
+        // Both roots resolved (workspace floor + the inner git repo).
+        let agents = hook.discover_agents_md_from_roots(vec![ws.clone(), repo.clone()], &ws);
+        // The repo-root AGENTS.md must be classified as a repo root.
+        let root = agents
+            .iter()
+            .find(|a| a.path.to_string_lossy().ends_with("/checkout/AGENTS.md"));
+        assert!(root.is_some(), "the checkout's root AGENTS.md must be discovered; got {agents:?}");
+        let root = root.unwrap();
+        assert!(root.is_root, "repo-root AGENTS.md must be is_root=true; got {agents:?}");
+        assert!(
+            root.scope.starts_with("repo:"),
+            "repo-root AGENTS.md must carry a repo: scope, got {}",
+            root.scope
+        );
+        // The nested pkg AGENTS.md is still discovered as nested.
+        assert!(
+            agents.iter().any(|a| {
+                a.path.to_string_lossy().ends_with("/checkout/pkg/AGENTS.md") && !a.is_root
+            }),
+            "nested AGENTS.md must remain nested; got {agents:?}"
+        );
+        // No duplicate: each file once.
+        let checkout_count = agents
+            .iter()
+            .filter(|a| a.path.to_string_lossy().ends_with("/checkout/AGENTS.md"))
+            .count();
+        assert_eq!(checkout_count, 1, "no duplicate listing; got {agents:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
