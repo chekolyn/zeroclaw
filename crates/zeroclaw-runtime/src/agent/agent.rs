@@ -4635,6 +4635,22 @@ impl Agent {
                 new_messages: new_msgs,
             });
         }
+        // ── Hook: before_prompt_build (typed, with context) ─────────────
+        // The rules hook and future prompt-modifying builtins run here, once
+        // per turn, after the dispatcher-specific prompt is assembled and the
+        // turn id exists for tool-event correlation — the streamed mirror of
+        // the non-streamed `turn` invocation. The context carries the effective
+        // alias, the agent workspace, the memory session id (empty where none),
+        // and the turn id.
+        if let Err(error) = self.apply_prompt_build_hooks(&turn_id).await {
+            let notice = self.trim_history(Some(&turn_id));
+            forward_history_trim_notice(&event_tx, notice).await;
+            return Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: new_msgs,
+            });
+        }
         let mut tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
@@ -14000,6 +14016,149 @@ mod tests {
             .expect("durable history must retain the user message");
         assert!(durable_user.contains("durable user request"));
         assert!(!durable_user.contains("hook-only provider request"));
+    }
+
+    struct MarkingBeforePromptBuildHook {
+        marker: String,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for MarkingBeforePromptBuildHook {
+        fn name(&self) -> &str {
+            "mark-before-prompt-build"
+        }
+
+        async fn before_prompt_build_with_context(
+            &self,
+            _context: &zeroclaw_api::hook::PromptBuildHookContext,
+            prompt: String,
+        ) -> crate::hooks::HookResult<String> {
+            crate::hooks::HookResult::Continue(format!("{prompt}\n\n{}", self.marker))
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_applies_prompt_build_hooks() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(MarkingBeforePromptBuildHook {
+            marker: "STREAMED-HOOK-MARKER".into(),
+        }));
+
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should complete");
+
+        // Drain any buffered events so the channel can be left alone.
+        while event_rx.try_recv().is_ok() {}
+
+        let requests = seen_messages.lock();
+        assert!(
+            !requests.is_empty(),
+            "the streamed turn must dispatch at least one provider request"
+        );
+        let system_prompt = requests[0]
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("provider request must include a system prompt")
+            .content
+            .as_str();
+        assert!(
+            system_prompt.contains("STREAMED-HOOK-MARKER"),
+            "the streamed turn must apply the prompt-build hook to the system prompt; got: {system_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_prompt_build_hooks_noop_without_runner() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .hook_runner(None)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should complete");
+
+        while event_rx.try_recv().is_ok() {}
+
+        let requests = seen_messages.lock();
+        assert!(
+            !requests.is_empty(),
+            "the streamed turn must dispatch at least one provider request"
+        );
+        let system_prompt = requests[0]
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("provider request must include a system prompt")
+            .content
+            .as_str();
+        assert!(
+            !system_prompt.contains("STREAMED-HOOK-MARKER"),
+            "a missing hook runner must be a no-op; got: {system_prompt}"
+        );
     }
 
     #[tokio::test]

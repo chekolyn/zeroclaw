@@ -1341,6 +1341,190 @@ mod tests {
         );
     }
 
+    /// The rules hook must run on the real `execute_turn` RPC boundary (the
+    /// daemon/`session/prompt` path — NOT the `/webhook` process_message path),
+    /// and its `"hook":"rules"` event must carry `manifest_count` + a
+    /// non-truncated manifest. Regression for the streamed-turn gap: the
+    /// non-streamed `Agent::turn` and the webhook path both ran the hook, but
+    /// `turn_streamed_with_steering_body` (which `execute_turn` drives at
+    /// turn.rs:151) rebuilt the prompt and never invoked it — a daemon-path
+    /// turn emitted zero rules-hook events.
+    #[tokio::test]
+    async fn execute_turn_runs_rules_hook_on_the_daemon_path() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::ChatRequest;
+
+        // Minimal non-streaming provider (the engine takes the `chat` path when
+        // streaming is not advertised — same shape as the cost-context test).
+        struct PlainProvider;
+
+        #[async_trait]
+        impl ModelProvider for PlainProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for PlainProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "plain-provider"
+            }
+        }
+
+        // A temp workspace carrying one `.agents/rules` rule so the rules hook
+        // builds a real (untruncated) manifest for the turn.
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let rules_dir = workspace.path().join(".agents").join("rules");
+        std::fs::create_dir_all(&rules_dir).expect("rules dir");
+        std::fs::write(
+            rules_dir.join("event-driven-swarm.md"),
+            "---\nname: event-driven-swarm\ndescription: binds when doing async work\n---\nNever sleep-poll; watch.\n",
+        )
+        .expect("rule file");
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed"),
+        );
+
+        // Real rules builtin + an empty passthrough so the runner is non-empty
+        // and the builtin fires exactly as production configures it.
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(crate::hooks::builtin::rules::RulesHook::new(
+            zeroclaw_config::schema::RulesHookConfig {
+                enabled: true,
+                global_dir: String::new(),
+                workspace_dir: ".agents/rules".to_string(),
+                repo_discovery: false,
+                ..zeroclaw_config::schema::RulesHookConfig::default()
+            },
+        )));
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(PlainProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_name("test-model".into())
+            .model_provider_name("plain-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        // Capture the canonical log stream in-process (the same `record_event`
+        // fan-out the persisted runtime-trace and the gateway SSE both read).
+        // The capture subscriber maps `record!` → `record_event` → broadcast;
+        // without it a bare unit-test process has no tracing subscriber and
+        // `record_event` never fires.
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = {
+            zeroclaw_log::clear_broadcast_hook();
+            let (tx, _keepalive) = tokio::sync::broadcast::channel(65_536);
+            zeroclaw_log::set_broadcast_hook(tx);
+            zeroclaw_log::subscribe().expect("subscribe after set")
+        };
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("s1".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "plain-provider".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            None,
+            None,
+            None,
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn should complete normally"
+        );
+
+        // Drain the broadcast and find the rules-hook event.
+        let mut rules_events = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(value) => {
+                    if value
+                        .get("attributes")
+                        .and_then(|a| a.get("hook"))
+                        .and_then(|h| h.as_str())
+                        == Some("rules")
+                    {
+                        rules_events.push(value);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert!(
+            !rules_events.is_empty(),
+            "the daemon-path turn must emit a `hook: rules` event"
+        );
+        let attrs = rules_events[0]
+            .get("attributes")
+            .expect("rules event carries attributes");
+        assert!(
+            attrs.get("manifest_count").is_some(),
+            "the rules event must carry manifest_count; got: {attrs}"
+        );
+        assert_eq!(
+            attrs.get("manifest_truncated"),
+            Some(&serde_json::Value::Bool(false)),
+            "the small manifest must not be truncated; got: {attrs}"
+        );
+    }
+
     /// Regression: the drain callback must resolve `model_context_window`
     /// from the embedded `provider_ref` via config, not by reacquiring the
     /// agent mutex. `execute_turn` holds `agent.lock()` for the whole turn;
