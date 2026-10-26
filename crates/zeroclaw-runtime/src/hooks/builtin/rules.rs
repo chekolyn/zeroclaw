@@ -670,7 +670,8 @@ static DISCOVERY_CACHE: Mutex<Option<HashMap<PathBuf, DiscoveryEntry>>> = Mutex:
 /// Diagnostic counters for the discovery hot path: how many times a turn did a
 /// stat-only cache hit (no walk) vs a re-walk, and the cumulative walk cost.
 /// These let the `rules block injected` log line carry the before/after timing
-/// evidence the operator asked for (first walk, stat-only turn, changed turn).
+/// evidence the operator asked for (first walk, stat-only turn, changed turn),
+/// plus the per-file body-cache hit ratio (`body_hits`/`body_misses`).
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryStats {
     /// Stat-only cache hits (no traversal).
@@ -681,6 +682,12 @@ pub(crate) struct DiscoveryStats {
     pub walk_millis: u128,
     /// Millis spent in the last stat-only revalidation (the cheap path).
     pub last_stat_millis: u128,
+    /// Per-file body-cache hits: `load_rule`/`load_agents_md` served the
+    /// parsed content WITHOUT reading the file (stamp matched).
+    pub body_hits: u64,
+    /// Per-file body-cache misses: first load, mtime/size moved, or a new
+    /// file appeared in the (never-cached) rules-dir listing.
+    pub body_misses: u64,
 }
 
 static DISCOVERY_STATS: Mutex<DiscoveryStats> = Mutex::new(DiscoveryStats::EMPTY);
@@ -691,6 +698,8 @@ impl DiscoveryStats {
         walks: 0,
         walk_millis: 0,
         last_stat_millis: 0,
+        body_hits: 0,
+        body_misses: 0,
     };
 
     fn snapshot() -> DiscoveryStats {
@@ -700,6 +709,8 @@ impl DiscoveryStats {
             walks: g.walks,
             walk_millis: g.walk_millis,
             last_stat_millis: g.last_stat_millis,
+            body_hits: g.body_hits,
+            body_misses: g.body_misses,
         }
     }
 }
@@ -716,6 +727,117 @@ fn mtime_secs(p: &Path) -> Option<u64> {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
+}
+
+// ── Per-file body cache (rules-body-cache) ──────────────────────
+
+/// One cached rules-file load: the (mtime NANOSECONDS, size) stamp it was
+/// built from plus the parsed frontmatter and raw body. Keyed by file path;
+/// served ONLY when the fresh stat matches BOTH stamp components.
+#[derive(Debug, Clone)]
+struct CachedRule {
+    mtime_nanos: u128,
+    size: u64,
+    frontmatter: RuleFrontmatter,
+    body: String,
+}
+
+/// One cached `AGENTS.md` load (same stamping contract as [`CachedRule`];
+/// AGENTS.md carries no parsed frontmatter, only the raw body).
+#[derive(Debug, Clone)]
+struct CachedAgentsMd {
+    mtime_nanos: u128,
+    size: u64,
+    body: String,
+}
+
+/// Capacity of each per-file body cache, with whole-table clear on overflow
+/// (the [`DISCOVERY_CACHE`] pattern): a flush costs one pass over a fresh
+/// corpus — cheap relative to the ~40-file corpus it serves per turn.
+const BODY_CACHE_CAPACITY: usize = 512;
+
+/// The process-global per-file rule body cache: on a hit (same path, mtime
+/// NANOSECONDS and byte size) `load_rule` serves the parsed frontmatter and
+/// body WITHOUT reading the file; a miss reads + parses once and inserts.
+static RULE_BODY_CACHE: Mutex<Option<HashMap<PathBuf, CachedRule>>> = Mutex::new(None);
+
+/// The process-global per-file AGENTS.md body cache (same contract).
+static AGENTS_MD_BODY_CACHE: Mutex<Option<HashMap<PathBuf, CachedAgentsMd>>> =
+    Mutex::new(None);
+
+/// Stat a file for the body-cache stamp: mtime in NANOSECONDS since the epoch
+/// (nanos, not the seconds the discovery cache uses — same-second edits are
+/// exactly what this cache must distinguish) plus byte size. `None`
+/// (unreadable, or a pre-epoch mtime) is never cached — the loader falls
+/// through to the direct read path.
+fn body_cache_stamp(p: &Path) -> Option<(u128, u64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let nanos = md
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((nanos, md.len()))
+}
+
+fn record_body_hit() {
+    // Test-only override (see BODY_CACHE_COUNT_SINK): a test measuring exact
+    // per-thread deltas captures its own events locally instead of contending
+    // on the global stats mutex — and, critically, without holding either
+    // body-cache lock across a measuring window, which would delay OTHER
+    // tests' loader calls and widen their setup→assertion windows.
+    #[cfg(test)]
+    if BODY_CACHE_COUNT_SINK
+        .try_with(|sink| {
+            let mut sink = sink.borrow_mut();
+            match sink.as_mut() {
+                Some((hits, _)) => {
+                    *hits += 1;
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let mut s = DISCOVERY_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    s.body_hits += 1;
+}
+
+fn record_body_miss() {
+    #[cfg(test)]
+    if BODY_CACHE_COUNT_SINK
+        .try_with(|sink| {
+            let mut sink = sink.borrow_mut();
+            match sink.as_mut() {
+                Some((_, misses)) => {
+                    *misses += 1;
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let mut s = DISCOVERY_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    s.body_misses += 1;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counting sink: when `Some((hits, misses))`, body-cache hit/
+    /// miss events on THIS thread are captured into the local bucket instead
+    /// of the global [`DISCOVERY_STATS`]. A test sets the bucket, drives the
+    /// public loaders on its own thread, and reads exact deltas — with no
+    /// global lock held across the measuring window (no cross-test blocking,
+    /// no counter pollution).
+    static BODY_CACHE_COUNT_SINK: std::cell::RefCell<Option<(u64, u64)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn canon(p: &Path) -> PathBuf {
@@ -1302,8 +1424,42 @@ impl RulesHook {
     }
 
     fn load_rule(&self, path: &Path, scope: String, scope_root: &Path) -> Option<Rule> {
-        // Cache is keyed by path+mtime via the frontmatter parse below; we
-        // re-read on mtime change. A `cached` map is kept process-global.
+        // Per-file body cache, keyed by (path, mtime NANOSECONDS, size): on a
+        // hit the parsed frontmatter + body are served WITHOUT reading the
+        // file; on a miss (first load, mtime/size moved, or a new file) the
+        // file is read + parsed once and inserted. The rules-dir LISTING is
+        // never cached — `scan_rules_dir` re-reads the directory every turn,
+        // so an ADDED file is simply a new miss and a REMOVED one stops being
+        // listed. Residual staleness window: content changes while BOTH the
+        // nanosecond mtime and the byte size stay identical — unreachable in
+        // practice.
+        let stamp = body_cache_stamp(path);
+        if let Some((nanos, size)) = stamp {
+            let cache = RULE_BODY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(map) = cache.as_ref()
+                && let Some(cached) = map.get(path)
+                && cached.mtime_nanos == nanos
+                && cached.size == size
+            {
+                // Cache hit: serve the parsed pieces WITHOUT reading the file.
+                record_body_hit();
+                // Scope-relative depth (path components) drives deepest-wins
+                // dedup.
+                let depth = path
+                    .strip_prefix(scope_root)
+                    .map(|rel| rel.components().count())
+                    .unwrap_or(0);
+                return Some(Rule {
+                    path: path.to_path_buf(),
+                    frontmatter: cached.frontmatter.clone(),
+                    scope,
+                    mtime_secs: (nanos / 1_000_000_000) as u64,
+                    body: cached.body.clone(),
+                    depth,
+                });
+            }
+        }
+        record_body_miss();
         let Ok(raw) = std::fs::read_to_string(path) else {
             // Unreadable file: skip, log once per condition.
             log_once(
@@ -1333,12 +1489,22 @@ impl RulesHook {
                 return None;
             }
         };
-        let mtime_secs = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        if let Some((nanos, size)) = stamp {
+            let mut cache = RULE_BODY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let map = cache.get_or_insert_with(HashMap::new);
+            map.insert(
+                path.to_path_buf(),
+                CachedRule {
+                    mtime_nanos: nanos,
+                    size,
+                    frontmatter: frontmatter.clone(),
+                    body: body.clone(),
+                },
+            );
+            if map.len() > BODY_CACHE_CAPACITY {
+                map.clear();
+            }
+        }
         // Scope-relative depth (path components) drives deepest-wins dedup.
         let depth = path
             .strip_prefix(scope_root)
@@ -1348,7 +1514,7 @@ impl RulesHook {
             path: path.to_path_buf(),
             frontmatter,
             scope,
-            mtime_secs,
+            mtime_secs: stamp.map_or(0, |(nanos, _)| (nanos / 1_000_000_000) as u64),
             body,
             depth,
         })
@@ -1649,6 +1815,30 @@ impl RulesHook {
     }
 
     fn load_agents_md(&self, path: &Path, scope: String, is_root: bool) -> Option<AgentsMd> {
+        // Per-file body cache (see `load_rule` for the contract).
+        let stamp = body_cache_stamp(path);
+        if let Some((nanos, size)) = stamp {
+            let cache = AGENTS_MD_BODY_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(map) = cache.as_ref()
+                && let Some(cached) = map.get(path)
+                && cached.mtime_nanos == nanos
+                && cached.size == size
+            {
+                // Cache hit: serve the body WITHOUT reading the file.
+                record_body_hit();
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                return Some(AgentsMd {
+                    path: path.to_path_buf(),
+                    dir,
+                    scope,
+                    is_root,
+                    body: cached.body.clone(),
+                });
+            }
+        }
+        record_body_miss();
         let Ok(body) = std::fs::read_to_string(path) else {
             log_once(
                 &format!("agents-md-unreadable:{}", path.display()),
@@ -1656,6 +1846,23 @@ impl RulesHook {
             );
             return None;
         };
+        if let Some((nanos, size)) = stamp {
+            let mut cache = AGENTS_MD_BODY_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let map = cache.get_or_insert_with(HashMap::new);
+            map.insert(
+                path.to_path_buf(),
+                CachedAgentsMd {
+                    mtime_nanos: nanos,
+                    size,
+                    body: body.clone(),
+                },
+            );
+            if map.len() > BODY_CACHE_CAPACITY {
+                map.clear();
+            }
+        }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Some(AgentsMd {
             path: path.to_path_buf(),
@@ -2030,6 +2237,8 @@ impl HookHandler for RulesHook {
                         "discovery_walks": stats.walks,
                         "discovery_walk_millis": stats.walk_millis,
                         "discovery_last_stat_millis": stats.last_stat_millis,
+                        "body_cache_hits": stats.body_hits,
+                        "body_cache_misses": stats.body_misses,
                     })),
                 "rules block injected into system prompt"
             );
@@ -2911,6 +3120,193 @@ mod tests {
 
         // A missing floor is a no-op, never a panic.
         warm_discovery(&dir.join("does-not-exist"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Per-file body cache (rules-body-cache) ──────────────────────
+
+    /// Build one rules file's text with a distinct name + description. The
+    /// body is core-marked so the (changed) body text lands in the rendered
+    /// block's core section — the manifest index carries only names, not
+    /// bodies, so a body-content assertion needs the core path.
+    fn body_cache_rule_text(name: &str, body: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: body-cache probe rule {name}.\ncore: true\n---\n\n<!-- core -->\n{body}\n<!-- core -->\n"
+        )
+    }
+
+    /// The three body-cache tests below assert EXACT hit/miss counts on the
+    /// process-global cache. They capture their own events through the
+    /// test-only BODY_CACHE_COUNT_SINK thread-local instead of holding the
+    /// body-cache locks across a measuring window: holding those global locks
+    /// would delay OTHER tests' loader calls and widen their setup→assertion
+    /// windows (it surfaced the pre-existing registry-reset race as flaky
+    /// failures). With the sink, the tests hold NO global lock, drive the
+    /// public loaders on their own thread, and still get exact deltas.
+    fn body_cache_counting_begin() {
+        BODY_CACHE_COUNT_SINK.with(|s| *s.borrow_mut() = Some((0, 0)));
+    }
+
+    /// Take and reset the local (misses, hits) bucket.
+    fn body_cache_counting_take() -> (u64, u64) {
+        BODY_CACHE_COUNT_SINK.with(|s| s.borrow_mut().take().unwrap_or((0, 0)))
+    }
+
+    /// One discover pass over the listing (what `discover` does each turn:
+    /// fresh `scan_rules_dir` + one `load_rule` per listed file).
+    fn body_cache_load_pass(hook: &RulesHook, dir: &Path) -> Vec<Rule> {
+        let mut rules = Vec::new();
+        for p in scan_rules_dir(dir) {
+            if let Some(rule) = hook.load_rule(&p, "global".to_string(), dir) {
+                rules.push(rule);
+            }
+        }
+        rules
+    }
+
+    #[test]
+    fn body_cache_serves_unchanged_files() {
+        // N rule files, two full discover/load passes: the second pass must be
+        // ALL hits (0 misses) — the parsed frontmatter + body are served from
+        // the per-file cache without a single file read.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let dir = std::env::temp_dir().join(format!("zc-bodycache-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                dir.join(format!("rule-{i}.md")),
+                body_cache_rule_text(&format!("cache-serve-{i}"), "unchanged law"),
+            )
+            .unwrap();
+        }
+
+        // Pass 1: first loads — every file a miss.
+        body_cache_counting_begin();
+        let first = body_cache_load_pass(&hook, &dir);
+        let (hits1, misses1) = body_cache_counting_take();
+        assert_eq!(first.len(), 3, "all three rules loaded; got {}", first.len());
+        assert_eq!(misses1, 3, "first pass: one miss per file");
+        assert_eq!(hits1, 0, "first pass: no hits yet");
+
+        // Pass 2: unchanged files — all hits, zero misses.
+        body_cache_counting_begin();
+        let second = body_cache_load_pass(&hook, &dir);
+        let (hits2, misses2) = body_cache_counting_take();
+        assert_eq!(second.len(), 3);
+        assert_eq!(hits2, 3, "second pass: one hit per file");
+        assert_eq!(misses2, 0, "second pass: no re-reads of unchanged files");
+
+        // And the served content is real: names + bodies intact on the hit path.
+        assert!(
+            second.iter().all(|r| r.name().starts_with("cache-serve-")),
+            "hit-path rules carry their frontmatter names; got {:?}",
+            second.iter().map(|r| r.name()).collect::<Vec<_>>()
+        );
+        assert!(
+            second.iter().all(|r| r.body.contains("unchanged law")),
+            "hit-path rules carry their bodies"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn body_cache_reparses_only_the_changed_file() {
+        // Touch ONE file (content changed AND mtime forced to a deterministic
+        // past time, avoiding same-second granularity flakes): exactly ONE
+        // miss on the next pass — the changed file re-parses, every other
+        // file stays a hit — and the NEW content appears in the rendered
+        // manifest.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let dir = std::env::temp_dir().join(format!("zc-bodycache-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let changed = dir.join("rule-changed.md");
+        std::fs::write(dir.join("rule-still.md"), body_cache_rule_text("cache-still", "old")).unwrap();
+        std::fs::write(&changed, body_cache_rule_text("cache-changed", "OLD LAW")).unwrap();
+
+        // Pass 1: both files miss (first load).
+        body_cache_counting_begin();
+        let _ = body_cache_load_pass(&hook, &dir);
+        let (_hits1, misses1) = body_cache_counting_take();
+        assert_eq!(misses1, 2);
+
+        // The touch: different-length content + a forced past mtime.
+        std::fs::write(&changed, body_cache_rule_text("cache-changed", "THE NEW LAW, longer")).unwrap();
+        {
+            let f = std::fs::File::options().write(true).open(&changed).unwrap();
+            let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+            f.set_modified(older).unwrap();
+        }
+
+        // Pass 2: exactly one miss (the changed file), one hit (the rest).
+        body_cache_counting_begin();
+        let second = body_cache_load_pass(&hook, &dir);
+        let (hits2, misses2) = body_cache_counting_take();
+        assert_eq!(misses2, 1, "only the changed file re-parses");
+        assert_eq!(hits2, 1, "the unchanged file stays a hit");
+        let changed_rule = second
+            .iter()
+            .find(|r| r.name() == "cache-changed")
+            .expect("changed rule loaded");
+        assert!(
+            changed_rule.body.contains("THE NEW LAW, longer"),
+            "the re-parsed rule carries the new body; got: {}",
+            changed_rule.body
+        );
+        let manifest = hook.render_manifest(&second);
+        assert!(
+            manifest.contains("THE NEW LAW, longer"),
+            "the new content appears in the rendered block; got: {manifest}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn body_cache_tracks_added_and_removed_files() {
+        // The LISTING is never cached: scan_rules_dir re-reads the directory
+        // every pass, so an ADDED rule file is discovered (and its first load
+        // is a miss), and a DELETED one drops out of the rendered block even
+        // though its stale cache entry lingers harmlessly.
+        let hook = RulesHook::new(RulesHookConfig::default());
+        let dir = std::env::temp_dir().join(format!("zc-bodycache-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("rule-a.md");
+        let b = dir.join("rule-b.md");
+        std::fs::write(&a, body_cache_rule_text("cache-add-gone-a", "law a")).unwrap();
+
+        // Pass 1: only A exists.
+        body_cache_counting_begin();
+        let first = body_cache_load_pass(&hook, &dir);
+        let (_hits1, misses1) = body_cache_counting_take();
+        assert_eq!(first.len(), 1);
+        assert_eq!(misses1, 1);
+        assert!(hook.render_manifest(&first).contains("cache-add-gone-a"));
+
+        // ADD B: the fresh listing finds it; its first load is a miss; A stays
+        // a hit.
+        std::fs::write(&b, body_cache_rule_text("cache-add-gone-b", "law b")).unwrap();
+        body_cache_counting_begin();
+        let second = body_cache_load_pass(&hook, &dir);
+        let (hits2, misses2) = body_cache_counting_take();
+        assert_eq!(second.len(), 2, "the added file is discovered immediately");
+        assert_eq!(misses2, 1, "the added file's first load is a miss");
+        assert_eq!(hits2, 1, "the pre-existing file stays a hit");
+        let rendered_second = hook.render_manifest(&second);
+        assert!(rendered_second.contains("cache-add-gone-b"), "added rule renders");
+        assert!(rendered_second.contains("cache-add-gone-a"));
+
+        // DELETE A: the fresh listing drops it from the block.
+        std::fs::remove_file(&a).unwrap();
+        let third = body_cache_load_pass(&hook, &dir);
+        assert_eq!(third.len(), 1, "the deleted file leaves the listing");
+        let rendered_third = hook.render_manifest(&third);
+        assert!(rendered_third.contains("cache-add-gone-b"));
+        assert!(
+            !rendered_third.contains("cache-add-gone-a"),
+            "the deleted rule is gone from the rendered block; got: {rendered_third}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
