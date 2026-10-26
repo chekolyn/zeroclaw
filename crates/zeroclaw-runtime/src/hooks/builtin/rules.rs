@@ -126,11 +126,28 @@ fn extract_core_block(body: &str) -> Option<String> {
 
 /// Chars cap for a repo-root `AGENTS.md` body delivered once per session.
 ///
-/// Mirrors the engine's own `COMPACT_BOOTSTRAP_MAX_CHARS` (6000) so a repo
-/// `AGENTS.md` delivered by the hook fits the same headroom the engine
-/// itself assumes for bootstrap files. Over-budget bodies are head-truncated
-/// with an explicit note (§4.10 "bounded digest when over budget").
-const AGENTS_MD_ROOT_BODY_MAX_CHARS: usize = 6000;
+/// Canary parity: ~12,000 chars (~11.7K measured on canary) keeps the
+/// once-per-session repo instructions digest small without losing the root
+/// body's narrative spine. A 67K-char workspace/fork AGENTS.md is head-
+/// truncated here rather than injected whole. Over-budget bodies are head-
+/// truncated with an explicit note (§4.10 "bounded digest when over budget").
+const AGENTS_MD_ROOT_BODY_MAX_CHARS: usize = 12_000;
+
+/// Total char budget for the ENTIRE AGENTS.md block a turn injects — root
+/// bodies + in-play attached bodies + the nested index + pointers.
+///
+/// The per-body cap alone does not bound the block: a workspace with several
+/// repos delivers several root bodies, and (measured on prod) the nested index
+/// alone was ~54K chars of `<instruction><folder>` entries for 261 discovered
+/// `AGENTS.md` files, against ~13K of bodies. Without a total budget the block
+/// grows with the workspace, not with what the turn needs.
+const AGENTS_MD_BLOCK_BUDGET: usize = 16_000;
+/// Char budget for the nested (out-of-play) `AGENTS.md` INDEX. Nested files are
+/// discoverability, not law: the index tells the agent a file exists so it can
+/// `read` it when it works there. Beyond this budget the listing is truncated
+/// with a count, because 261 entries × ~200 chars was the dominant cost of the
+/// measured 67,592-char block.
+const AGENTS_MD_INDEX_BUDGET: usize = 2_000;
 
 /// A discovered `AGENTS.md` delivery item (§4.10): VS Code's root + nested
 /// `AGENTS.md` listing, with the pod's location-driven attach replacing the
@@ -390,6 +407,124 @@ fn scan_rules_dir(dir: &Path) -> Vec<PathBuf> {
 /// (engine bootstrap) happens at the call sites that know which of these is
 /// the workspace floor.
 fn scan_agents_md(dir: &Path) -> Vec<(PathBuf, bool)> {
+    scan_agents_md_with(dir, &DiscoveryFilter::default())
+}
+
+/// A directory-prune + ignore filter for a bounded discovery walk. Applied by
+/// [`scan_agents_md_with`] and the repo-root finder so both honour the same
+/// law: `.git/` internals and caches that can never hold a discovery marker
+/// (`.agents/rules`, `AGENTS.md`) are pruned, and a gitignore-style exclusion
+/// hides the rest where practical.
+#[derive(Debug, Clone, Default)]
+struct DiscoveryFilter {
+    /// A gitignore matcher governing this walk (the root repo's own ignore
+    /// rules), if the caller supplied one.
+    ignores: Option<GitIgnore>,
+}
+
+/// Minimal gitignore matcher: a list of literal directory-prefix patterns and
+/// file patterns, evaluated against a path RELATIVE to the walk root.
+///
+/// This is deliberately a small subset (glob prefix + suffix `*` matching, `!`
+/// negation dropped) rather than a full spec implementation — its only job is
+/// to keep the discovery walk from descending into heavy dirs (`target/`,
+/// `node_modules/`, `build/`) that a repo has already told git to ignore, and
+/// failing to match is always safe (an unmatched path is scanned, which is the
+/// current status quo, not a regression).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GitIgnore {
+    /// Directory prefixes to prune (normalised, trailing `/` dropped).
+    dirs: Vec<String>,
+    /// Bare file-name matches (exact stem) to skip.
+    files: Vec<String>,
+}
+
+impl GitIgnore {
+    /// Parse `.gitignore` / `.git/info/exclude` lines into a matcher. Only
+    /// non-negated, non-comment lines are kept; anchored `/`-prefixed and
+    /// `**`-patterns are treated as literal dir/file prefixes (best effort).
+    fn parse(spec: &str) -> Self {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for raw in spec.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                continue;
+            }
+            let pat = line.trim_start_matches('/');
+            if pat.is_empty() {
+                continue;
+            }
+            // A trailing `/**` means "this dir and everything under it".
+            let mut p = pat;
+            if let Some(stripped) = p.strip_suffix("/**") {
+                dirs.push(stripped.trim_end_matches('/').to_string());
+                continue;
+            }
+            p = p.trim_end_matches('/');
+            if p.contains('/') {
+                dirs.push(p.to_string());
+            } else {
+                files.push(p.replace('*', "").to_string());
+            }
+        }
+        GitIgnore { dirs, files }
+    }
+
+    /// Whether `rel` (a path relative to the walk root) should be pruned.
+    fn prunes(&self, rel: &Path) -> bool {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        for d in &self.dirs {
+            if s == *d || s.starts_with(&format!("{d}/")) {
+                return true;
+            }
+        }
+        if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+            for f in &self.files {
+                if name == *f {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Load the combined ignore spec for a repo root (`.gitignore` +
+/// `.git/info/exclude`), or `None` when no spec is readable.
+fn load_gitignore(root: &Path) -> Option<GitIgnore> {
+    let mut spec = String::new();
+    let gi = root.join(".gitignore");
+    if let Ok(s) = std::fs::read_to_string(&gi) {
+        spec.push_str(&s);
+        spec.push('\n');
+    }
+    let ex = root.join(".git").join("info").join("exclude");
+    if let Ok(s) = std::fs::read_to_string(&ex) {
+        spec.push_str(&s);
+        spec.push('\n');
+    }
+    if spec.trim().is_empty() {
+        None
+    } else {
+        Some(GitIgnore::parse(&spec))
+    }
+}
+
+/// Directory names that can NEVER hold a discovery marker (`AGENTS.md` or
+/// `.agents/rules`) and are pruned unconditionally on every walk. These are
+/// the heavy, infinite-regrowth dirs (`.git` internals, Rust/uv caches) that
+/// dominate the ~957K-file workspace. Deliberately NOT a name blocklist for
+/// checkout dirs: `.worktrees/` and `skill-lab.gen/` are legitimately scanned
+/// — a worktree can be the working repo.
+fn is_pruned_dir(name: &str) -> bool {
+    matches!(name, ".git" | ".cargo" | ".cache")
+}
+
+/// A bounded, prune + ignore-aware AGENTS.md walk. Prunes `.git`/`.cargo`/
+/// `.cache` dirs always, honours the root's gitignore, and never follows a
+/// symlinked directory (N6).
+fn scan_agents_md_with(dir: &Path, filter: &DiscoveryFilter) -> Vec<(PathBuf, bool)> {
     let mut out = Vec::new();
     if !dir.is_dir() {
         return out;
@@ -407,7 +542,26 @@ fn scan_agents_md(dir: &Path) -> Vec<(PathBuf, bool)> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // Prune by NAME first (cheap, no ignore eval): `.git`, `.cargo`,
+            // `.cache`. Symlinked dirs are only recursed when not pruned.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if path.is_dir() {
+                if is_pruned_dir(name) {
+                    continue;
+                }
+                if let Some(ig) = &filter.ignores {
+                    // rel path = path relative to `dir`, eval'd as the walk root.
+                    if let Ok(rel) = path.strip_prefix(dir)
+                        && ig.prunes(rel)
+                    {
+                        continue;
+                    }
+                }
+                // Do not follow symlinked dirs (N6): `path.is_dir()` is true for
+                // a symlink-to-dir, so stat to detect + skip symlinks.
+                if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    continue;
+                }
                 stack.push(path);
             } else if path.file_name().and_then(|n| n.to_str()) == Some("AGENTS.md") {
                 let is_root = path.parent() == Some(dir);
@@ -445,6 +599,345 @@ fn resolve_repo_root(working_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ── Bounded repo-root discovery + manifest cache ─────────────────
+//
+// The discovery hot path: the per-turn full-tree walk (scan_agents_md over
+// the whole workspace + every resolved repo root — ~957K files, 42 .git dirs)
+// is replaced by (a) a BOUNDED root finder that locates candidate repos (dirs
+// with `.git` or `.agents/rules`) at limited depth, pruning `.git`/`.cargo`/
+// `.cache` and honouring gitignore along the way, and (b) an MTIME-CACHED
+// manifest keyed per floor. A turn that changes nothing does NO traversal —
+// it only stats the small set of marker paths recorded at first discovery.
+
+/// Maximum depth (below the floor) the root finder descends. This bounds the
+/// candidate scan: repos nested deeper than this are not discovered by the
+/// walker, but are still resolved for in-play paths via
+/// [`resolve_repo_root`] (git rev-parse / ancestor `.agents/rules`).
+const MAX_ROOT_SCAN_DEPTH: usize = 16;
+
+/// The discovery markers a walk records: a `.git` entry (file or dir), a
+/// `.agents/rules` dir, or an `AGENTS.md` file. These are the ONLY paths whose
+/// mtime invalidates the cached manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MarkerKind {
+    Git,
+    AgentsRulesDir,
+    AgentsMd,
+}
+
+/// A snapshot of one floor's discovery: the marker paths (and their mtimes)
+/// plus the discovered repo roots and AGENTS.md files, all built from one
+/// bounded walk. On a later turn we stat ONLY the markers; if none changed,
+/// the snapshot is reused without a walk.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiscoveryEntry {
+    /// The canonical floor this entry describes.
+    floor: PathBuf,
+    /// Floor mtime (unix secs) at discovery time.
+    floor_mtime: u64,
+    /// `(path, kind, mtime_secs)` for every marker discovered.
+    markers: Vec<(PathBuf, MarkerKind, u64)>,
+    /// The discovered repo roots (canonical).
+    roots: Vec<PathBuf>,
+    /// Every discovered AGENTS.md path (absolute), from the same bounded walk.
+    agents_md: Vec<PathBuf>,
+    /// When the walk that produced this entry ran. Drives [`DISCOVERY_CACHE_TTL`]
+    /// — the backstop for markers that APPEAR without touching a recorded
+    /// marker (a new `AGENTS.md`/`.agents/rules`/repo in an existing dir).
+    walked_at: Option<std::time::Instant>,
+}
+
+/// How long a cached floor is trusted for STRUCTURAL changes (a marker that
+/// appeared or disappeared) before it is re-walked regardless of mtimes.
+///
+/// Existing markers are validated on every turn by mtime, so an edited rule or
+/// `AGENTS.md` is picked up immediately. What mtimes cannot see is a marker
+/// being ADDED in a directory we already walked past (the parent's mtime does
+/// move for a direct child, but not for a grandchild), and a newly cloned repo.
+/// Rather than stat every traversed directory (141K of them on the prod
+/// workspace — far worse than the walk it would replace), the structural check
+/// is bounded by this TTL: five minutes of staleness in exchange for zero
+/// traversal on every other turn.
+const DISCOVERY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The process-global discovery cache, keyed by canonical floor path. Bounded
+/// by [`DISCOVERY_CACHE_CAPACITY`] with whole-table flush on overflow (floors
+/// are few; a flush is cheap relative to the walk it saves).
+static DISCOVERY_CACHE: Mutex<Option<HashMap<PathBuf, DiscoveryEntry>>> = Mutex::new(None);
+
+/// Diagnostic counters for the discovery hot path: how many times a turn did a
+/// stat-only cache hit (no walk) vs a re-walk, and the cumulative walk cost.
+/// These let the `rules block injected` log line carry the before/after timing
+/// evidence the operator asked for (first walk, stat-only turn, changed turn).
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryStats {
+    /// Stat-only cache hits (no traversal).
+    pub stat_hits: u64,
+    /// Full walks performed (first turn + any invalidated turn).
+    pub walks: u64,
+    /// Cumulative millis spent walking.
+    pub walk_millis: u128,
+    /// Millis spent in the last stat-only revalidation (the cheap path).
+    pub last_stat_millis: u128,
+}
+
+static DISCOVERY_STATS: Mutex<DiscoveryStats> = Mutex::new(DiscoveryStats::EMPTY);
+
+impl DiscoveryStats {
+    const EMPTY: DiscoveryStats = DiscoveryStats {
+        stat_hits: 0,
+        walks: 0,
+        walk_millis: 0,
+        last_stat_millis: 0,
+    };
+
+    fn snapshot() -> DiscoveryStats {
+        let g = DISCOVERY_STATS.lock().unwrap_or_else(|p| p.into_inner());
+        DiscoveryStats {
+            stat_hits: g.stat_hits,
+            walks: g.walks,
+            walk_millis: g.walk_millis,
+            last_stat_millis: g.last_stat_millis,
+        }
+    }
+}
+
+const DISCOVERY_CACHE_CAPACITY: usize = 64;
+
+fn discovery_cache() -> &'static Mutex<Option<HashMap<PathBuf, DiscoveryEntry>>> {
+    &DISCOVERY_CACHE
+}
+
+fn mtime_secs(p: &Path) -> Option<u64> {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+}
+
+fn canon(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// A single (bounded) walk of one floor: find every repo root (dir containing
+/// `.git` or `.agents/rules`) up to `max_depth`, and every marker path
+/// (`AGENTS.md`, `.git`, `.agents/rules`) for the cache. Returns `(roots,
+/// markers, agents_md_paths)`.
+fn walk_floor(
+    floor: &Path,
+    max_depth: usize,
+) -> (Vec<PathBuf>, Vec<(PathBuf, MarkerKind)>, Vec<PathBuf>) {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut markers: Vec<(PathBuf, MarkerKind)> = Vec::new();
+    let mut agents_md: Vec<PathBuf> = Vec::new();
+    if !floor.is_dir() {
+        return (roots, markers, agents_md);
+    }
+
+    // The floor itself is a candidate root if it holds a marker directly.
+    let floor_is_root = floor.join(".git").exists()
+        || floor.join(".agents").join("rules").is_dir();
+    if floor_is_root {
+        roots.push(canon(floor));
+    }
+    if floor.join(".git").exists() {
+        markers.push((floor.join(".git"), MarkerKind::Git));
+    }
+    let agents_rules = floor.join(".agents").join("rules");
+    if agents_rules.is_dir() {
+        markers.push((agents_rules, MarkerKind::AgentsRulesDir));
+    }
+    if floor.join("AGENTS.md").is_file() {
+        markers.push((floor.join("AGENTS.md"), MarkerKind::AgentsMd));
+        agents_md.push(floor.join("AGENTS.md"));
+    }
+
+    // The floor's ignore spec (.gitignore + .git/info/exclude).
+    let filter = DiscoveryFilter {
+        ignores: load_gitignore(floor),
+    };
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(floor.to_path_buf(), 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+        if let Ok(c) = std::fs::canonicalize(&current)
+            && !seen.insert(c)
+        {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if name == "AGENTS.md" && ft.is_file() {
+                markers.push((path.clone(), MarkerKind::AgentsMd));
+                agents_md.push(path.clone());
+                continue;
+            }
+            if !ft.is_dir() {
+                if name == ".git" {
+                    markers.push((path.clone(), MarkerKind::Git));
+                }
+                continue;
+            }
+
+            // Prune always-pruned dirs, but record `.git` as a marker first.
+            if is_pruned_dir(name) {
+                if name == ".git" {
+                    markers.push((path.clone(), MarkerKind::Git));
+                }
+                continue;
+            }
+            // Honour gitignore (evaluated relative to the floor).
+            if let Some(ig) = &filter.ignores
+                && let Ok(rel) = path.strip_prefix(floor)
+                && ig.prunes(rel)
+            {
+                continue;
+            }
+            // Do not follow symlinked dirs (N6).
+            if ft.is_symlink() {
+                continue;
+            }
+            let child_agents_rules = path.join(".agents").join("rules");
+            if path.join(".git").exists() || child_agents_rules.is_dir() {
+                roots.push(canon(&path));
+            }
+            if child_agents_rules.is_dir() {
+                markers.push((child_agents_rules, MarkerKind::AgentsRulesDir));
+            }
+            stack.push((path, depth + 1));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    markers.sort();
+    markers.dedup();
+    agents_md.sort();
+    agents_md.dedup();
+
+    (roots, markers, agents_md)
+}
+
+/// The cached discovery read: return the floor's repo roots and AGENTS.md
+/// paths with a stat-only revalidation. Returns `(roots, agents_md_paths,
+/// was_walked)` — `was_walked == false` means a pure stat-only cache hit (no
+/// traversal). Diagnostics get the walk duration from the cache entry directly.
+fn discover_floor_cached(floor: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, bool) {
+    discover_floor_cached_with_ttl(floor, DISCOVERY_CACHE_TTL)
+}
+
+/// [`discover_floor_cached`] with an explicit structural TTL (tests drive this
+/// with `Duration::ZERO` to force the structural revalidation without sleeping).
+fn discover_floor_cached_with_ttl(
+    floor: &Path,
+    ttl: std::time::Duration,
+) -> (Vec<PathBuf>, Vec<PathBuf>, bool) {
+    let key = canon(floor);
+    let mut guard = discovery_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+
+    if let Some(e) = cache.get(&key) {
+        let stat_start = std::time::Instant::now();
+        // Structural freshness: the TTL backstop for markers that APPEARED
+        // (mtimes of recorded markers cannot see a new sibling/deep marker).
+        let structure_ok = e
+            .walked_at
+            .map(|t| stat_start.duration_since(t) < ttl)
+            .unwrap_or(false);
+        let root_ok = mtime_secs(&e.floor).map(|m| m == e.floor_mtime).unwrap_or(false);
+        let all_ok = structure_ok
+            && root_ok
+            && e.markers
+                .iter()
+                .all(|(p, _, m)| mtime_secs(p).map(|cur| cur == *m).unwrap_or(false));
+        if all_ok {
+            // Stat-only cache hit: NO traversal.
+            let stat_millis = stat_start.elapsed().as_millis();
+            {
+                let mut s = DISCOVERY_STATS.lock().unwrap_or_else(|p| p.into_inner());
+                s.stat_hits += 1;
+                s.last_stat_millis = stat_millis;
+            }
+            return (e.roots.clone(), e.agents_md.clone(), false);
+        }
+    }
+
+    // Miss or invalidated: re-walk.
+    let start = std::time::Instant::now();
+    let (roots, markers, agents_md) = walk_floor(floor, MAX_ROOT_SCAN_DEPTH);
+    let walk_millis = start.elapsed().as_millis();
+    {
+        let mut s = DISCOVERY_STATS.lock().unwrap_or_else(|p| p.into_inner());
+        s.walks += 1;
+        s.walk_millis += walk_millis;
+    }
+    let marker_entries: Vec<(PathBuf, MarkerKind, u64)> = markers
+        .into_iter()
+        .map(|(p, k)| {
+            let m = mtime_secs(&p).unwrap_or(0);
+            (p, k, m)
+        })
+        .collect();
+    cache.insert(
+        key.clone(),
+        DiscoveryEntry {
+            floor: key.clone(),
+            floor_mtime: mtime_secs(&key).unwrap_or(0),
+            markers: marker_entries,
+            roots: roots.clone(),
+            agents_md: agents_md.clone(),
+            walked_at: Some(start),
+        },
+    );
+    if cache.len() > DISCOVERY_CACHE_CAPACITY {
+        cache.clear();
+    }
+    (roots, agents_md, true)
+}
+
+/// Warm the discovery cache for one workspace floor.
+///
+/// Called from daemon startup (in a background thread, once per configured
+/// agent workspace) so the FIRST turn of a fresh pod finds a populated cache
+/// instead of paying the bounded walk. Idempotent and best-effort: a floor
+/// that vanished between config load and the warm is simply skipped, and a
+/// failing walk leaves the cache empty for the turn to fill.
+pub fn warm_discovery(floor: &Path) {
+    if !floor.is_dir() {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let (roots, agents, walked) = discover_floor_cached(floor);
+    if walked {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load).with_attrs(
+                ::serde_json::json!({
+                    "hook": "rules",
+                    "event": "discovery-warm",
+                    "floor": floor.display().to_string(),
+                    "roots": roots.len(),
+                    "agents_md": agents.len(),
+                    "warm_millis": start.elapsed().as_millis(),
+                })
+            ),
+            "rules discovery cache warmed at startup"
+        );
+    }
 }
 
 // ── The in-play registry (process-global, LRU/TTL) ──────────────
@@ -742,6 +1235,18 @@ impl RulesHook {
 
         // 1. Session workspace / working directory first (the turn-1 corpus).
         let ws = ctx.workspace();
+        // Fast path: the bounded, mtime-cached walker finds every candidate
+        // repo root below the workspace floor WITHOUT a full tree walk, and
+        // stats-only on unchanged turns.
+        let (walked_roots, _agents, _walked) = discover_floor_cached(ws);
+        for root in walked_roots {
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
+        }
+        // Fallback: git rev-parse for the workspace itself (covers a floor
+        // that IS a repo but whose `.git`/`.agents/rules` marker is unusual,
+        // and the ancestor `.agents/rules` case).
         if let Some(root) = resolve_repo_root(ws)
             && seen.insert(root.clone())
         {
@@ -1062,21 +1567,53 @@ impl RulesHook {
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
 
+        // The workspace floor's AGENTS.md set comes from the SAME bounded,
+        // mtime-cached walk the root finder uses — no second full scan here.
+        // `is_root` is recomputed per path relative to a resolved repo root or
+        // the workspace floor below.
+        let (_floor_roots, floor_agents, _walked) = discover_floor_cached(ws);
+        let ws_canon = canon(ws);
+        // Canonicalise each discovered AGENTS.md ONCE (not per repo root): the
+        // filter below then does pure path-prefix comparisons, so a workspace
+        // with many nested `AGENTS.md` files × several repo roots costs a few
+        // hundred `canonicalize` calls instead of `agents × roots`.
+        let floor_agents_canon: Vec<(PathBuf, PathBuf)> = floor_agents
+            .iter()
+            .map(|p| (canon(p), p.clone()))
+            .collect();
+
         // Repo scopes FIRST — root + nested AGENTS.md. A repo root that is also
         // a workspace subdirectory must keep its repo-root classification
         // (deliver-once-per-session), so the repo scan claims the path before
-        // the workspace nested scan can mis-classify it. This mirrors the
-        // rules dedup law (a repo instance beats the shared workspace copy).
-        // Deeper roots scan first: when both a parent (workspace floor) and an
-        // inner git repo are resolved, the inner repo must claim its own root
-        // AGENTS.md as a root (not be swallowed as a parent-nested file).
+        // the workspace nested scan can mis-classify it. Deeper roots claim
+        // first (an inner repo's own root AGENTS.md is root, not parent-nested).
         let mut roots = roots;
         roots.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
         for root in roots {
             if !root.is_dir() {
                 continue;
             }
-            for (path, is_root) in scan_agents_md(&root) {
+            let root_canon = canon(&root);
+            // For a root under the workspace floor, its AGENTS.md files are
+            // already in `floor_agents` (the floor walk covers the subtree).
+            // For a root OUTSIDE the floor (an in-play absolute path into
+            // another checkout), scan it directly.
+            let candidates: Vec<(PathBuf, bool)> = if root_canon.starts_with(&ws_canon) {
+                floor_agents_canon
+                    .iter()
+                    .filter(|(canon_p, _)| canon_p.starts_with(&root_canon))
+                    .map(|(canon_p, p)| {
+                        let is_root = canon_p
+                            .parent()
+                            .map(|d| d == root_canon.as_path())
+                            .unwrap_or(false);
+                        (p.clone(), is_root)
+                    })
+                    .collect()
+            } else {
+                scan_agents_md(&root)
+            };
+            for (path, is_root) in candidates {
                 if let Some(md) = self.load_agents_md(
                     &path,
                     format!("repo:{}", root.display()),
@@ -1091,12 +1628,16 @@ impl RulesHook {
         // Workspace scope — nested AGENTS.md only (root = engine bootstrap),
         // and only when the repo scope above has not already claimed the path.
         if ws.is_dir() {
-            for (path, is_root) in scan_agents_md(ws) {
+            for (canon_p, path) in &floor_agents_canon {
+                let is_root = canon_p
+                    .parent()
+                    .map(|d| d == ws_canon.as_path())
+                    .unwrap_or(false);
                 if is_root {
                     continue; // engine bootstrap, never re-listed
                 }
-                if let Some(md) = self.load_agents_md(&path, "workspace".to_string(), false)
-                    && seen.insert(canon(&path))
+                if let Some(md) = self.load_agents_md(path, "workspace".to_string(), false)
+                    && seen.insert(canon_p.clone())
                 {
                     out.push(md);
                 }
@@ -1186,6 +1727,10 @@ impl RulesHook {
 
         let mut out = String::new();
         let mut delivered = 0usize;
+        // The block budget is shared by every section below: root bodies first
+        // (the law), then pointers (cheap), then in-play attached bodies, then
+        // the index (discoverability, capped hardest).
+        let mut remaining = AGENTS_MD_BLOCK_BUDGET;
 
         // 1. Root bodies (once per session).
         for md in root_bodies {
@@ -1194,13 +1739,16 @@ impl RulesHook {
             }
             delivered += 1;
             let heading = format!("### {} {}\n", md.scope, md.path.display());
+            let body_cap = AGENTS_MD_ROOT_BODY_MAX_CHARS
+                .min(remaining.saturating_sub(heading.chars().count()));
+            let (head, truncated) = bounded_digest(&md.body, body_cap);
             out.push_str(&heading);
-            let (head, truncated) = bounded_digest(&md.body, AGENTS_MD_ROOT_BODY_MAX_CHARS);
             out.push_str(head);
             if truncated {
                 out.push_str("\n[... AGENTS.md truncated — read the file for full content]\n");
             }
             out.push('\n');
+            remaining = remaining.saturating_sub(heading.chars().count() + head.chars().count());
         }
 
         // 2. Root pointers (already delivered this session).
@@ -1208,15 +1756,20 @@ impl RulesHook {
             if out.is_empty() {
                 out.push_str("\n## Repo instructions (AGENTS.md)\n");
             }
-            out.push_str(&format!(
+            let line = format!(
                 "{} — repo instructions loaded (AGENTS.md, {} chars) — re-read with file_read if needed\n",
                 md.scope,
                 md.body.chars().count()
-            ));
+            );
+            if line.chars().count() > remaining {
+                break;
+            }
+            remaining = remaining.saturating_sub(line.chars().count());
+            out.push_str(&line);
         }
 
         // 3. Nested attached bodies (in-play dir match).
-        let mut nested_budget = self.config.attach_budget;
+        let mut nested_budget = self.config.attach_budget.min(remaining);
         for md in nested_attached {
             let block =
                 format!("### {} {}\n{}", md.scope, md.path.display(), md.body);
@@ -1228,22 +1781,46 @@ impl RulesHook {
                 out.push_str("\n## Attached AGENTS.md — in-play directory\n");
                 out.push_str(head);
                 out.push_str("\n[... attached AGENTS.md truncated]\n");
+                remaining = remaining.saturating_sub(head.chars().count());
                 break;
             }
             out.push_str("\n## Attached AGENTS.md — in-play directory\n");
             out.push_str(&block);
             nested_budget -= block.len();
+            remaining = remaining.saturating_sub(block.chars().count());
         }
 
-        // 4. Nested indexed-only entries (out of play): folder description.
-        for md in nested_indexed {
-            if out.is_empty() {
-                out.push_str("\n## AGENTS.md index\n");
-            }
-            out.push_str(&format!(
+        // 4. Nested indexed-only entries (out of play): a bounded listing, most
+        // general first (shallow paths), with an explicit count when truncated.
+        // The index is discoverability, not law — 261 entries × ~200 chars was
+        // the dominant cost of the measured 67,592-char block.
+        let mut index_budget = AGENTS_MD_INDEX_BUDGET.min(remaining);
+        let mut indexed = nested_indexed;
+        indexed.sort_by_key(|md| (md.dir.components().count(), md.dir.clone()));
+        let total_indexed = indexed.len();
+        let mut listed = 0usize;
+        let mut skipped = 0usize;
+        for md in indexed {
+            let entry = format!(
                 "<instruction>\n<file>{}</file>\n<folder>{}</folder>\n</instruction>\n",
                 md.scope,
                 md.dir.display()
+            );
+            if entry.chars().count() > index_budget {
+                skipped += 1;
+                continue; // keep trying shorter entries that still fit
+            }
+            if listed == 0 {
+                out.push_str("\n## AGENTS.md index\n");
+            }
+            index_budget -= entry.chars().count();
+            out.push_str(&entry);
+            listed += 1;
+        }
+        if skipped > 0 {
+            out.push_str(&format!(
+                "[... {} more AGENTS.md files not listed ({} of {}) — locate with a file search when working in that directory]\n",
+                skipped, listed, total_indexed
             ));
         }
 
@@ -1432,6 +2009,7 @@ impl HookHandler for RulesHook {
             manifest_truncated,
         ) = self.build_block(ctx);
         let injected_chars = block.len();
+        let stats = DiscoveryStats::snapshot();
         if !block.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1448,6 +2026,10 @@ impl HookHandler for RulesHook {
                         "attached_count": attached_count,
                         "attached_chars": attached_chars,
                         "manifest_truncated": manifest_truncated,
+                        "discovery_stat_hits": stats.stat_hits,
+                        "discovery_walks": stats.walks,
+                        "discovery_walk_millis": stats.walk_millis,
+                        "discovery_last_stat_millis": stats.last_stat_millis,
                     })),
                 "rules block injected into system prompt"
             );
@@ -2157,6 +2739,357 @@ mod tests {
             .collect();
         assert!(by_name.iter().any(|(r, p)| *r && p.ends_with("AGENTS.md") && !p.contains("/sub/")));
         assert!(by_name.iter().any(|(r, p)| !*r && p.contains("/sub/AGENTS.md")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Bounded discovery + mtime cache (discovery-fix) ──────────
+
+    #[test]
+    fn walk_floor_finds_nested_repo_and_prunes_git() {
+        // A nested repo (dir with `.git`) under a non-repo floor is discovered;
+        // `.git/` INTERNALS (a file inside `.git/`) are never marked/indexed.
+        let dir = std::env::temp_dir().join(format!("zc-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested").join(".git")).unwrap();
+        std::fs::write(dir.join("nested").join(".git").join("index"), "x").unwrap();
+        std::fs::write(dir.join("nested").join("AGENTS.md"), "law\n").unwrap();
+
+        let (roots, markers, agents) = walk_floor(&dir, 16);
+
+        // The nested repo is a discovered root.
+        let canon_nested = canon(&dir.join("nested"));
+        assert!(
+            roots.iter().any(|r| *r == canon_nested),
+            "nested repo root discovered; got {roots:?}"
+        );
+        // The nested AGENTS.md is indexed.
+        assert!(
+            agents.iter().any(|p| p.ends_with("AGENTS.md")),
+            "nested AGENTS.md indexed; got {agents:?}"
+        );
+        // No marker descends INTO `.git/` internals.
+        assert!(
+            !markers.iter().any(|(p, _)| p.to_string_lossy().contains("/.git/index")),
+            "`.git/` internals are pruned from markers; got {markers:?}"
+        );
+        // The `.git` dir itself IS a marker (signals the repo root).
+        assert!(
+            markers.iter().any(|(p, k)| *k == MarkerKind::Git && p.ends_with(".git")),
+            "the `.git` dir itself is recorded as a marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_floor_prunes_cargo_cache_and_honours_gitignore() {
+        let dir = std::env::temp_dir().join(format!("zc-prune-{}", std::process::id()));
+        // `.cargo` and `.cache` always pruned.
+        std::fs::create_dir_all(dir.join(".cargo").join("registry")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache").join("uv")).unwrap();
+        std::fs::write(dir.join(".cache").join("uv").join("blob"), "x").unwrap();
+        // A gitignored dir (`target/`) pruned via .gitignore.
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target").join("AGENTS.md"), "ignored\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+        // A legitimate nested repo that must STILL be found.
+        std::fs::create_dir_all(dir.join("skill-lab.gen")).unwrap();
+        std::fs::write(dir.join("skill-lab.gen").join(".git"), "gitdir: fake\n").unwrap();
+        std::fs::write(dir.join("skill-lab.gen").join("AGENTS.md"), "lab\n").unwrap();
+
+        let (roots, markers, agents) = walk_floor(&dir, 16);
+
+        // No marker/index descends into `.cargo`, `.cache`, or `target`.
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        assert!(!markers.iter().any(|(p, _)| s(p).contains("/.cargo/")), ".cargo pruned");
+        assert!(!markers.iter().any(|(p, _)| s(p).contains("/.cache/")), ".cache pruned");
+        assert!(
+            !agents.iter().any(|p| s(p).contains("/target/AGENTS.md")),
+            "gitignored target/ AGENTS.md is not indexed"
+        );
+        // `skill-lab.gen` is NOT pruned (a worktree-like dir can be a repo).
+        let mut found_lab = roots.iter().any(|r| s(r).ends_with("skill-lab.gen"));
+        found_lab = found_lab || agents.iter().any(|p| s(p).ends_with("/skill-lab.gen/AGENTS.md"));
+        assert!(found_lab, "skill-lab.gen (a possible checkout) is still scanned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_hit_is_stat_only_no_second_walk() {
+        // A second discover_floor_cached on an unchanged tree must reuse the
+        // cached manifest (was_walked == false): no re-traversal.
+        let dir = std::env::temp_dir().join(format!("zc-cache-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("repo").join(".agents").join("rules")).unwrap();
+        std::fs::write(dir.join("repo").join("AGENTS.md"), "law\n").unwrap();
+
+        let (roots1, agents1, walked1) = discover_floor_cached(&dir);
+        assert!(walked1, "first call walks");
+        assert!(
+            roots1.iter().any(|r| r.ends_with("repo")),
+            "first walk finds the nested repo; got {roots1:?}"
+        );
+
+        // Second call: stat-only cache hit.
+        let (roots2, agents2, walked2) = discover_floor_cached(&dir);
+        assert!(!walked2, "unchanged tree → stat-only cache hit, no re-walk");
+        assert_eq!(roots1, roots2, "cached roots match the first walk");
+        assert_eq!(agents1, agents2, "cached AGENTS.md set matches");
+
+        // Changing an EXISTING marker's mtime invalidates the cache → re-walk.
+        // Set the marker to a deterministically older mtime (avoids second-
+        // granularity flakiness of a same-second content write).
+        std::fs::write(dir.join("repo").join("AGENTS.md"), "law v2\n").unwrap();
+        {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.join("repo").join("AGENTS.md"))
+                .unwrap();
+            let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+            f.set_modified(older).unwrap();
+        }
+        let (_roots3, _agents3, walked3) = discover_floor_cached(&dir);
+        assert!(walked3, "a changed marker (AGENTS.md mtime) invalidates → re-walk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovery_cache_ttl_picks_up_markers_that_appear() {
+        // The mtime check only sees markers it RECORDED. A marker that appears
+        // later (a new AGENTS.md, a newly cloned repo) must be found by the
+        // structural TTL re-walk — that is the bounded-invalidation contract:
+        // never re-walk every turn, but never go permanently blind either.
+        let dir = std::env::temp_dir().join(format!("zc-ttl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("keep"), "x").unwrap();
+
+        let (roots1, agents1, walked1) = discover_floor_cached_with_ttl(&dir, DISCOVERY_CACHE_TTL);
+        assert!(walked1, "first call walks");
+        assert!(roots1.is_empty(), "no repo yet: {roots1:?}");
+        assert!(agents1.is_empty(), "no AGENTS.md yet: {agents1:?}");
+
+        // A NEW marker appears one level down (the floor's own mtime does not
+        // move for a grandchild, and no recorded marker changed).
+        std::fs::write(dir.join("nested").join("AGENTS.md"), "new law\n").unwrap();
+
+        // Within the TTL the cached view is served (documented bounded staleness).
+        let (_r, agents_within_ttl, walked_within_ttl) =
+            discover_floor_cached_with_ttl(&dir, DISCOVERY_CACHE_TTL);
+        assert!(!walked_within_ttl, "within the TTL: stat-only, no re-walk");
+        assert!(
+            agents_within_ttl.is_empty(),
+            "bounded staleness: the new marker is not seen inside the TTL window"
+        );
+
+        // Once the TTL elapses the structural re-walk finds it.
+        let (_r2, agents_after_ttl, walked_after_ttl) =
+            discover_floor_cached_with_ttl(&dir, std::time::Duration::ZERO);
+        assert!(walked_after_ttl, "TTL elapsed → structural re-walk");
+        assert!(
+            agents_after_ttl.iter().any(|p| p.ends_with("nested/AGENTS.md")),
+            "the marker that appeared is discovered after the TTL; got {agents_after_ttl:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_discovery_populates_the_cache_for_the_first_turn() {
+        // Startup warm-up: after `warm_discovery`, the first turn's read is a
+        // stat-only cache hit — the pod never pays the walk on a live turn.
+        let dir = std::env::temp_dir().join(format!("zc-warm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("repo").join(".agents").join("rules")).unwrap();
+        std::fs::write(dir.join("repo").join("AGENTS.md"), "law\n").unwrap();
+
+        warm_discovery(&dir);
+
+        let (roots, agents, walked) = discover_floor_cached(&dir);
+        assert!(!walked, "after warm-up the turn is a stat-only hit (no walk)");
+        assert!(roots.iter().any(|r| r.ends_with("repo")), "warm found the repo");
+        assert!(agents.iter().any(|p| p.ends_with("AGENTS.md")), "warm indexed AGENTS.md");
+
+        // A missing floor is a no-op, never a panic.
+        warm_discovery(&dir.join("does-not-exist"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_md_block_respects_the_total_budget_with_many_nested_files() {
+        // The per-body cap does not bound the BLOCK: a workspace with many
+        // nested AGENTS.md files used to inject ~54K chars of index alone. The
+        // block budget caps the whole delivery and the index gets the smallest
+        // share, with an explicit count of what was dropped.
+        let dir = std::env::temp_dir().join(format!("zc-blockbudget-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("AGENTS.md"),
+            format!("ROOT LAW: kept.\n{}", "X".repeat(60_000)),
+        )
+        .unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
+            .status();
+        for i in 0..200 {
+            let sub = dir.join(format!("area{i:03}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("AGENTS.md"), format!("nested {i}\n")).unwrap();
+        }
+
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            ..RulesHookConfig::default()
+        });
+        let ctx = PromptBuildHookContext::new("director", dir.clone(), "sess-budget", "turn-1");
+        let (block, _count, _ac, _ac_chars, _manifest_chars, agents_md_chars, _truncated) =
+            hook.build_block(&ctx);
+
+        assert!(
+            agents_md_chars <= AGENTS_MD_BLOCK_BUDGET + 512,
+            "the WHOLE AGENTS.md block stays within the total budget; agents_md_chars={agents_md_chars}"
+        );
+        assert!(
+            block.contains("ROOT LAW: kept"),
+            "the root body's head survives (law before index)"
+        );
+        assert!(
+            block.contains("more AGENTS.md files not listed"),
+            "the dropped index entries are declared, not silently lost"
+        );
+        assert!(
+            block.chars().count() < 20_000,
+            "200 nested files + a 60k root body do not inflate the block; got {}",
+            block.chars().count()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Timing evidence for the discovery-fix report. `#[ignore]` by default:
+    // run explicitly with
+    //   cargo test -p zeroclaw-runtime --lib discovery_timing_report -- --ignored --nocapture
+    // to print first-walk / stat-only / mtime-changed timings on a realistic
+    // fixture (many files, nested repos, .git internals, .cargo/.cache, and a
+    // gitignored dir).
+    #[test]
+    #[ignore]
+    fn discovery_timing_report() {
+        let dir = std::env::temp_dir().join(format!("zc-timing-{}", std::process::id()));
+        // A floor that resembles a workspace: a nested repo with .git internals,
+        // a heavy .cargo + .cache, a gitignored target/, and many leaf files.
+        std::fs::create_dir_all(dir.join("repo").join(".git").join("objects")).unwrap();
+        std::fs::write(dir.join("repo").join(".git").join("objects").join("b1"), "x").unwrap();
+        std::fs::write(
+            dir.join("repo").join("AGENTS.md"),
+            &"X".repeat(67_592),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(".cargo").join("registry").join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache").join("uv")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        std::fs::create_dir_all(dir.join("target").join("debug")).unwrap();
+        std::fs::write(dir.join("target").join("debug").join("blob"), "x").unwrap();
+        // A spread of leaf files to give the walker real work.
+        for i in 0..20_000 {
+            let sub = dir.join(format!("d{}", i % 50));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("f{i}.rs")), "x").unwrap();
+        }
+
+        // First walk (cold) — the discovery-fix must NOT scan .cargo/.cache/
+        // .git internals, but DOES build the manifest in one bounded pass.
+        let t0 = std::time::Instant::now();
+        let (roots1, agents1, walked1) = discover_floor_cached(&dir);
+        let first_walk = t0.elapsed();
+        assert!(walked1, "first call walks");
+        assert!(roots1.iter().any(|r| r.ends_with("repo")), "nested repo found");
+
+        // Stat-only turn (unchanged).
+        let t0 = std::time::Instant::now();
+        let (_r2, _a2, walked2) = discover_floor_cached(&dir);
+        let stat_only = t0.elapsed();
+        assert!(!walked2, "unchanged → stat-only");
+
+        // mtime-changed turn (a marker changed) → re-walk.
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.join("repo").join("AGENTS.md"))
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let (_r3, _a3, walked3) = discover_floor_cached(&dir);
+        let changed_turn = t0.elapsed();
+        assert!(walked3, "changed marker → re-walk");
+
+        let stats = DiscoveryStats::snapshot();
+        eprintln!("\n=== discovery timing report ===");
+        eprintln!("first walk:        {:?}  (agents_md files: {})", first_walk, agents1.len());
+        eprintln!("stat-only turn:    {:?}  (cache hit, no traversal)", stat_only);
+        eprintln!("mtime-changed turn:{:?}  (re-walk)", changed_turn);
+        eprintln!(
+            "cumulative: walks={} stat_hits={} walk_millis={} last_stat_millis={}",
+            stats.walks, stats.stat_hits, stats.walk_millis, stats.last_stat_millis
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_root_agents_md_body_is_capped_at_12k() {
+        // A >12k repo-root AGENTS.md must be head-truncated to ~12k chars in
+        // the delivered block (canary parity), never injected whole.
+        let dir = std::env::temp_dir().join(format!("zc-cap-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // A 60k body: well over the 12k cap. The narrative spine is at the HEAD so
+        // head-truncation keeps it (the tail X's are dropped).
+        let body = format!("PROJECT LAW: the spine survives.\n{}", "X".repeat(60_000));
+        std::fs::write(repo.join("AGENTS.md"), &body).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
+            .status();
+
+        {
+            let mut guard = registry_inner().lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: true,
+            ..RulesHookConfig::default()
+        });
+
+        let ctx = PromptBuildHookContext::new("director", repo.clone(), "sess-cap", "turn-1");
+        let (block, _count, _ac, _ac_chars, _manifest_chars, agents_md_chars, _truncated) =
+            hook.build_block(&ctx);
+
+        // The delivered AGENTS.md block is bounded by the 12k cap (plus heading
+        // + truncation note overhead).
+        assert!(
+            agents_md_chars <= AGENTS_MD_ROOT_BODY_MAX_CHARS + 512,
+            "repo AGENTS.md body is capped (~12k) not injected whole; agents_md_chars={agents_md_chars}"
+        );
+        assert!(
+            block.contains("PROJECT LAW: the spine survives"),
+            "the head of the body (where the narrative spine lives) survives truncation"
+        );
+        assert!(
+            block.chars().count() < 20_000,
+            "the 60k body is NOT injected whole (block is bounded)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

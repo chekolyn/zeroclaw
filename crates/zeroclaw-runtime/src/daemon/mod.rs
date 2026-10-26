@@ -1081,6 +1081,32 @@ pub async fn run_with_authority(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+            // Warm the rules-hook discovery cache for every configured agent
+            // workspace BEFORE the first turn arrives. The discovery walk is
+            // bounded and pruned, but on a large workspace it is still a
+            // second-scale cost; doing it here (background thread, best-effort)
+            // means a fresh pod's first prompt build hits a warm cache instead
+            // of paying it, and no turn ever waits on another's walk.
+            if config.hooks.builtin.rules.enabled && config.hooks.builtin.rules.repo_discovery {
+                let floors: Vec<std::path::PathBuf> = {
+                    let mut aliases: Vec<&String> = config.agents.keys().collect();
+                    aliases.sort();
+                    aliases
+                        .into_iter()
+                        .map(|alias| config.agent_workspace_dir(alias))
+                        .collect()
+                };
+                if !floors.is_empty() {
+                    std::thread::Builder::new()
+                        .name("rules-discovery-warm".to_string())
+                        .spawn(move || {
+                            for floor in floors {
+                                crate::hooks::builtin::rules::warm_discovery(&floor);
+                            }
+                        })
+                        .ok();
+                }
+            }
             Some(std::sync::Arc::new(
                 crate::hooks::HookRunner::from_root_config(&config),
             ))
