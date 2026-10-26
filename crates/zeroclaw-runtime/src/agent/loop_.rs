@@ -1001,6 +1001,109 @@ pub(crate) async fn apply_prompt_build_hooks_with_context(
     }
 }
 
+/// Mint the prompt-build/tool-loop hook runner for one turn, from the settled
+/// config. The single construction site for `loop_::run` and the
+/// `process_message` path (mirrors `agent.rs::AgentBuilder::hook_runner` and
+/// the channels orchestrator): built once per turn, so the rules hook (and
+/// any future prompt-modifying builtin) fires on every turn origin. A
+/// `hooks.enabled = false` config yields `None` (no-op seam). Fail-open: a
+/// builtin whose own configuration is invalid is skipped inside
+/// `HookRunner::from_root_config` (logged there), never fails the turn.
+fn hooks_for(
+    config: &Config,
+    agent_alias: &str,
+) -> Option<crate::hooks::HookRunner> {
+    if config.hooks.enabled {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({
+                    "hook": "rules",
+                    "alias": agent_alias,
+                    "hooks.enabled": true,
+                    "rules.enabled": config.hooks.builtin.rules.enabled,
+                    "rules.global_dir": config.hooks.builtin.rules.global_dir,
+                })),
+            "building prompt-build hook runner"
+        );
+        Some(crate::hooks::HookRunner::from_root_config(config))
+    } else {
+        None
+    }
+}
+
+/// Build the turn's system prompt AND run the typed
+/// `before_prompt_build_with_context` hook chain over it — the ONE seam every
+/// `loop_::run` build site goes through (the cron / CLI one-shot /
+/// daemon-SOP-step turn path). The raw sync builder's arguments pass through
+/// unchanged (including `bootstrap_max_chars`, which stays call-site-derived,
+/// never sourced from config); the assembled result is wrapped by
+/// [`apply_prompt_build_hooks_with_context`] so the rules hook injects the
+/// manifest on every origin, and a per-iteration re-render re-applies (the
+/// marker-replace idempotency makes the wholesale overwrite byte-safe).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_turn_system_prompt(
+    hooks: Option<&crate::hooks::HookRunner>,
+    alias: &str,
+    workspace: &std::path::Path,
+    session_id: Option<&str>,
+    turn_id: &str,
+    agent_workspace: &std::path::Path,
+    model_name: &str,
+    tool_descs: &[(&str, &str)],
+    deferred_section: &str,
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    model_provider: &dyn ModelProvider,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
+    strict_tool_parsing: bool,
+    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
+    inject_memory: bool,
+    show_tool_calls: bool,
+    thinking_prefix: Option<&str>,
+    shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
+) -> Result<String> {
+    let prompt = build_system_prompt_for_turn(
+        agent_workspace,
+        model_name,
+        tool_descs,
+        deferred_section,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        risk_profile,
+        model_provider,
+        tools_registry,
+        excluded_tools,
+        activated_tools,
+        strict_tool_parsing,
+        skills_prompt_mode,
+        compact_context,
+        max_system_prompt_chars,
+        inject_memory,
+        show_tool_calls,
+        thinking_prefix,
+        shell_profile,
+    )?;
+    Ok(
+        apply_prompt_build_hooks_with_context(
+            hooks,
+            alias,
+            workspace,
+            session_id,
+            turn_id,
+            prompt,
+        )
+        .await,
+    )
+}
+
 pub fn make_query_summary(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
@@ -1564,6 +1667,19 @@ type AgentTurnHooksWiredTestHook = Arc<dyn Fn(bool) + Send + Sync>;
 #[cfg(test)]
 static AGENT_TURN_HOOKS_WIRED_TEST_HOOK: LazyLock<
     Mutex<Option<AgentTurnHooksWiredTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+/// Test-only probe: lets a test register EXTRA hook handlers into the runner
+/// minted inside `loop_::run` (the cron / CLI one-shot / daemon-SOP turn
+/// path). The runner is built from config inside `run` — there is no builder
+/// seam to inject through — so the test registers a closure that receives the
+/// freshly minted (refcount-1) runner and may register probe handlers on it.
+#[cfg(test)]
+type LoopRunHookRunnerTestHook = Arc<dyn Fn(&mut crate::hooks::HookRunner) + Send + Sync>;
+
+#[cfg(test)]
+static LOOP_RUN_HOOK_RUNNER_TEST_HOOK: LazyLock<
+    Mutex<Option<LoopRunHookRunnerTestHook>>,
 > = LazyLock::new(|| Mutex::new(None));
 
 fn api_key_and_uri_for_provider(
@@ -2178,7 +2294,49 @@ pub async fn run(
             excluded
         };
         let agent_workspace = config.agent_workspace_dir(agent_alias);
-        let mut system_prompt = build_system_prompt_for_turn(
+        // ── Prompt-build hook runner (cron / CLI one-shot / daemon-SOP path) ──
+        // Minted ONCE from the settled config and threaded into every system
+        // prompt build in this run (initial, message rebuild, and both
+        // per-iteration re-renders) plus the turn's `ResolvedIo.hooks`, so the
+        // rules hook fires on EVERY turn origin — before this change the four
+        // build sites called the raw builder with no runner and both
+        // `ResolvedIo` constructions passed `hooks: None`, leaving cron and
+        // daemon turns lawless (zero rules-hook events).
+        // `mut` exists only for the test-only probe registration below; the
+        // production path never mutates the minted runner.
+        #[allow(unused_mut)]
+        let mut turn_hooks: Option<Arc<crate::hooks::HookRunner>> =
+            hooks_for(&config, agent_alias).map(Arc::new);
+        #[cfg(test)]
+        if let Some(runner) = turn_hooks.as_mut() {
+            if let Some(hook) = LOOP_RUN_HOOK_RUNNER_TEST_HOOK
+                .lock()
+                .expect("loop-run runner test hook lock should not be poisoned")
+                .as_ref()
+                .cloned()
+            {
+                if let Some(minted) = Arc::get_mut(runner) {
+                    hook(minted);
+                }
+            }
+        }
+        let memory_session_id = session_state_file.as_deref().and_then(|path| {
+            let raw = path.to_string_lossy().trim().to_string();
+            if raw.is_empty() {
+                None
+            } else {
+                // Match the sanitized form persisted by memory backend migrations.
+                Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                    "cli:{raw}"
+                )))
+            }
+        });
+        let mut system_prompt = build_turn_system_prompt(
+            turn_hooks.as_deref(),
+            agent_alias,
+            &agent_workspace,
+            memory_session_id.as_deref(),
+            &turn_id,
             &agent_workspace,
             &model_name,
             &tool_descs,
@@ -2199,22 +2357,12 @@ pub async fn run(
             config.channels.show_tool_calls,
             None,
             runtime.shell_profile().as_ref(),
-        )?;
+        )
+        .await?;
 
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager =
             run_approval_manager(interactive, sop_step_scope.is_some(), &risk_profile);
-        let memory_session_id = session_state_file.as_deref().and_then(|path| {
-            let raw = path.to_string_lossy().trim().to_string();
-            if raw.is_empty() {
-                None
-            } else {
-                // Match the sanitized form persisted by memory backend migrations.
-                Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "cli:{raw}"
-                )))
-            }
-        });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
@@ -2279,7 +2427,12 @@ pub async fn run(
                 );
                 excluded
             };
-            system_prompt = build_system_prompt_for_turn(
+            system_prompt = build_turn_system_prompt(
+                turn_hooks.as_deref(),
+                agent_alias,
+                &agent_workspace,
+                memory_session_id.as_deref(),
+                &turn_id,
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
@@ -2300,7 +2453,8 @@ pub async fn run(
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
                 runtime.shell_profile().as_ref(),
-            )?;
+            )
+            .await?;
 
             let excluded_tool_names: HashSet<&str> =
                 excluded_tools.iter().map(String::as_str).collect();
@@ -2412,10 +2566,20 @@ pub async fn run(
             #[allow(unused_assignments)]
             let mut response = String::new();
             loop {
-                if let Some(sys_msg) = history.first_mut()
-                    && sys_msg.role == "system"
-                {
-                    sys_msg.content = build_system_prompt_for_turn(
+                // Re-render the system prompt each iteration (the wholesale
+                // overwrite), through the hook wrapper so the rules block is
+                // re-applied — the marker-replace idempotency keeps it a
+                // single block. The build runs BEFORE taking the
+                // `history.first_mut()` borrow, so no borrow is held across
+                // the await.
+                let system_role_first = history.first().is_some_and(|m| m.role == "system");
+                if system_role_first {
+                    let rebuilt_system = build_turn_system_prompt(
+                        turn_hooks.as_deref(),
+                        agent_alias,
+                        &agent_workspace,
+                        memory_session_id.as_deref(),
+                        &turn_id,
                         &agent_workspace,
                         &model_name,
                         &tool_descs,
@@ -2436,7 +2600,13 @@ pub async fn run(
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                         runtime.shell_profile().as_ref(),
-                    )?;
+                    )
+                    .await?;
+                    if let Some(sys_msg) = history.first_mut()
+                        && sys_msg.role == "system"
+                    {
+                        sys_msg.content = rebuilt_system;
+                    }
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
@@ -2459,7 +2629,7 @@ pub async fn run(
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
-                                        hooks: None,
+                                        hooks: turn_hooks.as_deref(),
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: None,
                                         receipt_generator: None,
@@ -3082,10 +3252,19 @@ pub async fn run(
                 });
 
                 let response = loop {
-                    if let Some(sys_msg) = history.first_mut()
-                        && sys_msg.role == "system"
-                    {
-                        sys_msg.content = build_system_prompt_for_turn(
+                    // Same per-iteration re-render discipline as the
+                    // one-shot loop above: build through the hook wrapper
+                    // (rules block re-applied each iteration), with no
+                    // `history` borrow held across the await.
+                    let system_role_first =
+                        history.first().is_some_and(|m| m.role == "system");
+                    if system_role_first {
+                        let rebuilt_system = build_turn_system_prompt(
+                            turn_hooks.as_deref(),
+                            agent_alias,
+                            &agent_workspace,
+                            memory_session_id.as_deref(),
+                            &turn_id,
                             &agent_workspace,
                             &model_name,
                             &tool_descs,
@@ -3106,7 +3285,13 @@ pub async fn run(
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                             runtime.shell_profile().as_ref(),
-                        )?;
+                        )
+                        .await?;
+                        if let Some(sys_msg) = history.first_mut()
+                            && sys_msg.role == "system"
+                        {
+                            sys_msg.content = rebuilt_system;
+                        }
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
@@ -3129,7 +3314,7 @@ pub async fn run(
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
                                             config: Some(&config),
-                                            hooks: None,
+                                            hooks: turn_hooks.as_deref(),
                                             activated_tools: activated_handle.as_ref(),
                                             model_switch_callback: None,
                                             receipt_generator: None,
@@ -3780,26 +3965,12 @@ async fn process_message_inner(
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
         // Prompt-build hook runner for the `process_message` / webhook turn
         // path. Mirrors `agent.rs::AgentBuilder::hook_runner` and the channels
-        // orchestrator: built once per turn from the settled config, so the
-        // rules hook (and any future prompt-modifying builtin) fires here too.
-        // The webhook/ACI path otherwise skips the hook chain entirely.
-        let prompt_build_hooks: Option<Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "hook": "rules",
-                        "alias": agent_alias,
-                        "hooks.enabled": true,
-                        "rules.enabled": config.hooks.builtin.rules.enabled,
-                        "rules.global_dir": config.hooks.builtin.rules.global_dir,
-                    })),
-                "process_message building prompt-build hook runner"
-            );
-            Some(Arc::new(crate::hooks::HookRunner::from_root_config(&config)))
-        } else {
-            None
-        };
+        // orchestrator: built once per turn from the settled config via the
+        // shared `hooks_for` construction site, so the rules hook (and any
+        // future prompt-modifying builtin) fires here too. The webhook/ACI
+        // path otherwise skips the hook chain entirely.
+        let prompt_build_hooks: Option<Arc<crate::hooks::HookRunner>> =
+            hooks_for(&config, agent_alias).map(Arc::new);
         let (provider_name, provider_alias, agent_model_provider) = match config
             .resolved_model_provider_for_agent(agent_alias)
         {
@@ -20795,6 +20966,288 @@ Let me check the result."#;
         assert!(
             wired.iter().any(|is_some| *is_some),
             "process_message must thread a HookRunner into the turn's ResolvedIo.hooks; observed {wired:?}"
+        );
+    }
+
+    /// The rules hook must fire on the `loop_::run` turn path — the origin the
+    /// cron scheduler (`run_agent_job`), the CLI one-shot (`zeroclaw agent`),
+    /// and daemon-convened SOP steps all drive. Before the CONTEXT-LAYERS-
+    /// LOOP-RUN-HOOKS fix this path built its system prompt via the raw
+    /// `build_system_prompt_for_turn` with NO hook runner (and passed
+    /// `hooks: None` into both `ResolvedIo` constructions), so cron/daemon
+    /// turns emitted zero rules-hook events. Origin-matrix probe: a recording
+    /// `before_prompt_build_with_context` handler registered into the minted
+    /// runner via the LOOP_RUN_HOOK_RUNNER_TEST_HOOK probe, the turn driven
+    /// NON-interactive (origin Cron, the scheduler's call shape) against a
+    /// local mock provider, asserting (a) the probe fired and (b) the system
+    /// message the provider actually received carries a non-empty
+    /// `<!-- rules-hook:v1 -->` block.
+    #[tokio::test]
+    async fn loop_run_applies_prompt_build_hooks_on_the_cron_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::ingress::TurnOrigin;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, HooksConfig, RiskProfileConfig, RulesHookConfig,
+        };
+
+        // The rules corpus: one rule file in the hook's global dir.
+        let corpus = tempfile::tempdir().expect("rules corpus tempdir");
+        std::fs::write(
+            corpus.path().join("event-driven-swarm.md"),
+            "---\nname: event-driven-swarm\ndescription: Binds when doing async work.\ncore: true\n---\n\n# Body\nNever sleep-poll.\n",
+        )
+        .expect("write rule");
+
+        // Mock openai-compatible provider capturing every request body.
+        let seen_requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen_for_route = Arc::clone(&seen_requests);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = Arc::clone(&seen_for_route);
+                    let call = calls_for_route.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        seen.lock()
+                            .expect("request capture lock")
+                            .push(body);
+                        let _ = call;
+                        axum::Json(serde_json::json!({
+                            "choices": [{"message": {"content": "final answer"}}]
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        // The probe: records every `before_prompt_build_with_context` prompt.
+        // Priority -200 runs AFTER the built-in rules hook (-100), so the
+        // recorded prompt already carries the injected block.
+        struct RecordingProbeHook {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for RecordingProbeHook {
+            fn name(&self) -> &str {
+                "loop-run-cron-probe"
+            }
+            fn priority(&self) -> i32 {
+                -200
+            }
+            async fn before_prompt_build_with_context(
+                &self,
+                _context: &zeroclaw_api::hook::PromptBuildHookContext,
+                prompt: String,
+            ) -> crate::hooks::HookResult<String> {
+                self.seen
+                    .lock()
+                    .expect("probe lock")
+                    .push(prompt.clone());
+                crate::hooks::HookResult::Continue(prompt)
+            }
+        }
+        let probe_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let probe_seen_for_hook = Arc::clone(&probe_seen);
+        {
+            let mut hook = super::LOOP_RUN_HOOK_RUNNER_TEST_HOOK
+                .lock()
+                .expect("loop-run runner test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |runner: &mut crate::hooks::HookRunner| {
+                runner.register(Box::new(RecordingProbeHook {
+                    seen: Arc::clone(&probe_seen_for_hook),
+                }));
+            }));
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("cron-rules-test-model".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "cron-rules-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        config.hooks = HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                rules: RulesHookConfig {
+                    enabled: true,
+                    global_dir: corpus.path().to_string_lossy().into_owned(),
+                    workspace_dir: ".agents/rules".to_string(),
+                    repo_discovery: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        // The cron scheduler's call shape (`run_agent_job`): non-interactive,
+        // a session path, origin Cron, default overrides.
+        let session_path = tmp.path().join("cron-session.json");
+        let _ = super::run(
+            config,
+            "cron-rules-agent",
+            Some("[cron:probe hello]".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            Some(session_path),
+            None,
+            TurnOrigin::Cron,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        {
+            let mut hook = super::LOOP_RUN_HOOK_RUNNER_TEST_HOOK
+                .lock()
+                .expect("loop-run runner test hook lock should not be poisoned");
+            *hook = None;
+        }
+        server_handle.abort();
+
+        let seen = probe_seen.lock().expect("probe lock");
+        assert!(
+            !seen.is_empty(),
+            "loop_::run must invoke the before_prompt_build hook chain on the cron path; \
+             the probe recorded nothing"
+        );
+        assert!(
+            seen.iter().any(|p| p.contains("<!-- rules-hook:v1 -->")),
+            "the wrapped prompt (post-rules-hook) must carry the rules block; got: {:?}",
+            seen.last()
+        );
+
+        let requests = seen_requests.lock().expect("request capture lock");
+        assert!(
+            !requests.is_empty(),
+            "the cron turn must dispatch at least one provider request"
+        );
+        let system_prompt = requests
+            .last()
+            .expect("at least one request")
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|msgs| {
+                msgs.iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            })
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .expect("provider request must include a system message")
+            .to_string();
+        let marker_pos = system_prompt
+            .find("<!-- rules-hook:v1 -->")
+            .expect("the final system message must carry the rules-hook marker");
+        assert!(
+            system_prompt.len() > marker_pos + "<!-- rules-hook:v1 -->".len() + 8,
+            "the rules block after the marker must be non-empty; got: {system_prompt}"
+        );
+        assert!(
+            system_prompt.contains("<instructions>"),
+            "the rules manifest must be rendered in the final system message; got: {system_prompt}"
+        );
+        assert!(
+            system_prompt.contains("event-driven-swarm"),
+            "the corpus rule must be indexed in the final system message; got: {system_prompt}"
+        );
+    }
+
+    /// Structural anti-bypass guard: after the CONTEXT-LAYERS-LOOP-RUN-HOOKS
+    /// rewiring, the raw sync builder `build_system_prompt_for_turn` must have
+    /// exactly ONE non-test caller inside this file — the
+    /// `build_turn_system_prompt` wrapper. A future call site that rebuilds a
+    /// system prompt directly (bypassing the hook chain) re-opens the
+    /// silent-loss class this fix closes (the wholesale per-iteration
+    /// overwrite erased an initially-injected block). Enforced by grepping the
+    /// production prefix of this source file (everything before `mod tests`).
+    #[test]
+    fn build_system_prompt_for_turn_has_one_non_test_caller_the_wrapper() {
+        let src = include_str!("loop_.rs");
+        let production_end = src
+            .find("mod tests {")
+            .expect("the `mod tests` marker must exist");
+        let production = &src[..production_end];
+
+        let wrapper_start = production
+            .find("async fn build_turn_system_prompt")
+            .expect("the build_turn_system_prompt wrapper must exist");
+        let mut depth = 0usize;
+        let mut wrapper_end = None;
+        for (offset, ch) in production[wrapper_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wrapper_end = Some(wrapper_start + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let wrapper_end = wrapper_end.expect("the wrapper's braces must balance");
+
+        let mut call_sites = Vec::new();
+        let mut search = 0usize;
+        while let Some(idx) = production[search..].find("build_system_prompt_for_turn(") {
+            let at = search + idx;
+            if !production[..at].ends_with("fn ") {
+                call_sites.push(at);
+            }
+            search = at + 1;
+        }
+
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "build_system_prompt_for_turn must have exactly one non-test call site (the wrapper); \
+             found {call_sites:?}"
+        );
+        let site = call_sites[0];
+        assert!(
+            site > wrapper_start && site < wrapper_end,
+            "the sole non-test call site must be inside fn build_turn_system_prompt; \
+             found at byte {site} (wrapper spans {wrapper_start}..{wrapper_end})"
         );
     }
 
