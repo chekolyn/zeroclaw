@@ -10511,6 +10511,7 @@ async fn process_channel_message_body(
                         max_tool_result_chars: ctx.max_tool_result_chars,
                         keep_tool_context_turns: ctx.agent_cfg.resolved.keep_tool_context_turns,
                         context_limits,
+                        max_turn_prompt_tokens: ctx.agent_cfg.resolved.max_turn_prompt_tokens,
                         context_limits_resolver: None,
                         knobs: &loop_knobs,
                     },

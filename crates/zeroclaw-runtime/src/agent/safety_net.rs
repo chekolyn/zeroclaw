@@ -620,6 +620,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
+            max_turn_prompt_tokens: None,
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },
@@ -1037,6 +1038,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
                         },
+                    max_turn_prompt_tokens: None,
                         context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
@@ -2849,6 +2851,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 max_tool_result_chars: 30_000,
                 keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                max_turn_prompt_tokens: None,
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },
@@ -4054,6 +4057,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                     100_000,
                 ),
+                max_turn_prompt_tokens: None,
                 context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },

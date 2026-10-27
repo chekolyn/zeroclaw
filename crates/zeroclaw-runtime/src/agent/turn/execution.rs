@@ -243,6 +243,12 @@ pub struct ResolvedAgentExecution<'a> {
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
+    /// Optional per-dispatch turn-prompt cap from the agent's runtime profile
+    /// (`ResolvedRuntime::max_turn_prompt_tokens`). `None` and `Some(0)` leave
+    /// the capacity-derived dispatch budget untouched; `Some(n)` with `n > 0`
+    /// tightens it. Threaded beside `context_limits` so every loop
+    /// construction site resolves it exactly once.
+    pub max_turn_prompt_tokens: Option<usize>,
     /// The turn engine's single authority for per-call `(provider, model)`
     /// limits. Daemon-backed agents pass a closure reading the shared live
     /// `Config`; configless (test) paths leave it `None` and the loop uses
@@ -289,6 +295,9 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub context_limits: ResolvedContextLimits,
+    /// Optional per-dispatch turn-prompt cap; see
+    /// [`ResolvedAgentExecution::max_turn_prompt_tokens`].
+    pub max_turn_prompt_tokens: Option<usize>,
     /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
     pub context_limits_resolver: Option<ContextLimitsResolver>,
     pub knobs: &'a LoopKnobs,
@@ -321,6 +330,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             max_tool_result_chars: runtime.max_tool_result_chars,
             keep_tool_context_turns: runtime.keep_tool_context_turns,
             context_limits: runtime.context_limits,
+            max_turn_prompt_tokens: runtime.max_turn_prompt_tokens,
             context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
