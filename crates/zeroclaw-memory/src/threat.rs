@@ -86,8 +86,18 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             scope: Scope::On,
         },
         Pattern {
-            regex: Regex::new(r#"(?i)\b(?:cat|less|more|tail|head)\b[^\n]*(?:\.env|\.netrc|\.pgpass|\.npmrc|id_rsa|id_ed25519)"#)
-                .expect("valid credential-file read regex"),
+            // Tune-map item 5 (2026-10-27): the credential file must be the
+            // command's OBJECT — verb, then optional flags/numeric args, then
+            // a path-shaped argument. The old `[^\n]*` bridge matched any
+            // prose span between the verb and the file, flagging operational
+            // prose ("head of the release notes mentions .env handling",
+            // "tail latency of the .pgpass migration") — the known
+            // false-positive class that withheld legitimate entries from
+            // recall under block-on-read.
+            regex: Regex::new(
+                r#"(?i)\b(?:cat|less|more|tail|head)[ \t]+(?:(?:-{1,2}[\w-]+|\d+)[ \t]+)*["']?[\w.$~/-]*?(?:\.env|\.netrc|\.pgpass|\.npmrc|id_rsa|id_ed25519)"#,
+            )
+            .expect("valid credential-file read regex"),
             kind: ThreatKind::ReadSecrets,
             scope: Scope::On,
         },
@@ -180,6 +190,47 @@ mod tests {
     fn detects_inline_secret_assignment() {
         let findings = scan(r#"api_key = "abcdefghijklmnopqrstuvwxyz""#, Scope::On);
         assert_eq!(findings[0].kind, ThreatKind::HardcodedSecret);
+    }
+
+    // Tune-map item 5 (memory-content-scan-audit-false-positive, 2026-10-27):
+    // the read_secrets kind is an injection-pattern detector, and the fleet's
+    // own operational prose false-positives it — digests and escalation
+    // records that *discuss* credential files look like instructions to read
+    // them, and under block-on-read those entries are withheld from recall.
+    // A credential file must be the command's OBJECT (verb → optional
+    // flags/numbers → path-shaped argument), never an arbitrary prose span.
+    #[test]
+    fn operational_prose_mentioning_credential_files_is_not_flagged() {
+        for content in [
+            "head of the release notes mentions .env handling",
+            "more details on .env files live in the wiki",
+            "the daily digest discussed id_rsa rotation policy",
+            "audit noted the .env loader's tail latency regression",
+            "tail latency of the .pgpass migration improved",
+        ] {
+            assert!(
+                scan(content, Scope::On).is_empty(),
+                "operational prose must not be flagged: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_shaped_credential_file_reads_still_flagged() {
+        for content in [
+            "cat .env",
+            "cat ~/.env",
+            "cat /home/user/.pgpass",
+            "tail -n 5 .env",
+            "less .npmrc",
+            r#"cat "$HOME/.npmrc""#,
+            "cat ~/.ssh/id_rsa",
+        ] {
+            assert!(
+                !scan(content, Scope::On).is_empty(),
+                "command-shaped read must stay flagged: {content}"
+            );
+        }
     }
 
     #[test]

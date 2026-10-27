@@ -12955,6 +12955,13 @@ pub struct MemoryConfig {
     /// live turn it is prepended to.
     #[serde(default = "default_true")]
     pub recall_date_stamp: bool,
+    /// Per-call wall-clock budget for memory recall, in milliseconds. When
+    /// the ranked recall attempt exceeds the budget, recall degrades to the
+    /// backend's recent-entries path (and logs a warning) rather than
+    /// stalling the turn — the result stays bounded even when the store
+    /// scan does not. 0 disables the budget. Default: 2000.
+    #[serde(default = "default_recall_soft_timeout_ms")]
+    pub recall_soft_timeout_ms: u64,
 
     // ── Namespace Isolation ─────────────────────────────────────
     /// Default namespace for memory entries.
@@ -13078,11 +13085,17 @@ pub struct MemoryPolicyConfig {
     #[serde(default = "default_true")]
     pub threat_scan_load_time: bool,
     /// Behavior when a write-time content scan matches: "reject" or
-    /// "block-on-read".
+    /// "block-on-read". The default is `block-on-read` (the tune-map
+    /// posture): flagged writes PERSIST — audit-shaped SOPs whose output
+    /// quotes credential-adjacent content keep their archives intact — and
+    /// the flagged entries are withheld at read time instead. `reject` drops
+    /// the write outright and is kept as an operator opt-in.
     #[serde(default = "default_memory_threat_scan_on_hit")]
     pub threat_scan_on_hit: String,
-    /// Redact configured secret/PII categories before persistence.
-    #[serde(default)]
+    /// Redact configured secret/PII categories before persistence. Default
+    /// `true`: future entries persist masked, so the stored corpus cures at
+    /// the source and fewer entries need read-time withholding.
+    #[serde(default = "default_true")]
     pub redact_on_write: bool,
     /// Redaction categories applied when `redact_on_write` is true.
     #[serde(default = "default_memory_redact_categories")]
@@ -13099,7 +13112,7 @@ impl Default for MemoryPolicyConfig {
             threat_scan: default_memory_threat_scan(),
             threat_scan_load_time: true,
             threat_scan_on_hit: default_memory_threat_scan_on_hit(),
-            redact_on_write: false,
+            redact_on_write: true,
             redact_categories: default_memory_redact_categories(),
         }
     }
@@ -13110,7 +13123,14 @@ fn default_memory_threat_scan() -> String {
 }
 
 fn default_memory_threat_scan_on_hit() -> String {
-    "reject".into()
+    // The tune-map posture (prod v14, proven live 2026-10-18): flagged writes
+    // persist and are withheld at read time; the write-reject class (audit
+    // SOPs structurally scanner-positive) is cured at the default level.
+    "block-on-read".into()
+}
+
+fn default_recall_soft_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_memory_redact_categories() -> Vec<String> {
@@ -13476,6 +13496,7 @@ impl Default for MemoryConfig {
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             recall_date_stamp: true,
+            recall_soft_timeout_ms: default_recall_soft_timeout_ms(),
             default_namespace: default_namespace(),
             category_namespaces: HashMap::new(),
             conflict_threshold: default_conflict_threshold(),

@@ -301,6 +301,10 @@ impl<M: Memory> ScannedMemory<M> {
         // single daily-synthesis recall emitted 17 identical per-entry WARN
         // records in one second — pure log noise). The per-recall record
         // carries the count, the unique kinds, and up to three sample keys.
+        // `scanned` (candidates examined) rides along so the recall
+        // breadth — the read-scan's share of recall latency — is measurable
+        // from the trace without new instrumentation (tuning cycle 3).
+        let scanned = entries.len();
         let mut kept: Vec<MemoryEntry> = Vec::with_capacity(entries.len());
         let mut withheld: Vec<(String, Vec<String>)> = Vec::new();
         for entry in entries {
@@ -323,6 +327,7 @@ impl<M: Memory> ScannedMemory<M> {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "count": count,
+                        "scanned": scanned,
                         "kinds": kinds,
                         "sample_keys": sample_keys,
                     })),
@@ -775,12 +780,57 @@ mod tests {
     #[tokio::test]
     async fn rejects_flagged_content_before_persistence() {
         let tmp = TempDir::new().unwrap();
-        let mem = scanned(&tmp, &MemoryPolicyConfig::default());
+        // Explicit legacy posture: the fork DEFAULT is block-on-read (the
+        // tune-map posture); reject survives as an operator opt-in.
+        let mem = scanned(&tmp, &policy("on", "reject"));
 
         let result = mem.store("bad", FLAGGED, MemoryCategory::Core, None).await;
         assert!(result.is_err());
         assert!(mem.get("bad").await.unwrap().is_none());
         assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    // The fork default IS the tune-map posture (2026-10-27): flagged writes
+    // persist (the audit archive stays intact) and are withheld at read time,
+    // with write-time redaction cleaning future entries.
+    #[tokio::test]
+    async fn default_posture_persists_flagged_writes_and_withholds_at_read() {
+        let tmp = TempDir::new().unwrap();
+        let mem = scanned(&tmp, &MemoryPolicyConfig::default());
+
+        mem.store("held", FLAGGED, MemoryCategory::Core, None)
+            .await
+            .expect("block-on-read default must persist flagged writes");
+
+        assert_eq!(mem.count().await.unwrap(), 1);
+        assert!(mem.get("held").await.unwrap().is_none());
+        assert!(
+            mem.recall("gadget", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // Tune-map item 5: a known-benign entry class — operational prose that
+    // *mentions* credential files — must no longer be withheld at read time.
+    #[tokio::test]
+    async fn operational_prose_entry_passes_the_read_scan() {
+        let tmp = TempDir::new().unwrap();
+        let mem = scanned(&tmp, &MemoryPolicyConfig::default());
+
+        let prose = "head of the release notes mentions .env handling; \
+                     the daily digest discussed id_rsa rotation policy";
+        mem.store("digest", prose, MemoryCategory::Daily, None)
+            .await
+            .expect("prose mentioning credential files is not a flagged write");
+
+        let recalled = mem
+            .recall("release notes", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1, "prose entry must not be withheld");
+        assert_eq!(recalled[0].content, prose);
     }
 
     #[tokio::test]
@@ -882,7 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redaction_precedes_default_reject_for_supported_secret() {
+    async fn redaction_precedes_the_scan_for_supported_secret() {
         let tmp = TempDir::new().unwrap();
         let policy = MemoryPolicyConfig {
             redact_on_write: true,
@@ -923,6 +973,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let policy = MemoryPolicyConfig {
             redact_on_write: true,
+            threat_scan_on_hit: "reject".into(),
             ..MemoryPolicyConfig::default()
         };
         let mem = scanned(&tmp, &policy);
@@ -999,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn store_procedural_is_scanned() {
         let tmp = TempDir::new().unwrap();
-        let mem = scanned(&tmp, &MemoryPolicyConfig::default());
+        let mem = scanned(&tmp, &policy("on", "reject"));
 
         let messages = vec![ProceduralMessage {
             role: "user".into(),
