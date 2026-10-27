@@ -500,6 +500,7 @@ mod tests {
             provider_name: "test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            max_turn_prompt_tokens: None,
             temperature: None,
             approval: None,
             channel_name: "test",

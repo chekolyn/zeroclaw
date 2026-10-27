@@ -175,6 +175,11 @@ pub async fn maybe_run_skill_review(
                                 )
                             },
                         ),
+                        max_turn_prompt_tokens: full_config
+                            .zip(agent_alias)
+                            .and_then(|(config, alias)| {
+                                config.effective_max_turn_prompt_tokens(alias)
+                            }),
                         context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },

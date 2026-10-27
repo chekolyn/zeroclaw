@@ -4,7 +4,7 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Local, Timelike};
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -94,6 +94,20 @@ pub struct InteractionContext {
 }
 
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+
+/// The `[CURRENT DATE & TIME: …]` user-message prefix rendered from `now`.
+///
+/// Single home of the envelope format: embedded Agent turns
+/// (`Agent::enrich_user_message`) and delegate children (whose date moved OUT
+/// of the system row for prompt-cache stability) both prefix their user rows
+/// through this helper, so the labeled shape stays identical everywhere.
+#[must_use]
+pub(crate) fn current_datetime_user_prefix(now: chrono::DateTime<chrono::Local>) -> String {
+    let (year, month, day) = (now.year(), now.month(), now.day());
+    let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+    let tz = now.format("%Z");
+    format!("[CURRENT DATE & TIME: {year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}]")
+}
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);

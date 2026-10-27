@@ -13,7 +13,7 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike};
+
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -1447,13 +1447,11 @@ impl Agent {
     /// own user-message envelopes independently.
     fn enrich_user_message(&self, user_message: &str) -> String {
         let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        format!(
+            "{}\n\n{user_message}",
+            crate::agent::prompt::current_datetime_user_prefix(now)
+        )
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -4209,6 +4207,7 @@ impl Agent {
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
                                 context_limits,
+                                max_turn_prompt_tokens: self.config.resolved.max_turn_prompt_tokens,
                                 context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },
@@ -4880,6 +4879,10 @@ impl Agent {
                                     // resolver-free config limits instead of invoking
                                     // the resolver a second time here.
                                     context_limits: self.config.resolved.context_limits(),
+                                    max_turn_prompt_tokens: self
+                                        .config
+                                        .resolved
+                                        .max_turn_prompt_tokens,
                                     context_limits_resolver: self.context_limits_resolver.clone(),
                                     knobs: &knobs,
                                 },

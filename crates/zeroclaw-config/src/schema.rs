@@ -3872,6 +3872,12 @@ pub struct ResolvedRuntime {
     /// `Some(0)` disables proactive token-budget trimming.
     /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: Option<usize>,
+    /// Optional per-dispatch turn-prompt cap from
+    /// `runtime_profiles.<name>.max_turn_prompt_tokens`. `None` (the default)
+    /// preserves the legacy behavior — no turn-prompt cap beyond the context
+    /// budget. `Some(0)` is the explicit disable sentinel. `Some(n)` with
+    /// `n > 0` tightens the dispatch trim target to `n` tokens.
+    pub max_turn_prompt_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
     /// Whether `model_context_window` came from the selected provider profile
@@ -4071,6 +4077,7 @@ impl Default for ResolvedRuntime {
             max_execution_tree_iterations: None,
             max_history_messages: 50,
             max_context_tokens: None,
+            max_turn_prompt_tokens: None,
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             context_compact_ratio: None,
@@ -4724,6 +4731,16 @@ impl Config {
             .and_then(|p| p.max_context_tokens)
     }
 
+    /// Optional per-dispatch turn-prompt cap from the runtime profile.
+    /// `None` (the default) preserves the legacy behavior — no turn-prompt
+    /// cap beyond the context budget; `Some(0)` is the explicit disable
+    /// sentinel; `Some(n)` with `n > 0` tightens the dispatch trim target.
+    #[must_use]
+    pub fn effective_max_turn_prompt_tokens(&self, agent_alias: &str) -> Option<usize> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_turn_prompt_tokens)
+    }
+
     /// Optional fraction of the selected model's context window at which
     /// proactive trimming fires. Invalid values are treated as unset so they
     /// cannot silently opt an existing profile into model-relative budgeting.
@@ -4976,6 +4993,9 @@ impl Config {
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            // Optional per-dispatch turn-prompt cap (`None` = legacy no cap,
+            // `Some(0)` = explicit disable sentinel).
+            max_turn_prompt_tokens: self.effective_max_turn_prompt_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
             model_context_window: model_context_window.tokens,
             model_context_window_source: model_context_window.source,
@@ -15053,6 +15073,16 @@ pub struct RuntimeProfileConfig {
     /// positive effective value is capped by the selected model capacity. `0`
     /// disables proactive token-budget trimming.
     pub max_context_tokens: Option<usize>,
+    /// Maximum estimated tokens for one dispatched turn prompt (the prepared
+    /// message population sent to the provider in a single LLM call, including
+    /// native tool schemas). `None` preserves the legacy behavior — no
+    /// turn-prompt cap beyond the context budget. `Some(0)` is the explicit
+    /// disable sentinel (same meaning as `None`). `Some(n)` with `n > 0`
+    /// tightens the dispatch trim target to `n` tokens: the pre-dispatch gate
+    /// drops the oldest whole turns until the measured population fits,
+    /// stopping at the newest-turn floor. It can only tighten, never widen,
+    /// the capacity-derived budget.
+    pub max_turn_prompt_tokens: Option<usize>,
     /// Opt-in fraction of the selected model's context window at which
     /// proactive history trimming triggers (e.g. `0.9` = trim at 90%). `None`
     /// preserves the legacy absolute-budget behavior. Values outside `(0, 1]`
@@ -15122,6 +15152,7 @@ impl Default for RuntimeProfileConfig {
             agentic_timeout_secs: None,
             max_history_messages: None,
             max_context_tokens: None,
+            max_turn_prompt_tokens: None,
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
@@ -35269,6 +35300,51 @@ runtime_profile = "default"
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
         assert_eq!(agent.resolved.max_execution_tree_iterations, Some(7));
+    }
+
+    #[test]
+    async fn runtime_profile_max_turn_prompt_tokens_defaults_off_and_resolves_by_agent() {
+        // The turn-prompt cap is OFF by default: `None` on the profile means
+        // the legacy behavior (no turn-prompt cap beyond the existing context
+        // budget), `Some(0)` is the explicit disable sentinel, and `Some(n)`
+        // caps each dispatched turn prompt at n tokens. The resolved agent
+        // config carries the profile value so nested/delegated loops see the
+        // same cap.
+        let parsed = parse_test_config(
+            r#"
+[runtime_profiles.capped]
+max_turn_prompt_tokens = 40000
+[runtime_profiles.disabled]
+max_turn_prompt_tokens = 0
+[runtime_profiles.unset]
+[agents.capped-agent]
+runtime_profile = "capped"
+[agents.disabled-agent]
+runtime_profile = "disabled"
+[agents.unset-agent]
+runtime_profile = "unset"
+[agents.missing]
+runtime_profile = "missing"
+"#,
+        );
+        assert_eq!(RuntimeProfileConfig::default().max_turn_prompt_tokens, None);
+        assert_eq!(
+            parsed.effective_max_turn_prompt_tokens("capped-agent"),
+            Some(40_000)
+        );
+        assert_eq!(
+            parsed.effective_max_turn_prompt_tokens("disabled-agent"),
+            Some(0)
+        );
+        for alias in ["unset-agent", "missing", "unknown"] {
+            assert_eq!(parsed.effective_max_turn_prompt_tokens(alias), None);
+        }
+        let capped = parsed.resolved_agent_config("capped-agent").unwrap();
+        assert_eq!(capped.resolved.max_turn_prompt_tokens, Some(40_000));
+        let disabled = parsed.resolved_agent_config("disabled-agent").unwrap();
+        assert_eq!(disabled.resolved.max_turn_prompt_tokens, Some(0));
+        let unset = parsed.resolved_agent_config("unset-agent").unwrap();
+        assert_eq!(unset.resolved.max_turn_prompt_tokens, None);
     }
 
     #[test]

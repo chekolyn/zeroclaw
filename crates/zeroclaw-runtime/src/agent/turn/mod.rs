@@ -1027,6 +1027,22 @@ fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) 
 /// in raw-estimate units; calibration is applied only to the total.
 type RequestShares = (usize, usize, usize);
 
+/// Fold the operator turn-prompt cap ([`ResolvedRuntime::max_turn_prompt_tokens`])
+/// into the dispatch trim budget. The cap can only TIGHTEN the budget — it never
+/// widens a smaller capacity-derived budget, so model capacity stays a hard
+/// invariant. `None` (legacy) and `Some(0)` (explicit disable sentinel) leave the
+/// budget untouched.
+fn effective_dispatch_trim_budget(
+    base_trim_budget: usize,
+    max_turn_prompt_tokens: Option<usize>,
+) -> usize {
+    match max_turn_prompt_tokens {
+        None | Some(0) => base_trim_budget,
+        Some(cap) => base_trim_budget.min(cap),
+    }
+}
+>>>>>>> b9c592942 (feat(runtime): per-identity-key child prompt memoization + off-by-default max_turn_prompt_tokens (tuning cycle 2))
+
 fn context_window_exceeded_error(
     (provider_name, model): (&str, &str),
     limits: zeroclaw_config::schema::ResolvedContextLimits,
@@ -1134,19 +1150,45 @@ fn surface_oversized_dispatch_if_needed(
     context_token_budget: usize,
 ) -> PreDispatchTrimResult {
     let before = retention_layout(history, *crumb_present);
-    let outcome;
+    let mut outcome = PreDispatchOutcome::Fit;
     let mut dropped_messages = 0;
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
         outcome = PreDispatchOutcome::Fit;
     } else {
-        dropped_messages =
-            crate::agent::history_trim::drop_oldest_whole_turn(history, *crumb_present);
-        if dropped_messages == 0 {
-            outcome = PreDispatchOutcome::Floor;
-        } else {
+        // The `enforce_reported_budget` loop shape: drop the oldest whole
+        // turn, re-measure, and repeat until the measured population fits or
+        // nothing droppable remains. The re-measure is the durable raw-history
+        // estimate — the caller's rebuilt post-hook request stays the
+        // authoritative count and re-enforces against it, so this loop's
+        // cheaper measure only batches whole-turn drops between rebuilds. The
+        // newest turn is never droppable (`drop_oldest_whole_turn`), so a cap
+        // smaller than the newest turn deterministically stops without
+        // trimming into it. The outcome keeps the caller's contract: `Floor`
+        // only when the FIRST drop attempt found nothing droppable (the
+        // caller treats it as terminal); any drop reports `Trimmed` even when
+        // the raw estimate is still over — the caller's authoritative
+        // re-measure owns that decision.
+        let mut measured;
+        loop {
+            let dropped =
+                crate::agent::history_trim::drop_oldest_whole_turn(history, *crumb_present);
+            if dropped == 0 {
+                // Terminal only when nothing has been dropped yet: a call that
+                // already dropped whole turns reports `Trimmed` and leaves the
+                // still-over decision to the caller's authoritative re-measure.
+                if dropped_messages == 0 {
+                    outcome = PreDispatchOutcome::Floor;
+                }
+                break;
+            }
+            dropped_messages += dropped;
+            outcome = PreDispatchOutcome::Trimmed;
             *crumb_present =
                 crate::agent::history_trim::insert_breadcrumb_deduped(history, *crumb_present);
-            outcome = PreDispatchOutcome::Trimmed;
+            measured = crate::agent::history::estimate_history_tokens(history) as u64;
+            if measured <= context_token_budget as u64 {
+                break;
+            }
         }
     }
     remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
@@ -1685,6 +1727,7 @@ async fn run_tool_call_loop_impl<'a>(
         parallel_tools,
         max_tool_result_chars,
         context_limits,
+        max_turn_prompt_tokens,
         context_limits_resolver,
         receipt_generator,
         knobs,
@@ -1849,6 +1892,7 @@ async fn run_tool_call_loop_impl<'a>(
         provider_name,
         model,
         context_limits,
+        max_turn_prompt_tokens,
         temperature,
         approval,
         channel_name,
@@ -2225,7 +2269,13 @@ async fn run_tool_call_loop_impl<'a>(
         let context_token_budget = active_context_limits.context_token_budget;
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
-        let trim_budget = dispatch_trim_budget(active_context_limits);
+        // An operator turn-prompt cap (runtime_profiles.<n>.max_turn_prompt_tokens)
+        // tightens that target further — it can only shrink the budget, never
+        // widen it, so model capacity stays a hard invariant.
+        let trim_budget = effective_dispatch_trim_budget(
+            dispatch_trim_budget(active_context_limits),
+            max_turn_prompt_tokens,
+        );
         let ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
@@ -3527,6 +3577,7 @@ async fn run_tool_call_loop_impl<'a>(
                 parallel_tools,
                 max_tool_result_chars,
                 context_limits,
+                max_turn_prompt_tokens,
                 receipt_generator,
                 knobs,
                 channel_name,
@@ -4007,15 +4058,130 @@ pub(crate) async fn assemble_owned_execution_with_admission(
 /// through the same construction a fresh turn for that agent uses
 /// (`build_system_prompt_for_turn`): registry-derived tool descriptions, the
 /// agent's own MCP prompt section, skills, identity, risk profile, and its
-/// resolved prompt knobs. Built per step (not memoized per alias) because the
-/// effective tool surface keys on the step's excluded-tool set, which the
-/// `tool_filter_groups` gate derives from the step context.
+/// resolved prompt knobs.
+///
+/// The render is memoized per identity key (A1): the key carries the step's
+/// OWN render inputs — alias, model, provider, the effective tool surface
+/// INCLUDING the step's excluded-tool set (built per step, not per alias,
+/// because the `tool_filter_groups` gate derives it from the step context),
+/// the activated-tool state, skills, autonomy, shell, workspace, a content
+/// fingerprint of every workspace file the render reads, and the prompt
+/// knobs. A repeated cross-agent step of one identity then dispatches
+/// byte-identical system rows (provider prefix-cache hits) without reusing
+/// any parent bytes.
 fn build_owned_step_system_prompt(
     owned: &OwnedAgentExecution,
     config: &zeroclaw_config::schema::Config,
     alias: &str,
     excluded_tools: &[String],
 ) -> Result<String> {
+    let workspace_dir = config.agent_workspace_dir(alias);
+
+    // ── Memo key (the child's own render inputs; every member load-bearing) ──
+    let mut tool_hasher = crate::agent::prompt_memo::KeyHasher::new();
+    for tool in owned.tools_registry.iter() {
+        tool_hasher.str(tool.name());
+        tool_hasher.str(tool.description());
+    }
+    for name in excluded_tools {
+        tool_hasher.str(name);
+    }
+    // The activated-tool state feeds the render twice (hidden builtins and
+    // the deferred section); its current fingerprint is part of the key so a
+    // mid-turn activation never serves a stale catalog.
+    if let Some(state) = owned.activated_tools.as_ref() {
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
+        tool_hasher.str(&crate::agent::prompt_memo::hash_string_set(
+            state.hidden_builtin_names(),
+        )
+        .to_string());
+        tool_hasher.str(&state.deferred_builtin_prompt_section());
+    }
+    tool_hasher.str(&owned.mcp_prompt_section);
+    let tool_surface_hash = tool_hasher.finish();
+
+    let skills_hash = {
+        let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+        for skill in &owned.skills {
+            hasher.str(
+                &serde_json::to_string(skill).unwrap_or_else(|_| format!("{:?}", skill)),
+            );
+            hasher.str(&skill.location.as_ref().map_or_else(String::new, |path| {
+                path.to_string_lossy().into_owned()
+            }));
+        }
+        hasher.finish()
+    };
+    let autonomy_hash = crate::agent::prompt_memo::hash_string_list([serde_json::to_string(
+        &owned.risk_profile,
+    )
+    .unwrap_or_else(|_| format!("{:?}", owned.risk_profile))]);
+    let shell_hash = crate::agent::prompt_memo::hash_string_list(
+        owned
+            .shell_profile
+            .as_ref()
+            .map(|profile| profile.prompt_section())
+            .into_iter(),
+    );
+    // The bootstrap fingerprint covers every workspace file the render reads:
+    // the personality files (including MEMORY.md) plus the configured AIEOS
+    // identity file when one is bound. The identity config itself (inline
+    // AIEOS, format) hashes in too.
+    let bootstrap_hash = {
+        let identity_config = &owned.agent.identity;
+        let mut filenames: Vec<std::path::PathBuf> = crate::agent::personality::PERSONALITY_FILES
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        if crate::identity::is_aieos_configured(identity_config)
+            && let Some(aieos_path) = &identity_config.aieos_path
+        {
+            filenames.push(std::path::PathBuf::from(aieos_path));
+        }
+        let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+        hasher.str(&crate::agent::prompt_memo::files_fingerprint(
+            &workspace_dir,
+            &filenames.iter().map(std::path::PathBuf::as_path).collect::<Vec<_>>(),
+        )
+        .to_string());
+        hasher.str(
+            &serde_json::to_string(identity_config)
+                .unwrap_or_else(|_| format!("{identity_config:?}")),
+        );
+        hasher.finish()
+    };
+    let knobs_hash = {
+        let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+        hasher.bool(owned.agent.resolved.strict_tool_parsing);
+        hasher.str(&serde_json::to_string(&owned.agent.resolved.prompt_injection_mode)
+            .unwrap_or_else(|_| format!("{:?}", owned.agent.resolved.prompt_injection_mode)));
+        hasher.bool(owned.agent.resolved.compact_context);
+        hasher.usize(owned.agent.resolved.max_system_prompt_chars);
+        hasher.bool(config.channels.show_tool_calls);
+        hasher.finish()
+    };
+    let memo_key = crate::agent::prompt_memo::PromptMemoKey {
+        shape: crate::agent::prompt_memo::PromptRenderShape::OwnedStep,
+        agent_alias: alias.to_string(),
+        model: owned.model.clone(),
+        provider_alias: owned.model_provider.alias().to_string(),
+        tool_surface_hash,
+        skills_hash,
+        autonomy_hash,
+        shell_hash,
+        workspace_dir,
+        identity_workspace_dir: None,
+        bootstrap_hash,
+        knobs_hash,
+        // The owned-step render still embeds the current date (`## Current
+        // Date`); the day stamps the key so a memoized prompt is never served
+        // across midnight with a stale date.
+        render_day: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+    };
+    if let Some(cached) = crate::agent::prompt_memo::memoized_system_prompt(&memo_key) {
+        return Ok((*cached).clone());
+    }
+
     let tool_descs: Vec<(&str, &str)> = owned
         .tools_registry
         .iter()
@@ -4026,7 +4192,7 @@ fn build_owned_step_system_prompt(
     } else {
         None
     };
-    crate::agent::loop_::build_system_prompt_for_turn(
+    let prompt = crate::agent::loop_::build_system_prompt_for_turn(
         &config.agent_workspace_dir(alias),
         &owned.model,
         &tool_descs,
@@ -4047,7 +4213,9 @@ fn build_owned_step_system_prompt(
         config.channels.show_tool_calls,
         None,
         owned.shell_profile.as_ref(),
-    )
+    )?;
+    let cached = crate::agent::prompt_memo::store_system_prompt(memo_key, prompt);
+    Ok((*cached).clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4096,6 +4264,10 @@ async fn drive_live_sop_actions(
     parallel_tools: bool,
     max_tool_result_chars: usize,
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    // The parent turn's operator turn-prompt cap: same-agent steps keep it
+    // verbatim; a cross-agent step's own resolved runtime overrides it (the
+    // `eff_` tuple below).
+    max_turn_prompt_tokens: Option<usize>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     knobs: &LoopKnobs,
     channel_name: &str,
@@ -4317,6 +4489,7 @@ async fn drive_live_sop_actions(
                             eff_context_limits,
                             eff_dedup_exempt_tools,
                             eff_pacing,
+                            eff_max_turn_prompt_tokens,
                         ) = match owned {
                             Some(o) => (
                                 o.temperature,
@@ -4335,6 +4508,7 @@ async fn drive_live_sop_actions(
                                             .config,
                                     )
                                     .pacing,
+                                o.agent.resolved.max_turn_prompt_tokens,
                             ),
                             None => (
                                 temperature,
@@ -4345,6 +4519,7 @@ async fn drive_live_sop_actions(
                                 context_limits,
                                 dedup_exempt_tools,
                                 pacing,
+                                max_turn_prompt_tokens,
                             ),
                         };
 
@@ -4513,6 +4688,7 @@ async fn drive_live_sop_actions(
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
                                             context_limits: eff_context_limits,
+                                            max_turn_prompt_tokens: eff_max_turn_prompt_tokens,
                                             context_limits_resolver: None,
                                             knobs,
                                         },
@@ -6229,6 +6405,104 @@ mod trim_budget_tests {
             "final history must include the model-visible breadcrumb"
         );
     }
+
+    #[test]
+    fn dispatch_trim_drops_whole_turns_until_under_cap_in_one_call() {
+        // The generalized dispatch gate drops the oldest whole turn, re-measures,
+        // and repeats until the measured population fits — one call performs the
+        // whole iterative drop loop (the `enforce_reported_budget` shape), never
+        // touching the newest turn.
+        let big = "x".repeat(1000);
+        let mut history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user(format!("old1 {big}")),
+            ChatMessage::assistant(format!("old1 {big}")),
+            ChatMessage::user(format!("old2 {big}")),
+            ChatMessage::assistant(format!("old2 {big}")),
+            ChatMessage::user(format!("old3 {big}")),
+            ChatMessage::assistant(format!("old3 {big}")),
+            ChatMessage::user("new"),
+            ChatMessage::assistant("ok"),
+        ];
+        let minimal_estimate = crate::agent::history::estimate_history_tokens(&[
+            ChatMessage::system("s"),
+            ChatMessage::user("new"),
+            ChatMessage::assistant("ok"),
+        ]);
+        // Fits the minimal population (system + newest turn + the trim
+        // breadcrumb) but not the full three-turn history.
+        let budget = minimal_estimate + 100;
+        let tokens_before = crate::agent::history::estimate_history_tokens(&history);
+        assert!(tokens_before as usize > budget, "fixture must start over budget");
+        let mut crumb_present = false;
+        let result = surface_oversized_dispatch_if_needed(
+            &mut None,
+            &mut history,
+            &mut crumb_present,
+            tokens_before as u64,
+            budget,
+        );
+        assert_eq!(result.outcome, PreDispatchOutcome::Trimmed);
+        assert!(
+            result.dropped_messages >= 6,
+            "three whole old turns (6 messages) must be dropped in one call, got {}",
+            result.dropped_messages
+        );
+        // Head and tail byte-identical: system intact, newest turn intact.
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[0].content, "s");
+        let tail: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role != "system")
+            .filter(|m| m.content != crate::agent::history_trim::breadcrumb().content)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(tail, vec!["new", "ok"], "the newest turn must never be dropped");
+        // The measured population after the trim fits the cap.
+        let after = crate::agent::history::estimate_history_tokens(&history);
+        assert!(
+            after <= budget,
+            "the iterative loop must stop under the cap ({after} > {budget})"
+        );
+        assert!(crumb_present, "a trim must leave the model-visible breadcrumb");
+    }
+
+    #[test]
+    fn dispatch_trim_tiny_cap_stops_at_floor_without_touching_newest_turn() {
+        // A cap smaller than one whole turn is unsatisfiable: the gate must
+        // deterministically report Floor — no panic, and never a trim INTO the
+        // newest turn.
+        let mut history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("new question that is longish"),
+            ChatMessage::assistant("ok"),
+        ];
+        let tokens_before = crate::agent::history::estimate_history_tokens(&history);
+        let mut crumb_present = false;
+        let result = surface_oversized_dispatch_if_needed(
+            &mut None,
+            &mut history,
+            &mut crumb_present,
+            tokens_before as u64,
+            5,
+        );
+        assert_eq!(result.outcome, PreDispatchOutcome::Floor);
+        assert_eq!(result.dropped_messages, 0);
+        assert_eq!(history.len(), 3, "Floor must not drop anything");
+        assert_eq!(history[2].content, "ok", "the newest turn is never dropped");
+    }
+
+    #[test]
+    fn turn_prompt_cap_tightens_only_and_preserves_sentinels() {
+        // `None` (legacy) and `Some(0)` (explicit disable) leave the
+        // capacity-derived dispatch budget untouched; a positive cap can only
+        // tighten it, never widen it.
+        assert_eq!(effective_dispatch_trim_budget(32_000, None), 32_000);
+        assert_eq!(effective_dispatch_trim_budget(32_000, Some(0)), 32_000);
+        assert_eq!(effective_dispatch_trim_budget(32_000, Some(8_000)), 8_000);
+        assert_eq!(effective_dispatch_trim_budget(8_000, Some(50_000)), 8_000);
+        assert_eq!(effective_dispatch_trim_budget(0, Some(8_000)), 0);
+    }
 }
 
 #[cfg(test)]
@@ -6365,6 +6639,7 @@ mod active_route_context_tests {
             provider_name: "custom.text",
             model: "text-model",
             context_limits: text_limits,
+            max_turn_prompt_tokens: None,
             temperature: None,
             approval: None,
             channel_name: "test",
@@ -6767,6 +7042,7 @@ vision_model_provider = "custom.vision"
                     parallel_tools: false,
                     max_tool_result_chars: 100_000,
                     context_limits: text_limits,
+                    max_turn_prompt_tokens: None,
                     context_limits_resolver: None,
                     knobs: &knobs,
                 },
@@ -7887,6 +8163,7 @@ mod sop_step_reassembly_tests {
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         100_000,
                     ),
+                    max_turn_prompt_tokens: None,
                     context_limits_resolver: None,
                     knobs: &knobs,
                 },
@@ -8431,6 +8708,7 @@ mod sop_step_reassembly_tests {
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
+            None,
             None,
             &LoopKnobs::default(),
             "cli",
@@ -9721,6 +9999,7 @@ mod tool_lifecycle_abandonment_tests {
                     context_token_budget,
                     ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
                 },
+                max_turn_prompt_tokens: None,
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
@@ -10451,6 +10730,404 @@ mod tool_lifecycle_abandonment_tests {
         assert!(
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_memo_tests {
+    //! The per-identity-key child system-prompt memo (A1): repeated children
+    //! of one identity must serve byte-identical, freshly-rendered-from-the-
+    //! child's-own-inputs prompts, and NO key member may be omitted from the
+    //! key — a missing member turns the memo into a stale-prompt or
+    //! cross-identity bug (the failure class parent-prompt reuse has).
+
+    use super::*;
+    use crate::agent::prompt_memo::{
+        PromptRenderShape, memoized_system_prompt, prompt_memo_stats, reset_prompt_memo,
+    };
+    use zeroclaw_config::multi_agent::AgentWorkspaceConfig;
+
+    /// A minimal provider double: `build_owned_step_system_prompt` consults
+    /// only its identity and per-model capabilities.
+    struct MemoStubProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for MemoStubProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "memo-stub"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for MemoStubProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            anyhow::bail!("memo fixture provider never chats")
+        }
+    }
+
+    /// A trivially registrable tool for the memo fixtures.
+    struct MemoTool(&'static str);
+
+    ::zeroclaw_api::tool_attribution!(MemoTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for MemoTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "memo fixture tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    fn memo_workspace_config(workspace: &std::path::Path) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "coder".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                workspace: AgentWorkspaceConfig {
+                    path: Some(workspace.to_path_buf()),
+                    ..AgentWorkspaceConfig::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "reviewer".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                workspace: AgentWorkspaceConfig {
+                    path: Some(workspace.join("reviewer-ws")),
+                    ..AgentWorkspaceConfig::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    fn memo_owned(
+        tools: Vec<Box<dyn crate::tools::Tool>>,
+        workspace: &std::path::Path,
+        risk_profile: zeroclaw_config::schema::RiskProfileConfig,
+    ) -> OwnedAgentExecution {
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.resolved.max_tool_iterations = 3;
+        OwnedAgentExecution {
+            model_provider: Box::new(MemoStubProvider),
+            provider_name: "memo-stub".into(),
+            model: "memo-model".into(),
+            temperature: None,
+            tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
+            approval: crate::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            ),
+            activated_tools: None,
+            agent,
+            risk_profile,
+            skills: Vec::new(),
+            mcp_tool_names: HashSet::new(),
+            mcp_prompt_section: String::new(),
+            shell_profile: None,
+            execution_admission: None,
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+        }
+        .tap_workspace(workspace)
+    }
+
+    /// Trait-local helper keeping the fixture literal tidy.
+    trait MemoOwnedWorkspace {
+        fn tap_workspace(self, workspace: &std::path::Path) -> Self;
+    }
+
+    impl MemoOwnedWorkspace for OwnedAgentExecution {
+        fn tap_workspace(mut self, workspace: &std::path::Path) -> Self {
+            self.agent.workspace = AgentWorkspaceConfig {
+                path: Some(workspace.to_path_buf()),
+                ..AgentWorkspaceConfig::default()
+            };
+            self
+        }
+    }
+
+    fn write_workspace_file(workspace: &std::path::Path, name: &str, content: &str) {
+        std::fs::create_dir_all(workspace).unwrap();
+        std::fs::write(workspace.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn owned_step_prompt_memoizes_per_identity_key() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_prompt_memo();
+        let workspace = std::env::temp_dir().join(format!("zc_memo_owned_{}", uuid::Uuid::new_v4()));
+        write_workspace_file(&workspace, "AGENTS.md", "coder identity bytes");
+        let config = memo_workspace_config(&workspace);
+        let owned = memo_owned(
+            vec![Box::new(MemoTool("child_tool")) as Box<dyn crate::tools::Tool>],
+            &workspace,
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let first =
+            build_owned_step_system_prompt(&owned, &config, "coder", &[]).expect("render");
+        let (hits_before, misses_before) = prompt_memo_stats();
+        let second =
+            build_owned_step_system_prompt(&owned, &config, "coder", &[]).expect("render");
+        let (hits_after, misses_after) = prompt_memo_stats();
+        assert_eq!(first, second, "same key must serve byte-identical prompts");
+        assert_eq!(
+            misses_after, misses_before,
+            "the second same-key render must be a memo hit, not a re-render"
+        );
+        assert_eq!(
+            hits_after,
+            hits_before + 1,
+            "exactly one hit recorded for the repeated render"
+        );
+        assert!(
+            first.contains("child_tool"),
+            "the child prompt narrates the child's own tools"
+        );
+        assert!(
+            first.contains("coder identity bytes"),
+            "the child prompt carries the child's identity bytes"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn owned_step_memo_key_includes_excluded_tools() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The documented pitfall (the `tool_filter_groups` gate): the effective
+        // tool surface keys on the step's excluded-tool set. The memo key MUST
+        // include it — same alias, different excluded set ⇒ a DIFFERENT prompt
+        // and no cross-hit.
+        reset_prompt_memo();
+        let workspace =
+            std::env::temp_dir().join(format!("zc_memo_excl_{}", uuid::Uuid::new_v4()));
+        let config = memo_workspace_config(&workspace);
+        let owned = memo_owned(
+            vec![
+                Box::new(MemoTool("tool_kept")) as Box<dyn crate::tools::Tool>,
+                Box::new(MemoTool("tool_dropped")) as Box<dyn crate::tools::Tool>,
+            ],
+            &workspace,
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let keep_all = build_owned_step_system_prompt(&owned, &config, "coder", &[])
+            .expect("render without exclusions");
+        let (_, misses_before) = prompt_memo_stats();
+        let drop_one = build_owned_step_system_prompt(
+            &owned,
+            &config,
+            "coder",
+            &["tool_dropped".to_string()],
+        )
+        .expect("render with an exclusion");
+        let (_, misses_after) = prompt_memo_stats();
+        assert!(
+            keep_all.contains("tool_dropped"),
+            "the unexcluded render narrates both tools"
+        );
+        assert!(
+            !drop_one.contains("tool_dropped"),
+            "the excluded render must NOT narrate the excluded tool"
+        );
+        assert_ne!(
+            keep_all, drop_one,
+            "same alias, different excluded_tools ⇒ different prompt"
+        );
+        assert!(
+            misses_after >= misses_before + 2,
+            "the different-excluded-set render must be a fresh render (lookup miss + store), \
+             never a hit (misses {misses_before} → {misses_after})"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn owned_step_memo_invalidates_on_bootstrap_content_change() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Identity bootstrap files are read from disk per render; the memo key
+        // fingerprints their content, so an edited AGENTS.md is served fresh
+        // and a changed file is never served stale.
+        reset_prompt_memo();
+        let workspace =
+            std::env::temp_dir().join(format!("zc_memo_boot_{}", uuid::Uuid::new_v4()));
+        write_workspace_file(&workspace, "AGENTS.md", "bootstrap version one");
+        let config = memo_workspace_config(&workspace);
+        let owned = memo_owned(
+            vec![Box::new(MemoTool("child_tool")) as Box<dyn crate::tools::Tool>],
+            &workspace,
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let first =
+            build_owned_step_system_prompt(&owned, &config, "coder", &[]).expect("render");
+        assert!(first.contains("bootstrap version one"));
+        write_workspace_file(&workspace, "AGENTS.md", "bootstrap version two");
+        let second =
+            build_owned_step_system_prompt(&owned, &config, "coder", &[]).expect("render");
+        assert!(
+            second.contains("bootstrap version two") && !second.contains("bootstrap version one"),
+            "a changed identity bootstrap must be served fresh, never stale"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn owned_step_memo_autonomy_change_renders_fresh() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Autonomy is part of the identity key: same alias, a changed
+        // always-ask list ⇒ a different prompt (no cross-contamination between
+        // approval policies).
+        reset_prompt_memo();
+        let workspace =
+            std::env::temp_dir().join(format!("zc_memo_auto_{}", uuid::Uuid::new_v4()));
+        let config = memo_workspace_config(&workspace);
+        let mut full_with_ask = zeroclaw_config::schema::RiskProfileConfig::default();
+        full_with_ask.level = crate::security::AutonomyLevel::Full;
+        full_with_ask.always_ask = vec!["shell".to_string()];
+        let mut full_without_ask = full_with_ask.clone();
+        full_without_ask.always_ask = Vec::new();
+        let with_ask = memo_owned(
+            vec![Box::new(MemoTool("shell")) as Box<dyn crate::tools::Tool>],
+            &workspace,
+            full_with_ask,
+        );
+        let without_ask = memo_owned(
+            vec![Box::new(MemoTool("shell")) as Box<dyn crate::tools::Tool>],
+            &workspace,
+            full_without_ask,
+        );
+        let asked = build_owned_step_system_prompt(&with_ask, &config, "coder", &[])
+            .expect("render with always_ask");
+        let unasked = build_owned_step_system_prompt(&without_ask, &config, "coder", &[])
+            .expect("render without always_ask");
+        assert_ne!(
+            asked, unasked,
+            "an autonomy change must yield a different prompt, not a cached one"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn owned_step_memo_never_cross_serves_between_agents() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The honesty core: a cross-agent child's rendered prompt contains the
+        // CHILD's tool names and identity bytes, and never the other agent's.
+        reset_prompt_memo();
+        let workspace =
+            std::env::temp_dir().join(format!("zc_memo_cross_{}", uuid::Uuid::new_v4()));
+        write_workspace_file(&workspace, "AGENTS.md", "coder identity bytes");
+        write_workspace_file(&workspace.join("reviewer-ws"), "AGENTS.md", "reviewer identity bytes");
+        let config = memo_workspace_config(&workspace);
+        let coder = memo_owned(
+            vec![Box::new(MemoTool("coder_tool")) as Box<dyn crate::tools::Tool>],
+            &workspace,
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let reviewer = memo_owned(
+            vec![Box::new(MemoTool("reviewer_tool")) as Box<dyn crate::tools::Tool>],
+            &workspace.join("reviewer-ws"),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let coder_prompt =
+            build_owned_step_system_prompt(&coder, &config, "coder", &[]).expect("render");
+        let reviewer_prompt =
+            build_owned_step_system_prompt(&reviewer, &config, "reviewer", &[]).expect("render");
+        assert!(coder_prompt.contains("coder_tool") && coder_prompt.contains("coder identity bytes"));
+        assert!(
+            !coder_prompt.contains("reviewer_tool") && !coder_prompt.contains("reviewer identity bytes"),
+            "the coder child must never carry the reviewer's tools or identity"
+        );
+        assert!(
+            reviewer_prompt.contains("reviewer_tool") && reviewer_prompt.contains("reviewer identity bytes")
+        );
+        assert!(
+            !reviewer_prompt.contains("coder_tool") && !reviewer_prompt.contains("coder identity bytes"),
+            "the reviewer child must never carry the coder's tools or identity"
+        );
+        // And the memo serves each identity its own bytes on repeat:
+        let coder_again =
+            build_owned_step_system_prompt(&coder, &config, "coder", &[]).expect("render");
+        assert_eq!(coder_again, coder_prompt, "repeat serves the same identity's own bytes");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn owned_step_memo_render_day_partitions_the_key() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The owned-step render still embeds the current date; the key's day
+        // stamp keeps a memoized prompt from being served across midnight.
+        // Byte-observable proxy: keys differing ONLY in render_day are
+        // distinct keys (no cross-hit), asserted at the memo boundary.
+        reset_prompt_memo();
+        let workspace = std::env::temp_dir();
+        let base = crate::agent::prompt_memo::PromptMemoKey {
+            shape: PromptRenderShape::OwnedStep,
+            agent_alias: "coder".into(),
+            model: "m".into(),
+            provider_alias: "p".into(),
+            tool_surface_hash: 1,
+            skills_hash: 1,
+            autonomy_hash: 1,
+            shell_hash: 1,
+            workspace_dir: workspace.clone(),
+            identity_workspace_dir: None,
+            bootstrap_hash: 1,
+            knobs_hash: 1,
+            render_day: Some("2026-10-26".into()),
+        };
+        crate::agent::prompt_memo::store_system_prompt(base.clone(), "yesterday".into());
+        let mut today = base.clone();
+        today.render_day = Some("2026-10-27".into());
+        assert!(memoized_system_prompt(&today).is_none());
+        assert_eq!(
+            &*memoized_system_prompt(&base).unwrap(),
+            "yesterday",
+            "the prior day's entry stays served under its own day key"
         );
     }
 }

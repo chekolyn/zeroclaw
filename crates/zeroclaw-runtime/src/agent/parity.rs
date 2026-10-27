@@ -182,6 +182,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
+                max_turn_prompt_tokens: None,
                 context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },

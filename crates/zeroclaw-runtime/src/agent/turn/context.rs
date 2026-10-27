@@ -17,6 +17,10 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) model: &'a str,
     pub(crate) context_limits: ResolvedContextLimits,
+    /// Optional per-dispatch turn-prompt cap from the agent's runtime profile.
+    /// Turn-constant (it is agent-level policy, not route-level capacity), so
+    /// `for_route` carries it unchanged across vision-route overrides.
+    pub(crate) max_turn_prompt_tokens: Option<usize>,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
     pub(crate) channel_name: &'a str,
@@ -83,6 +87,7 @@ impl<'a> TurnCtx<'a> {
             provider_name,
             model,
             context_limits,
+            max_turn_prompt_tokens: self.max_turn_prompt_tokens,
             temperature: self.temperature,
             approval: self.approval,
             channel_name: self.channel_name,

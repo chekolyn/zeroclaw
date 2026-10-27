@@ -438,6 +438,19 @@ impl BackgroundResultState {
     }
 }
 
+/// The appended-identity files a delegate child reads from its target
+/// workspace, after the SystemPromptBuilder sections. All of them are also
+/// members of `PERSONALITY_FILES` (the memo's bootstrap fingerprint list),
+/// but the delegate path reads them from the TARGET workspace specifically,
+/// which can differ from the prompt workspace on bounded delegation.
+const DELEGATE_IDENTITY_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
+    "BOOTSTRAP.md",
+];
+
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -1910,6 +1923,9 @@ impl DelegateTool {
             if profile.max_context_tokens.is_some() {
                 resolved.max_context_tokens = profile.max_context_tokens;
             }
+            if profile.max_turn_prompt_tokens.is_some() {
+                resolved.max_turn_prompt_tokens = profile.max_turn_prompt_tokens;
+            }
             if let Some(ratio) = profile
                 .context_compact_ratio
                 .filter(|r| *r > 0.0 && *r <= 1.0)
@@ -1952,6 +1968,9 @@ impl DelegateTool {
             }
             if let Some(max_context_tokens) = profile.max_context_tokens {
                 resolved.max_context_tokens = Some(max_context_tokens);
+            }
+            if profile.max_turn_prompt_tokens.is_some() {
+                resolved.max_turn_prompt_tokens = profile.max_turn_prompt_tokens;
             }
             if let Some(ratio) = profile
                 .context_compact_ratio
@@ -3192,7 +3211,12 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_system(
+                system_prompt_ref,
+                &Self::timestamped_user_prompt(&full_prompt),
+                &model,
+                temperature,
+            ),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -4911,6 +4935,18 @@ impl DelegateTool {
         )
     }
 
+    /// Prefix a delegate child's user row with the runtime timestamp
+    /// envelope. The date lives on the USER row, never the system row: the
+    /// system row is the cached prefix of every repeated child dispatch, and
+    /// a date there would invalidate the memo (and the provider prefix
+    /// cache) once a day.
+    fn timestamped_user_prompt(full_prompt: &str) -> String {
+        format!(
+            "{}\n\n{full_prompt}",
+            crate::agent::prompt::current_datetime_user_prefix(chrono::Local::now())
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_enriched_system_prompt_from_config(
         &self,
@@ -4963,18 +4999,128 @@ impl DelegateTool {
             }
         };
 
+        // The appended-identity workspace is resolved here (not inside the
+        // render block) because it is part of the memo key: identity files
+        // are read from THIS directory below.
+        let target_workspace = config
+            .map(|config| config.agent_workspace_dir(agent_alias))
+            .or_else(|| self.agent_workspace(agent_alias));
+
+        // ── Memo key (the child's own render inputs; every member load-bearing) ──
         let empty_tools: &[Box<dyn Tool>] = &[];
-        let expose_text_tools =
-            sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
+        let expose_text_tools = sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
         let prompt_tools = if expose_text_tools {
             sub_tools
         } else {
             empty_tools
         };
-
+        let tool_surface_hash = {
+            let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+            for tool in prompt_tools {
+                hasher.str(tool.name());
+                hasher.str(tool.description());
+            }
+            if let Some(names) = hidden_builtin_names {
+                hasher.str(
+                    &crate::agent::prompt_memo::hash_string_set(names.iter()).to_string(),
+                );
+            }
+            hasher.bool(sends_native_tool_specs);
+            hasher.bool(agent_config.resolved.strict_tool_parsing);
+            hasher.finish()
+        };
+        let skills_hash = {
+            let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+            for skill in skills {
+                hasher.str(
+                    &serde_json::to_string(skill).unwrap_or_else(|_| format!("{:?}", skill)),
+                );
+                hasher.str(&skill.location.as_ref().map_or_else(String::new, |path| {
+                    path.to_string_lossy().into_owned()
+                }));
+            }
+            hasher.finish()
+        };
+        let (autonomy_level, always_ask_values) = match approval_policy {
+            Some(mgr) => (mgr.autonomy_level(), mgr.always_ask_tools()),
+            None => (crate::security::AutonomyLevel::default(), Vec::new()),
+        };
+        let autonomy_hash = {
+            let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+            hasher.str(&serde_json::to_string(&autonomy_level)
+                .unwrap_or_else(|_| format!("{autonomy_level:?}")));
+            for value in &always_ask_values {
+                hasher.str(value);
+            }
+            hasher.finish()
+        };
         let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
+        let shell_hash = crate::agent::prompt_memo::hash_string_list(
+            shell_profile
+                .as_ref()
+                .map(|profile| profile.prompt_section())
+                .into_iter(),
+        );
+        // Bootstrap fingerprint: the personality files the IdentitySection
+        // reads from `workspace_dir` plus the appended identity files read
+        // from `target_workspace` below.
+        let bootstrap_hash = {
+            let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+            hasher.str(
+                &crate::agent::prompt_memo::files_fingerprint(
+                    workspace_dir,
+                    &crate::agent::personality::PERSONALITY_FILES
+                        .iter()
+                        .map(std::path::Path::new)
+                        .collect::<Vec<_>>(),
+                )
+                .to_string(),
+            );
+            if let Some(target_workspace) = target_workspace.as_deref() {
+                hasher.str(
+                    &crate::agent::prompt_memo::files_fingerprint(
+                        target_workspace,
+                        &DELEGATE_IDENTITY_FILES
+                            .iter()
+                            .map(std::path::Path::new)
+                            .collect::<Vec<_>>(),
+                    )
+                    .to_string(),
+                );
+            }
+            hasher.finish()
+        };
+        let knobs_hash = {
+            let mut hasher = crate::agent::prompt_memo::KeyHasher::new();
+            hasher.str(&serde_json::to_string(&agent_config.resolved.prompt_injection_mode)
+                .unwrap_or_else(|_| {
+                    format!("{:?}", agent_config.resolved.prompt_injection_mode)
+                }));
+            hasher.finish()
+        };
+        let memo_key = crate::agent::prompt_memo::PromptMemoKey {
+            shape: crate::agent::prompt_memo::PromptRenderShape::DelegateChild,
+            agent_alias: agent_alias.to_string(),
+            model: model_name.to_string(),
+            // The provider identity collapses into `sends_native_tool_specs`
+            // on this path (the prompt's only provider-derived input).
+            provider_alias: String::new(),
+            tool_surface_hash,
+            skills_hash,
+            autonomy_hash,
+            shell_hash,
+            workspace_dir: workspace_dir.to_path_buf(),
+            identity_workspace_dir: target_workspace.clone(),
+            bootstrap_hash,
+            knobs_hash,
+            // Date-free system row: the date lives on the child's user row.
+            render_day: None,
+        };
+        if let Some(cached) = crate::agent::prompt_memo::memoized_system_prompt(&memo_key) {
+            let trimmed = (*cached).trim().to_string();
+            return (!trimmed.is_empty()).then_some(trimmed);
+        }
 
-        // Build structured operational context using SystemPromptBuilder sections.
         let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
             String::new()
         } else {
@@ -4985,10 +5131,6 @@ impl DelegateTool {
         // `always_ask` exceptions come from the same manager the nested loop's
         // gate consults. Callers without a manager (bounded delegation,
         // non-agentic one-shot) keep the generic default guidance.
-        let (autonomy_level, always_ask_values) = match approval_policy {
-            Some(mgr) => (mgr.autonomy_level(), mgr.always_ask_tools()),
-            None => (crate::security::AutonomyLevel::default(), Vec::new()),
-        };
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
@@ -5013,25 +5155,25 @@ impl DelegateTool {
             .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
-            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
-            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection));
 
         let mut enriched = builder
             .build_with_approval_policy(&ctx, &always_ask_values)
             .unwrap_or_default();
 
-        let target_workspace = config
-            .map(|config| config.agent_workspace_dir(agent_alias))
-            .or_else(|| self.agent_workspace(agent_alias));
+        // The runtime timestamp envelope now prefixes the child's USER row
+        // (`timestamped_user_prompt`), never this system row: a date here
+        // would invalidate the prompt memo and the provider prefix cache once
+        // a day. What the child DOES need is the static orientation for that
+        // envelope, so the bracket line reads as runtime metadata rather than
+        // message data — static bytes, safe to freeze.
+        if !enriched.trim().is_empty() {
+            enriched.push_str("\n\n");
+            enriched.push_str(crate::agent::prompt::TIMESTAMP_ORIENTATION.trim_end());
+        }
+
         if let Some(target_workspace) = target_workspace {
-            let identity_files = [
-                "AGENTS.md",
-                "SOUL.md",
-                "IDENTITY.md",
-                "USER.md",
-                "BOOTSTRAP.md",
-            ];
-            for filename in identity_files {
+            for filename in DELEGATE_IDENTITY_FILES {
                 let path = target_workspace.join(filename);
                 if let Ok(contents) = std::fs::read_to_string(&path) {
                     let trimmed = contents.trim();
@@ -5047,6 +5189,7 @@ impl DelegateTool {
         if trimmed.is_empty() {
             None
         } else {
+            crate::agent::prompt_memo::store_system_prompt(memo_key, trimmed.clone());
             Some(trimmed)
         }
     }
@@ -5121,6 +5264,9 @@ impl DelegateTool {
             target_config,
             registry: approval_registry,
         } = approval_context;
+        // The child's date travels on its USER row, never the system row
+        // (which the memo freezes for provider prefix-cache hits).
+        let full_prompt = Self::timestamped_user_prompt(full_prompt);
         let Some(tool_policy) =
             self.resolve_tool_policy_from_config(target_config, &agent_config.risk_profile)
         else {
@@ -5650,6 +5796,7 @@ impl DelegateTool {
                                 )
                             },
                         ),
+                        max_turn_prompt_tokens: loop_runtime.max_turn_prompt_tokens,
                         context_limits_resolver: None,
                         knobs: &loop_knobs,
                     },
@@ -12525,7 +12672,7 @@ mod tests {
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_date() {
+    fn enriched_prompt_includes_tools_workspace_and_is_date_free() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -12564,15 +12711,194 @@ mod tests {
             prompt.contains(&workspace.display().to_string()),
             "should contain workspace path"
         );
+        // The system row is the cached prefix of every repeated child dispatch,
+        // so it must be DATE-FREE: the per-child `[CURRENT DATE & TIME: …]`
+        // user-message prefix carries the date instead (same convention as the
+        // embedded Agent turn paths). A date here would invalidate the memo
+        // and the provider prefix cache once a day. (The static timestamp
+        // ORIENTATION line is allowed — it names the envelope but carries no
+        // date bytes.)
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
-            "should contain date section"
+            !prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "the DateTimeSection must be retired from the child system row, got:\n{prompt}"
         );
-        assert!(!prompt.contains("CURRENT DATE & TIME"));
-        assert!(!prompt.contains("Time:"));
+        assert!(
+            !prompt.contains("## Current Date"),
+            "no date section may render into the child system row"
+        );
+        let digits_in_date_header = prompt
+            .lines()
+            .filter(|line| line.contains("CURRENT DATE"))
+            .count();
+        assert!(
+            digits_in_date_header <= 1,
+            "at most the orientation line may mention the timestamp envelope"
+        );
         assert!(!prompt.contains("ISO 8601:"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn delegate_child_system_prompt_memoizes_and_never_cross_serves() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        crate::agent::prompt_memo::reset_prompt_memo();
+        let target_ws = TempDir::new().unwrap();
+        std::fs::write(target_ws.path().join("AGENTS.md"), "target identity bytes").unwrap();
+        let mut config = Config::default();
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "reviewer".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.path().join("reviewer-ws")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let workspace = TempDir::new().unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_root_config(Arc::new(config.clone()));
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let (hits_before, _) = crate::agent::prompt_memo::prompt_memo_stats();
+        let first = tool
+            .build_enriched_system_prompt(
+                "coder",
+                config.agents.get("coder").unwrap(),
+                "test-model",
+                &tools,
+                target_ws.path(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let (hits_middle, misses_middle) = crate::agent::prompt_memo::prompt_memo_stats();
+        let second = tool
+            .build_enriched_system_prompt(
+                "coder",
+                config.agents.get("coder").unwrap(),
+                "test-model",
+                &tools,
+                target_ws.path(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let (hits_after, _) = crate::agent::prompt_memo::prompt_memo_stats();
+        assert_eq!(first, second, "same identity key must serve identical bytes");
+        assert_eq!(
+            hits_after,
+            hits_middle + 1,
+            "the repeated child render must be a memo hit (hits {hits_before} → {hits_middle} → {hits_after})"
+        );
+        assert!(misses_middle >= 1, "the first render must have stored a fresh render");
+        assert!(
+            first.contains("target identity bytes") && first.contains("echo_tool"),
+            "the memoized bytes are the child's own render"
+        );
+
+        // A different target alias must never cross-serve:
+        let other = tool
+            .build_enriched_system_prompt(
+                "reviewer",
+                config.agents.get("reviewer").unwrap(),
+                "test-model",
+                &tools,
+                &target_ws.path().join("reviewer-ws"),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !other.contains("target identity bytes"),
+            "a different alias must never serve the coder's identity bytes"
+        );
+    }
+
+    #[test]
+    fn delegate_child_memo_invalidates_on_target_workspace_change() {
+        let _memo_guard =
+            crate::agent::prompt_memo::MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        crate::agent::prompt_memo::reset_prompt_memo();
+        let target_ws = TempDir::new().unwrap();
+        std::fs::write(target_ws.path().join("AGENTS.md"), "bootstrap version one").unwrap();
+        let mut config = Config::default();
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let workspace = TempDir::new().unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_root_config(Arc::new(config.clone()));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let first = tool
+            .build_enriched_system_prompt(
+                "coder",
+                config.agents.get("coder").unwrap(),
+                "test-model",
+                &tools,
+                target_ws.path(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(first.contains("bootstrap version one"));
+        std::fs::write(target_ws.path().join("AGENTS.md"), "bootstrap version two").unwrap();
+        let second = tool
+            .build_enriched_system_prompt(
+                "coder",
+                config.agents.get("coder").unwrap(),
+                "test-model",
+                &tools,
+                target_ws.path(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            second.contains("bootstrap version two") && !second.contains("bootstrap version one"),
+            "a changed target identity bootstrap must be served fresh, never stale"
+        );
+    }
+
+    #[test]
+    fn delegate_child_user_row_carries_the_timestamp_prefix() {
+        // The date moved out of the child's system row into its user row, in
+        // the same labeled shape the embedded Agent turn paths use.
+        let prefixed = DelegateTool::timestamped_user_prompt("do the thing");
+        assert!(
+            prefixed.starts_with("[CURRENT DATE & TIME: "),
+            "the child user row must carry the runtime timestamp prefix, got: {prefixed}"
+        );
+        assert!(prefixed.ends_with("\n\ndo the thing"));
     }
 
     #[test]
