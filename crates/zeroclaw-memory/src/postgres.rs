@@ -70,6 +70,14 @@ pub struct PostgresMemory {
     /// from recall via `exclude_namespaces` prefix matching.
     category_namespaces: HashMap<String, String>,
     op_timeout: Duration,
+    /// Soft wall-clock budget for the RANKED recall attempts. When set (and
+    /// below `op_timeout`), each ranked recall runs with a per-attempt
+    /// server-side `statement_timeout` so an over-budget attempt is cancelled
+    /// by the server, freeing the shared connection for the recall budget's
+    /// recent-entries fallback instead of holding it until `op_timeout`.
+    /// The empty-query recall path is exempt: it is the indexed recent
+    /// fallback itself.
+    recall_soft_timeout: Option<Duration>,
 }
 
 impl PostgresMemory {
@@ -82,6 +90,7 @@ impl PostgresMemory {
         op_timeout_secs: Option<u64>,
         pgvector_enabled: Option<bool>,
         pgvector_dimensions: Option<usize>,
+        recall_soft_timeout_ms: Option<u64>,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -102,6 +111,12 @@ impl PostgresMemory {
                 .unwrap_or(DEFAULT_OP_TIMEOUT_SECS)
                 .min(POSTGRES_OP_TIMEOUT_CAP_SECS),
         );
+        // A soft budget at or above `op_timeout` is inert: the session-level
+        // `statement_timeout` (op_timeout) is already the tighter bound.
+        let recall_soft_timeout = recall_soft_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .filter(|soft| *soft < op_timeout);
 
         let (client, pgvector_ok) = Self::initialize_client(
             db_url.to_string(),
@@ -128,6 +143,7 @@ impl PostgresMemory {
             qualified_agents,
             category_namespaces: HashMap::new(),
             op_timeout,
+            recall_soft_timeout,
         })
     }
 
@@ -209,7 +225,17 @@ impl PostgresMemory {
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
-        client.batch_execute(&format!(
+        client.batch_execute(&Self::ensure_schema_sql(schema_ident, qualified_table))?;
+
+        Self::migrate_session_ids_to_sanitized(client, qualified_table)?;
+
+        Ok(())
+    }
+
+    /// The schema/bootstrap DDL. Extracted pure so the index contract is
+    /// unit-testable without a live PostgreSQL instance.
+    fn ensure_schema_sql(schema_ident: &str, qualified_table: &str) -> String {
+        format!(
             "
             CREATE SCHEMA IF NOT EXISTS {schema_ident};
 
@@ -230,13 +256,16 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
             CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
+            -- The recall WHERE clause matches on the CONCATENATION
+            -- `to_tsvector('simple', key || ' ' || content)`, which matches
+            -- neither single-column FTS index above: every recall seq-scanned
+            -- the whole table computing tsvectors per row (measured
+            -- 2026-10-27: 6.3–6.7s per recall on a 50K-row store). This index
+            -- makes the query a first-class filter.
+            CREATE INDEX IF NOT EXISTS idx_memories_key_content_fts ON {qualified_table} USING gin(to_tsvector('simple', key || ' ' || content));
                 CREATE INDEX IF NOT EXISTS idx_memories_key_btree ON {qualified_table}(key text_pattern_ops);
             "
-        ))?;
-
-        Self::migrate_session_ids_to_sanitized(client, qualified_table)?;
-
-        Ok(())
+        )
     }
 
     fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
@@ -437,6 +466,82 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
     }
 }
 
+/// The recent-entries recall: indexed recency (`idx_memories_updated_at`),
+/// NO full-text scoring. The empty-query contract (bare `*` / omitted query
+/// returns recent entries) must not pay the per-row tsvector cost of the
+/// ranked query — on the measured 50K-row store the ranked shape seq-scanned
+/// every row even for a bare recall because the constant-zero score
+/// expressions still computed `to_tsvector` per row. This is also the
+/// degraded shape the recall budget's fallback lands on.
+///
+/// Placeholders: `$1` session_id, `$2..` the enabled time bounds, LIMIT last.
+fn recent_recall_sql(qualified_table: &str, qualified_agents: &str, since: bool, until: bool) -> String {
+    let time_filter = recall_time_filter(since, until, 2);
+    let limit_placeholder = 2 + usize::from(since) + usize::from(until);
+    format!(
+        "
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+        FROM {qualified_table} m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+        WHERE ($1::TEXT IS NULL OR m.session_id = $1)
+          {time_filter}
+        ORDER BY m.updated_at DESC
+        LIMIT ${limit_placeholder}
+        "
+    )
+}
+
+/// The agent-scoped variant of [`recent_recall_sql`]. Placeholders: `$1` the
+/// agent allowlist, `$2..` the enabled time bounds, LIMIT last.
+fn recent_recall_sql_for_agents(
+    qualified_table: &str,
+    qualified_agents: &str,
+    since: bool,
+    until: bool,
+) -> String {
+    let time_filter = recall_time_filter(since, until, 2);
+    let limit_placeholder = 2 + usize::from(since) + usize::from(until);
+    format!(
+        "
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+        FROM {qualified_table} m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+        WHERE m.agent_id = ANY($1)
+          {time_filter}
+        ORDER BY m.updated_at DESC
+        LIMIT ${limit_placeholder}
+        "
+    )
+}
+
+/// Bound ONE ranked recall attempt: sets `statement_timeout` to the soft
+/// recall budget, runs `run`, then restores the session default
+/// (`op_timeout`). The whole SET → query → restore sequence runs inside the
+/// shared client's mutex critical section, so it cannot interleave with
+/// another operation. Best-effort restore: a failed restore only leaves the
+/// tighter bound in place for subsequent statements until the next guarded
+/// attempt resets it. `soft == None` runs the query with no per-attempt
+/// re-bound (the session-level `op_timeout` already applies).
+fn with_statement_timeout<T>(
+    client: &mut Client,
+    soft: Option<Duration>,
+    op_timeout: Duration,
+    run: impl FnOnce(&mut Client) -> Result<T>,
+) -> Result<T> {
+    let Some(soft) = soft else {
+        return run(client);
+    };
+    client
+        .batch_execute(&format!("SET statement_timeout = {}", soft.as_millis()))
+        .context("failed to bound the recall attempt at the soft budget")?;
+    let result = run(client);
+    let _ = client.batch_execute(&format!(
+        "SET statement_timeout = {}",
+        op_timeout.as_millis()
+    ));
+    result
+}
+
 /// INSERT/UPSERT used by [`Memory::store_with_agent`].
 ///
 /// The `importance` placeholder must carry an explicit `::FLOAT8` annotation
@@ -506,6 +611,40 @@ impl Memory for PostgresMemory {
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);
 
+        // Empty-query fast path: the bare `*` / omitted-query contract is an
+        // indexed recency read, not a full-text scan.
+        if query.is_empty() {
+            return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+                let mut client = client.lock();
+                let since_ref = since_owned.as_deref();
+                let until_ref = until_owned.as_deref();
+                let stmt = recent_recall_sql(
+                    &qualified_table,
+                    &qualified_agents,
+                    since_ref.is_some(),
+                    until_ref.is_some(),
+                );
+
+                #[allow(clippy::cast_possible_wrap)]
+                let limit_i64 = limit as i64;
+
+                let rows = match (since_ref, until_ref) {
+                    (Some(s), Some(u)) => client.query(&stmt, &[&sid, &s, &u, &limit_i64])?,
+                    (Some(s), None) => client.query(&stmt, &[&sid, &s, &limit_i64])?,
+                    (None, Some(u)) => client.query(&stmt, &[&sid, &u, &limit_i64])?,
+                    (None, None) => client.query(&stmt, &[&sid, &limit_i64])?,
+                };
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
+            .await;
+        }
+
+        let client = self.client.get().clone();
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
@@ -537,15 +676,19 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
-                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
-                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
-            };
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+            // Bound THIS attempt server-side at the soft budget so a caller
+            // that gives up leaves no orphan holding the shared connection.
+            let entries =
+                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                    let rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
+                        (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
+                        (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
+                        (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+                    };
+                    rows.iter().map(Self::row_to_entry).collect::<Result<Vec<MemoryEntry>>>()
+                })?;
+            Ok(entries)
         })
         .await
     }
@@ -864,6 +1007,39 @@ impl Memory for PostgresMemory {
         let until_owned = until.map(str::to_string);
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
+        // Empty-query fast path: indexed recency within the agent allowlist.
+        if q.is_empty() {
+            return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+                let mut client = client.lock();
+                let since_ref = since_owned.as_deref();
+                let until_ref = until_owned.as_deref();
+                let stmt = recent_recall_sql_for_agents(
+                    &qualified_table,
+                    &qualified_agents,
+                    since_ref.is_some(),
+                    until_ref.is_some(),
+                );
+
+                #[allow(clippy::cast_possible_wrap)]
+                let limit_i64 = limit as i64;
+
+                let rows = match (since_ref, until_ref) {
+                    (Some(s), Some(u)) => client.query(&stmt, &[&allowed, &s, &u, &limit_i64])?,
+                    (Some(s), None) => client.query(&stmt, &[&allowed, &s, &limit_i64])?,
+                    (None, Some(u)) => client.query(&stmt, &[&allowed, &u, &limit_i64])?,
+                    (None, None) => client.query(&stmt, &[&allowed, &limit_i64])?,
+                };
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
+            .await;
+        }
+
+        let client = self.client.get().clone();
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
@@ -896,17 +1072,25 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => {
-                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
-                }
-                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
-                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
-            };
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+            // Bound THIS attempt server-side at the soft budget so a caller
+            // that gives up leaves no orphan holding the shared connection.
+            let entries =
+                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                    let rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => {
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
+                        }
+                        (Some(s), None) => {
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?
+                        }
+                        (None, Some(u)) => {
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?
+                        }
+                        (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+                    };
+                    rows.iter().map(Self::row_to_entry).collect::<Result<Vec<MemoryEntry>>>()
+                })?;
+            Ok(entries)
         })
         .await
     }
@@ -954,6 +1138,50 @@ mod tests {
     fn postgres_test_url() -> String {
         std::env::var("ZEROCLAW_TEST_POSTGRES_URL")
             .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests")
+    }
+
+    // Tuning cycle 3: the recent-entries (empty-query) path must be an
+    // indexed recency read — no per-row tsvector computation — because it is
+    // both the bare-recall contract path and the recall budget's fallback.
+    #[test]
+    fn recent_recall_sql_is_index_backed_and_vector_free() {
+        let sql = recent_recall_sql("mem.memories", "mem.agents", true, false);
+        assert!(
+            !sql.contains("to_tsvector"),
+            "the recent path must not compute tsvectors per row"
+        );
+        assert!(
+            sql.contains("ORDER BY m.updated_at DESC"),
+            "recency ordering rides the updated_at index"
+        );
+        assert!(sql.contains("LEFT JOIN mem.agents"), "agent alias join kept");
+        assert!(sql.contains("$1::TEXT IS NULL OR m.session_id = $1"));
+        assert!(sql.contains("m.created_at >= $2::TIMESTAMPTZ"));
+        assert!(sql.contains("LIMIT $3"), "since bound → limit at $3, got: {sql}");
+    }
+
+    #[test]
+    fn recent_recall_sql_for_agents_filters_by_allowlist_and_is_vector_free() {
+        let sql = recent_recall_sql_for_agents("mem.memories", "mem.agents", true, true);
+        assert!(!sql.contains("to_tsvector"));
+        assert!(sql.contains("m.agent_id = ANY($1)"));
+        assert!(sql.contains("m.created_at >= $2::TIMESTAMPTZ"));
+        assert!(sql.contains("m.created_at <= $3::TIMESTAMPTZ"));
+        assert!(sql.contains("LIMIT $4"), "both time bounds → limit at $4, got: {sql}");
+    }
+
+    #[test]
+    fn ensure_schema_carries_the_composite_key_content_fts_index() {
+        let sql = PostgresMemory::ensure_schema_sql("mem", "mem.memories");
+        assert!(
+            sql.contains("idx_memories_key_content_fts"),
+            "the recall WHERE clause matches the key||' '||content concatenation; \
+             without an index on exactly that expression every recall seq-scans"
+        );
+        assert!(
+            sql.contains("gin(to_tsvector('simple', key || ' ' || content))"),
+            "the index expression must match the WHERE expression for the planner to use it"
+        );
     }
 
     #[test]
@@ -1076,6 +1304,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
         });
 
@@ -1098,6 +1327,7 @@ mod tests {
                 None,
                 Some(true),
                 Some(4),
+                None,
             )
         });
 
@@ -1169,6 +1399,7 @@ mod tests {
                 None,
                 Some(true),
                 Some(4),
+                None,
             )
         });
 
@@ -1196,7 +1427,9 @@ mod tests {
                 &schema.name,
                 "memories",
                 Some(5),
+                None,
                 Some(false),
+                None,
                 None,
             )
             .unwrap();
