@@ -616,6 +616,7 @@ mod argument_preservation_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "argument-preservation",
+            turn_started_at: std::time::Instant::now(),
             serving_provider_name: None,
             serving_model: None,
         };
@@ -1007,6 +1008,7 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            turn_started_at: std::time::Instant::now(),
             serving_provider_name: None,
             serving_model: None,
         };
@@ -1154,6 +1156,7 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            turn_started_at: std::time::Instant::now(),
             serving_provider_name: None,
             serving_model: None,
         };
@@ -1235,6 +1238,7 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: Some("test_agent"),
             turn_id,
+            turn_started_at: std::time::Instant::now(),
             serving_provider_name: None,
             serving_model: None,
         }

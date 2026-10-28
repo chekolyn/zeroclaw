@@ -2217,6 +2217,8 @@ impl HookHandler for RulesHook {
         ) = self.build_block(ctx);
         let injected_chars = block.len();
         let stats = DiscoveryStats::snapshot();
+        let (prompt_memo_hits, prompt_memo_misses) =
+            crate::agent::prompt_memo::prompt_memo_stats();
         if !block.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -2239,6 +2241,8 @@ impl HookHandler for RulesHook {
                         "discovery_last_stat_millis": stats.last_stat_millis,
                         "body_cache_hits": stats.body_hits,
                         "body_cache_misses": stats.body_misses,
+                        "prompt_memo_hits": prompt_memo_hits,
+                        "prompt_memo_misses": prompt_memo_misses,
                     })),
                 "rules block injected into system prompt"
             );
@@ -2767,6 +2771,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_build_row_carries_prompt_memo_counters() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let dir = std::env::temp_dir().join(format!("zc-rules-memo-test-{}", std::process::id()));
+        let ws = dir.join("workspace");
+        let rules_dir = ws.join(".agents").join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("memo-probe.md"),
+            "---\nname: memo-probe\ndescription: binds when probing memo counters\n---\nBody here.\n",
+        )
+        .unwrap();
+
+        let hook = RulesHook::new(RulesHookConfig {
+            enabled: true,
+            global_dir: String::new(),
+            workspace_dir: ".agents/rules".to_string(),
+            repo_discovery: false,
+            ..RulesHookConfig::default()
+        });
+        let ctx = PromptBuildHookContext::new("memo-probe-agent", ws, "sess-1", "turn-memo-1");
+        match hook
+            .before_prompt_build_with_context(&ctx, "SYSTEM".to_string())
+            .await
+        {
+            HookResult::Continue(_) => {}
+            HookResult::Cancel(_) => panic!("rules hook must continue"),
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut row = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "rules block injected into system prompt")
+                    {
+                        row = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        zeroclaw_log::clear_broadcast_hook();
+        let value = row.expect("a non-empty rules block must emit its injection row");
+        assert!(
+            value["attributes"]["prompt_memo_hits"].is_u64()
+                && value["attributes"]["prompt_memo_misses"].is_u64(),
+            "the rules row must carry the production memo counters, got: {value}"
+        );
+    }
+
     async fn prompt_build_appends_manifest_and_core_for_workspace_scope() {
         let dir = std::env::temp_dir().join(format!("zc-rules-test-{}", std::process::id()));
         let ws = dir.join("workspace");

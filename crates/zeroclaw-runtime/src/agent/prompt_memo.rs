@@ -148,18 +148,20 @@ const PROMPT_MEMO_CAPACITY: usize = 64;
 /// cheaper than the re-prefill it prevents.
 static PROMPT_MEMO: Mutex<Option<HashMap<PromptMemoKey, Arc<String>>>> = Mutex::new(None);
 
-#[cfg(test)]
+// Hit/miss telemetry: production counters (the A1 memo was previously
+// observable only under `cfg(test)`; the 2026-10-28 tuning cycle exposed them
+// on the rules row so prod memo behavior is readable from traces).
 static MEMO_HITS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
 static MEMO_MISSES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
-pub(crate) static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
+/// Process-global `(hits, misses)` snapshot for the prompt memo. Emitted on
+/// the rules hook's injection row alongside the body-cache counters.
 pub(crate) fn prompt_memo_stats() -> (u64, u64) {
     (MEMO_HITS.load(Ordering::SeqCst), MEMO_MISSES.load(Ordering::SeqCst))
 }
+
+#[cfg(test)]
+pub(crate) static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn reset_prompt_memo() {
