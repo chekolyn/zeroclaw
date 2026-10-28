@@ -436,6 +436,17 @@ pub fn build_deferred_tools_section_excluding(
     if deferred.is_empty() {
         return String::new();
     }
+    // Render-site canonical order: sort a LOCAL COPY by `prefixed_name` so
+    // the section bytes are a pure function of the stub SET, not of the
+    // registry's enumeration order (`McpRegistry::tool_names()` is unsorted
+    // HashMap keys — every fresh assembly reshuffled the listing at constant
+    // length, breaking provider prefix-cache stability). The stored order is
+    // untouched: `search()`'s keyword-less path
+    // (`self.stubs.iter().take(max_results)`) depends on it. This mirrors the
+    // builtin deferred section, which already sorts at its render site
+    // (`render_deferred_builtin_tools_section`).
+    let mut ordered: Vec<&DeferredMcpToolStub> = deferred.stubs.iter().collect();
+    ordered.sort_by(|a, b| a.prefixed_name.cmp(&b.prefixed_name));
     let mut out = String::new();
     out.push_str("## Deferred Tools\n\n");
     out.push_str(
@@ -447,7 +458,7 @@ pub fn build_deferred_tools_section_excluding(
     );
     out.push_str("<available-deferred-tools>\n");
     let mut count = 0;
-    for stub in &deferred.stubs {
+    for stub in ordered {
         if exclude.contains(&stub.prefixed_name) {
             continue;
         }
@@ -923,6 +934,125 @@ mod tests {
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
+    }
+
+    // ── M3: render-site canonical order (re-order landing 1) ────────────────
+    //
+    // `McpRegistry::tool_names()` is unsorted HashMap keys, so every fresh
+    // assembly shuffles the stored stub order and the rendered
+    // `<available-deferred-tools>` listing flapped per turn at constant
+    // length (measured 2026-10-28: first-entry rotation, no re-sync to
+    // window end). The fix sorts a LOCAL COPY at the render site — the
+    // stored order stays untouched because the keyword-less `search` path
+    // (`self.stubs.iter().take(max_results)`) depends on it.
+
+    fn make_deferred_set_with_order(names: &[(&str, &str)]) -> DeferredMcpToolSet {
+        let stubs = names.iter().map(|(n, d)| make_stub(n, d)).collect();
+        DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        }
+    }
+
+    #[test]
+    fn deferred_listing_order_stable_across_fresh_registries() {
+        // Two fresh assemblies of the SAME stub set in DIFFERENT stored
+        // order must render byte-identical sections: the section bytes are
+        // a pure function of the stub SET, not of enumeration order.
+        let set_a = make_deferred_set_with_order(&[
+            ("grafana__create_incident", "Create an incident"),
+            ("grafana__list_loki_label_names", "List Loki label names"),
+            ("fs__read_file", "Read a file"),
+            ("git__status", "Git status"),
+        ]);
+        let set_b = make_deferred_set_with_order(&[
+            ("git__status", "Git status"),
+            ("grafana__list_loki_label_names", "List Loki label names"),
+            ("fs__read_file", "Read a file"),
+            ("grafana__create_incident", "Create an incident"),
+        ]);
+        assert_ne!(
+            set_a.stub_names(),
+            set_b.stub_names(),
+            "test setup must hand the renderer two DIFFERENT stored orders"
+        );
+        assert_eq!(
+            build_deferred_tools_section(&set_a),
+            build_deferred_tools_section(&set_b),
+            "fresh assemblies of the same stub set must render byte-identical listings"
+        );
+    }
+
+    #[test]
+    fn search_invariance_under_render_sort() {
+        // The invariant that justifies render-site-only sorting: the
+        // keyword-less search path returns stubs in STORED order, and the
+        // render-site sort must not disturb that stored order.
+        let set = make_deferred_set_with_order(&[
+            ("zeta__last", "Last inserted"),
+            ("alpha__first", "First inserted"),
+            ("mid__middle", "Middle inserted"),
+        ]);
+        let stored: Vec<&str> = set.stub_names();
+        assert_eq!(
+            stored,
+            vec!["zeta__last", "alpha__first", "mid__middle"],
+            "test setup must store a NON-sorted order"
+        );
+        let found: Vec<&str> = set
+            .search("", 10)
+            .into_iter()
+            .map(|s| s.prefixed_name.as_str())
+            .collect();
+        assert_eq!(
+            found, stored,
+            "empty-term search must return stubs in STORED order, not the sorted render order"
+        );
+    }
+
+    #[test]
+    fn content_multiset_preserved() {
+        // Old (stored-order) vs new (sorted) renders differ by PERMUTATION
+        // only: the rendered content lines' multiset equals the stub-derived
+        // "name - summary" multiset — nothing dropped, no description mutated,
+        // prose header/footer unchanged.
+        let set = make_deferred_set_with_order(&[
+            ("grafana__create_incident", "Create an incident"),
+            ("fs__read_file", "Read a file\nwith a second line"),
+        ]);
+        let section = build_deferred_tools_section(&set);
+        let content = section
+            .split("<available-deferred-tools>\n")
+            .nth(1)
+            .and_then(|rest| rest.split("</available-deferred-tools>").next())
+            .unwrap_or_else(|| panic!("section must carry the deferred-tools tag: {section}"));
+        let multiset = |lines: Vec<String>| {
+            let mut map: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for line in lines {
+                *map.entry(line).or_default() += 1;
+            }
+            map
+        };
+        let rendered = multiset(content.lines().filter(|l| !l.is_empty()).map(String::from).collect());
+        let expected = multiset(
+            // The pre-sort renderer emitted exactly these lines in stored
+            // order; multiset equality pins same-names/same-descriptions.
+            set.stubs
+                .iter()
+                .map(|s| format!("{} - {}", s.prefixed_name, deferred_summary_line(&s.description)))
+                .collect(),
+        );
+        assert_eq!(
+            rendered, expected,
+            "render-site sort must permute the listing, never mutate its content"
+        );
     }
 
     #[test]

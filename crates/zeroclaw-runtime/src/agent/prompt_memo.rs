@@ -349,4 +349,70 @@ mod tests {
         );
         assert_ne!(hash_string_set(["a", "b"]), hash_string_set(["a"]));
     }
+
+    #[tokio::test]
+    async fn memo_interplay() {
+        // Re-order landing 1 (M3: render-site sort of the deferred-MCP
+        // listing) × the A1 prompt memo.
+        //
+        // KEY side: `hash_string_set` sorts before hashing, so every key
+        // member hashed as a SET is invariant under stub-order permutation —
+        // M3 changes no name set, hence no such key member. (The
+        // `mcp_prompt_section` key member additionally becomes order-STABLE
+        // once the render sorts: its bytes become a pure function of the
+        // stub set, so two fresh assemblies of one identity now derive the
+        // SAME key instead of diverging per shuffle.)
+        //
+        // VALUE side: a memoized prompt freezes its render's deferred
+        // listing; before the sort, a second assembly's fresh render froze a
+        // DIFFERENT shuffle, so byte-identical values across fresh
+        // assemblies were impossible. After the sort the embedded section
+        // bytes are identical, and a memo hit serves exactly the bytes a
+        // fresh render would produce.
+        let registry = std::sync::Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty MCP registry connects"),
+        );
+        let make_set = |order: &[&str]| crate::tools::DeferredMcpToolSet {
+            stubs: order
+                .iter()
+                .map(|name| {
+                    zeroclaw_tools::mcp_deferred::DeferredMcpToolStub::new(
+                        (*name).to_string(),
+                        zeroclaw_tools::mcp_protocol::McpToolDef {
+                            name: (*name).to_string(),
+                            description: Some("memo interplay stub".to_string()),
+                            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                        },
+                    )
+                })
+                .collect(),
+            registry: std::sync::Arc::clone(&registry),
+            security: std::sync::Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        };
+        let set_a = make_set(&["grafana__create_incident", "fs__read_file", "git__status"]);
+        let set_b = make_set(&["git__status", "grafana__create_incident", "fs__read_file"]);
+
+        // (a) KEY side: the set-hash key member is order-insensitive across
+        // the two assemblies' stub-name lists.
+        let names_a = set_a.stub_names();
+        let names_b = set_b.stub_names();
+        assert_ne!(names_a, names_b, "setup must permute the stub order");
+        assert_eq!(
+            hash_string_set(names_a),
+            hash_string_set(names_b),
+            "A1 key members hashed as sets must not depend on stub enumeration order"
+        );
+
+        // (b) VALUE side: the deferred section embedded in the memoized
+        // prompt (and hashed into the key via `mcp_prompt_section`) is
+        // byte-identical across fresh assemblies of the same stub set.
+        assert_eq!(
+            crate::tools::build_deferred_tools_section(&set_a),
+            crate::tools::build_deferred_tools_section(&set_b),
+            "fresh assemblies must render byte-identical deferred sections — \
+             a memo hit now serves the bytes a fresh render would produce"
+        );
+    }
 }
