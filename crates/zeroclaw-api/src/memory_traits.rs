@@ -383,6 +383,39 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// List entries whose key starts with `prefix`, most-recent first,
+    /// bounded IN STORAGE by `limit`.
+    ///
+    /// The prefix-enumeration contract behind the `memory_recall` tool's
+    /// prefix mode: unlike [`Memory::list`] — the unbounded full-store
+    /// listing the enumeration used to ride (measured 15.2s on the prod
+    /// leader's 50K-row postgres store, canary v7) — implementations push
+    /// both the prefix predicate and the limit down to the store so the
+    /// call is fast AND bounded on large stores.
+    ///
+    /// Default: compose [`Memory::list`] with a client-side prefix filter
+    /// and truncation (the pre-`list_prefixed` shape, now bounded by
+    /// `limit` on the RESULT but not on the scan). Backends with a
+    /// prefix-servable index (postgres `idx_memories_key_btree` with
+    /// `text_pattern_ops`, sqlite `idx_memories_key`) override this with a
+    /// native indexed query.
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = self.list(None, session_id).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.key.starts_with(prefix))
+            .take(limit)
+            .collect())
+    }
+
     /// Remove a memory by key. Deletes every row matching `key`, regardless
     /// of agent attribution. Agent-scoped callers (the `AgentScopedMemory`
     /// wrapper) use [`forget_for_agent`](Self::forget_for_agent) instead.

@@ -180,6 +180,74 @@ impl BudgetedMemory {
             }
         }
     }
+    /// Bound one enumeration attempt with NO fallback: an enumeration has no
+    /// recency-fallback semantic — a partial or unrelated listing would
+    /// overstate completeness to the caller (the evo SOPs' prefix
+    /// enumeration) — so a budget-exhausted attempt (tokio timeout, or a
+    /// backend error arriving at/after the budget) FAILS BOUNDED, carrying
+    /// the same trace shape as [`Self::bounded`].
+    async fn bounded_enumeration<P, PF>(
+        &self,
+        primary: P,
+        label: &str,
+    ) -> anyhow::Result<Vec<MemoryEntry>>
+    where
+        P: FnOnce() -> PF,
+        PF: Future<Output = anyhow::Result<Vec<MemoryEntry>>>,
+    {
+        let start = Instant::now();
+        let outcome = tokio::time::timeout(self.soft_timeout, primary()).await;
+        let elapsed = start.elapsed();
+        match outcome {
+            Ok(Ok(entries)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "recall": label,
+                            "elapsed_ms": elapsed.as_millis() as u64,
+                            "count": entries.len(),
+                            "degraded": false,
+                        })),
+                    "memory enumeration completed within the soft budget"
+                );
+                Ok(entries)
+            }
+            // A real backend failure that did NOT consume the budget: it
+            // propagates as-is.
+            Ok(Err(error)) if elapsed < self.soft_timeout => Err(error),
+            Ok(Err(error)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "recall": label,
+                            "elapsed_ms": elapsed.as_millis() as u64,
+                            "error": error.to_string(),
+                        })),
+                    "memory enumeration errored after exhausting the soft budget"
+                );
+                Err(error)
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "recall": label,
+                            "elapsed_ms": elapsed.as_millis() as u64,
+                            "soft_timeout_ms": self.soft_timeout.as_millis() as u64,
+                        })),
+                    "memory enumeration exceeded the soft budget; failed bounded"
+                );
+                Err(anyhow::anyhow!(
+                    "memory enumeration ({label}) exceeded the soft budget ({:?})",
+                    self.soft_timeout
+                ))
+            }
+        }
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for BudgetedMemory {
@@ -298,6 +366,28 @@ impl Memory for BudgetedMemory {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         self.inner.list(category, session_id).await
+    }
+
+    /// The prefix enumeration rides the backend's `list_prefixed` under the
+    /// same wall-clock budget as the ranked recall — but with NO
+    /// recent-entries fallback: an enumeration has no recency-fallback
+    /// semantic, so an over-budget enumeration fails bounded rather than
+    /// returning a partial or unrelated listing (see
+    /// [`Self::bounded_enumeration`]).
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if self.disabled() {
+            return self.inner.list_prefixed(prefix, limit, session_id).await;
+        }
+        self.bounded_enumeration(
+            || self.inner.list_prefixed(prefix, limit, session_id),
+            "list_prefixed",
+        )
+        .await
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
@@ -669,5 +759,226 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// Fake backend whose `list_prefixed` sleeps (the measured prod
+    /// enumeration shape, abstracted) while `list` is instant — so a test
+    /// that observes the budget proves the DECORATOR bounds `list_prefixed`
+    /// itself, not a default compose through the fast `list`.
+    struct SlowPrefixMemory {
+        prefix_delay: Duration,
+        prefix_error: bool,
+        prefix_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+    }
+
+    impl SlowPrefixMemory {
+        fn new(prefix_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                prefix_delay,
+                prefix_error: false,
+                prefix_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn prefixed_entry(key: &str) -> MemoryEntry {
+            MemoryEntry {
+                principal_id: None,
+                id: key.into(),
+                key: key.into(),
+                content: "prefixed enumeration result".into(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-10-28T00:00:00Z".into(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SlowPrefixMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "slow-prefix"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for SlowPrefixMemory {
+        fn name(&self) -> &str {
+            "slow-prefix"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn list_prefixed(
+            &self,
+            _prefix: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.prefix_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.prefix_delay).await;
+            if self.prefix_error {
+                anyhow::bail!("prefix backend down");
+            }
+            Ok(vec![Self::prefixed_entry("ws:one"), Self::prefixed_entry("ws:two")])
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    /// The decorator routes the prefix enumeration through the inner
+    /// backend's `list_prefixed` — not the default list-based compose — and
+    /// a within-budget enumeration returns the backend's entries unchanged.
+    #[tokio::test]
+    async fn list_prefixed_within_budget_returns_prefixed_entries() {
+        let fake = SlowPrefixMemory::new(Duration::ZERO);
+        let mem = BudgetedMemory::new(fake.clone(), BUDGET);
+
+        let results = mem.list_prefixed("ws:", 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 2, "the prefixed entries come through");
+        assert_eq!(
+            fake.prefix_calls.load(Ordering::SeqCst),
+            1,
+            "the decorator must call the backend's list_prefixed"
+        );
+        assert_eq!(
+            fake.list_calls.load(Ordering::SeqCst),
+            0,
+            "the prefix enumeration must not ride the unbounded list compose"
+        );
+    }
+
+    /// An over-budget enumeration FAILS BOUNDED (no truncated-result
+    /// fallback: a partial enumeration would overstate completeness to the
+    /// SOP consumer). The call returns an error naming the budget, within
+    /// roughly the soft budget.
+    #[tokio::test]
+    async fn list_prefixed_over_budget_fails_bounded() {
+        let fake = SlowPrefixMemory::new(Duration::from_secs(2));
+        let mem = BudgetedMemory::new(fake, BUDGET);
+        let start = Instant::now();
+
+        let result = mem.list_prefixed("ws:", 10, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an over-budget enumeration must fail bounded, not return a partial listing"
+        );
+        assert!(
+            result
+                .err()
+                .is_some_and(|e| e.to_string().contains("soft budget")),
+            "the bounded failure must name the soft budget"
+        );
+        assert!(
+            elapsed < BUDGET + BOUNDED_SLACK,
+            "the enumeration must stay bounded by the soft budget; took {elapsed:?}"
+        );
+    }
+
+    /// `soft_timeout == 0` disables the budget entirely — the decorator's
+    /// disabled contract, mirrored for the enumeration: byte-identical
+    /// pass-through.
+    #[tokio::test]
+    async fn list_prefixed_disabled_budget_is_passthrough() {
+        let fake = SlowPrefixMemory::new(Duration::from_millis(250));
+        let mem = BudgetedMemory::new(fake, Duration::ZERO);
+        let start = Instant::now();
+
+        let results = mem.list_prefixed("ws:", 10, None).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "a disabled budget must not interrupt the enumeration"
+        );
     }
 }

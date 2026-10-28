@@ -394,6 +394,43 @@ impl Memory for AgentScopedMemory {
         Ok(self.filter_attributed_entries(entries))
     }
 
+    /// The prefix enumeration, attribution-filtered. The backend's
+    /// `list_prefixed` LIMIT lands BEFORE this wrapper's attribution filter,
+    /// so the fetch carries headroom and re-fetches wider when the filtered
+    /// result falls short of `limit` and the backend may have more (the same
+    /// shape `recall_namespaced`'s doubling loop uses): the enumeration stays
+    /// a bounded, index-assisted backend query per attempt instead of
+    /// collapsing to the unbounded full-store `list` compose.
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .inner
+                .list_prefixed(prefix, fetch_limit, session_id)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered = self.filter_attributed_entries(entries);
+            let bounded: Vec<MemoryEntry> = filtered.into_iter().take(limit).collect();
+            if bounded.len() >= limit || !backend_may_have_more {
+                return Ok(bounded);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(bounded);
+            }
+            fetch_limit = next_fetch_limit;
+        }
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);

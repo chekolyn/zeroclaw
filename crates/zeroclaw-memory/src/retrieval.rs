@@ -354,6 +354,19 @@ impl Memory for RetrievalPipeline {
         self.memory.list(category, session_id).await
     }
 
+    /// The prefix enumeration is a listing, not a recall: forward verbatim so
+    /// the backend's LIMITed, index-assisted query survives the decorator
+    /// (the default compose would route through `list` — the unbounded
+    /// full-store scan the enumeration exists to avoid).
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory.list_prefixed(prefix, limit, session_id).await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let result = self.memory.forget(key).await;
         // Invalidate unless the backend confirmed a no-op; a backend error
