@@ -36,6 +36,35 @@ impl FileWriteTool {
             persistent_writes,
         }
     }
+
+    /// A file tool for a BOUNDED delegate child: everything about this
+    /// instance is preserved — the policy's autonomy, allowlists, forbidden
+    /// paths, allowed roots, tracker — with ONE delta: the workspace root
+    /// the tool resolves relative paths against moves to the TARGET agent's
+    /// workspace. Mirrors the shell's `for_delegate_child` single-delta
+    /// contract: the workspace root moves, the authority does not.
+    ///
+    /// Why: a bounded child inherits the caller's tool instances verbatim
+    /// (delegate.rs `bounded_base_tools`), so the inherited file tools
+    /// resolved relative paths in the CALLER's workspace. Measured live
+    /// 2026-10-28: a coder delegate's relative `file_write cwd-probe.txt`
+    /// landed in `/storage/agents/rocky/workspace/` instead of the coder
+    /// agent's own tree.
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+            persistent_writes: self.persistent_writes,
+        }
+    }
+
+    /// Diagnostic view of the workspace root this instance resolves
+    /// relative paths against — the runtime's delegate-workspace tests
+    /// observe the re-point delta through it.
+    pub fn workspace_root(&self) -> &Path {
+        &self.security.workspace_dir
+    }
 }
 
 #[async_trait]

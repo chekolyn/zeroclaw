@@ -15,6 +15,27 @@ impl GlobSearchTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
     }
+
+    /// A glob_search tool for a BOUNDED delegate child: the caller's policy
+    /// is preserved verbatim with ONE delta — the workspace root the glob
+    /// pattern resolves against moves to the TARGET agent's workspace (the
+    /// shell's `for_delegate_child` single-delta contract). A bounded
+    /// child's relative pattern must match files in its OWN tree, not the
+    /// caller's.
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+        }
+    }
+
+    /// Diagnostic view of the workspace root this instance resolves
+    /// relative patterns against — the runtime's delegate-workspace tests
+    /// observe the re-point delta through it.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.security.workspace_dir
+    }
 }
 
 #[async_trait]
