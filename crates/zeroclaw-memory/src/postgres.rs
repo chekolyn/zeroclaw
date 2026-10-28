@@ -681,6 +681,40 @@ fn recent_recall_sql_for_agents(
     )
 }
 
+/// The prefix enumeration: index-assisted, LIMITed in storage.
+///
+/// `key LIKE $1 || '%'` is served by the boot-time
+/// `idx_memories_key_btree` index (`text_pattern_ops` — the operator class
+/// that makes btree serve `LIKE 'prefix%'` under the default C-less
+/// collation), so the enumeration is an index range scan capped by LIMIT
+/// instead of the no-LIMIT full-table scan `list` runs (measured 15.2s on
+/// the prod leader's 50K-row store, canary v7). Placeholders: `$1` the
+/// LIKE-escaped prefix, `$2` session_id, `$3` the LIMIT.
+fn list_prefixed_sql(qualified_table: &str, qualified_agents: &str) -> String {
+    format!(
+        "
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+        FROM {qualified_table} m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+        WHERE m.key LIKE ($1 || '%')
+          AND ($2::TEXT IS NULL OR m.session_id = $2)
+        ORDER BY m.updated_at DESC
+        LIMIT $3
+        "
+    )
+}
+
+/// Escape a caller-supplied prefix for the LIKE predicate: `%` and `_` are
+/// LIKE wildcards and `\` is the LIKE escape character, so the tool's
+/// literal `starts_with` contract requires escaping all three before the
+/// `'%'` suffix is appended.
+fn escape_like_prefix(prefix: &str) -> String {
+    prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Bound ONE ranked recall attempt: sets `statement_timeout` to the soft
 /// recall budget, runs `run`, then restores the session default
 /// (`op_timeout`). The whole SET → query → restore sequence runs inside the
@@ -934,6 +968,47 @@ impl Memory for PostgresMemory {
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if prefix.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let prefix = escape_like_prefix(prefix);
+        let sid = session_id.map(str::to_string);
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let stmt = list_prefixed_sql(&qualified_table, &qualified_agents);
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+            let session_ref = sid.as_deref();
+
+            // Bound THIS attempt server-side at the soft recall budget — the
+            // same per-attempt cancel shape the ranked recall gets — so an
+            // over-budget enumeration is cancelled by the server and frees
+            // the shared connection instead of holding it until `op_timeout`.
+            let entries =
+                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                    let rows = client.query(&stmt, &[&prefix, &session_ref, &limit_i64])?;
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
+                })?;
+            Ok(entries)
         })
         .await
     }
@@ -1325,6 +1400,45 @@ mod tests {
         assert!(sql.contains("m.created_at >= $2::TIMESTAMPTZ"));
         assert!(sql.contains("m.created_at <= $3::TIMESTAMPTZ"));
         assert!(sql.contains("LIMIT $4"), "both time bounds → limit at $4, got: {sql}");
+    }
+
+    // Tuning cycle 5: the prefix enumeration must be an index-assisted,
+    // LIMITed query — the no-LIMIT full-table scan it used to ride through
+    // `list` measured 15.2s on the prod leader (canary v7).
+    #[test]
+    fn list_prefixed_sql_is_prefix_pushed_and_limited() {
+        let sql = list_prefixed_sql("mem.memories", "mem.agents");
+        assert!(
+            sql.contains("m.key LIKE ($1 || '%')"),
+            "the prefix predicate must be pushed into storage, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY m.updated_at DESC"),
+            "most-recent-first ordering matches the enumeration contract"
+        );
+        assert!(
+            sql.contains("LIMIT $3"),
+            "the LIMIT must be a bound parameter pushed into storage, got: {sql}"
+        );
+        assert!(
+            sql.contains("$2::TEXT IS NULL OR m.session_id = $2"),
+            "session scoping mirrors list, got: {sql}"
+        );
+        assert!(
+            sql.contains("LEFT JOIN mem.agents"),
+            "agent alias join kept"
+        );
+    }
+
+    #[test]
+    fn escape_like_prefix_neutralizes_like_wildcards() {
+        assert_eq!(escape_like_prefix("ws:"), "ws:");
+        assert_eq!(escape_like_prefix("100%"), "100\\%");
+        assert_eq!(escape_like_prefix("under_score"), "under\\_score");
+        assert_eq!(escape_like_prefix(r"back\slash"), r"back\\slash");
+        // Order matters: the escape character is escaped FIRST so the
+        // wildcard escapes it inserts are not themselves re-escaped.
+        assert_eq!(escape_like_prefix(r"\%"), r"\\\%");
     }
 
     #[test]
@@ -1854,6 +1968,160 @@ mod tests {
             index_present,
             "the composite recall index must persist after the schema-init"
         );
+    }
+
+    /// Live regression for the cycle-5 prefix enumeration: `list_prefixed`
+    /// must be served by the `idx_memories_key_btree` index
+    /// (`text_pattern_ops`) as an index (bitmap) scan — the no-LIMIT
+    /// full-table scan it replaced measured 15.2s on the prod leader's
+    /// 50K-row store, canary v7. The fixture seeds rare matches in a wide
+    /// table so the planner cannot satisfy the LIMIT from the recency index
+    /// with a cheap filter; the key btree is the plan that finds 10 matches
+    /// without touching the whole table.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_list_prefixed_uses_the_key_btree_index() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "prefixidx");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Constructs the table AND the recall indexes (boot DDL). The
+        // handle's only job here is the boot; the client it owns is dropped
+        // inside the runtime (DropOnThread moves the drop off-thread).
+        // Production shape: the pgvector column setup adds the
+        // namespace/importance columns the recall SELECTs read.
+        runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
+        });
+        drop(runtime);
+
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        let qualified_agents = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("agents")
+        );
+        // 30K wide rows, only 10 under the queried prefix: an updated_at
+        // index walk would filter every row before finding the LIMIT; the
+        // key btree goes straight to the matches.
+        schema
+            .admin
+            .batch_execute(&format!(
+                "INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'id_' || g, 'noise:' || g, repeat(md5(g::text), 16), 'daily', NOW(), NOW(),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 30000) g;
+                 INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'match_' || g, 'ws:cycle:' || g, repeat('m', 16), 'daily', NOW(), NOW(),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 10) g;",
+            ))
+            .expect("seeding the prefix-index fixture must succeed");
+
+        // ANALYZE so the planner has real stats for the cost decision.
+        schema
+            .admin
+            .batch_execute(&format!("ANALYZE {qualified_table};"))
+            .expect("ANALYZE must succeed");
+
+        let sql = list_prefixed_sql(&qualified_table, &qualified_agents);
+        let explain = schema
+            .admin
+            .query(&format!("EXPLAIN {sql}"), &[&"ws:cycle:", &None::<String>, &10i64])
+            .expect("EXPLAIN on the prefix query must succeed");
+        let plan: String = explain
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_memories_key_btree"),
+            "the prefix enumeration must be served by the key btree index, got plan:\n{plan}"
+        );
+    }
+
+    /// Live functional contract: only matching keys come back, most-recent
+    /// first, LIMIT respected in storage (not truncated client-side).
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_list_prefixed_returns_prefixed_rows_bounded() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "prefixrt");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
+
+            for i in 0..5 {
+                memory
+                    .store(&format!("evo:cycle:{i}"), &format!("cycle {i}"), MemoryCategory::Core, None)
+                    .await
+                    .unwrap();
+            }
+            memory
+                .store("other:1", "unrelated", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+
+            let limited = memory.list_prefixed("evo:cycle:", 3, None).await.unwrap();
+            assert_eq!(limited.len(), 3, "the LIMIT must be respected in storage");
+            assert!(
+                limited.iter().all(|e| e.key.starts_with("evo:cycle:")),
+                "only matching keys come back, got: {:?}",
+                limited.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+
+            let all = memory.list_prefixed("evo:cycle:", 100, None).await.unwrap();
+            assert_eq!(all.len(), 5, "the full enumeration stays available");
+
+            let none = memory.list_prefixed("absent:", 10, None).await.unwrap();
+            assert!(none.is_empty(), "a non-matching prefix enumerates nothing");
+
+            // LIKE wildcards in the prefix are literals, not patterns: the
+            // tool's contract is a literal starts_with.
+            let literal = memory.list_prefixed("evo:cycle:%", 10, None).await.unwrap();
+            assert!(
+                literal.is_empty(),
+                "a % in the prefix must be escaped, not treated as a wildcard"
+            );
+        });
     }
 
     #[test]

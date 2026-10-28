@@ -75,10 +75,23 @@ impl MemoryRecallTool {
 
     /// Handle prefix recall mode: list all entries whose key starts with `prefix`.
     async fn handle_prefix_recall(&self, prefix: &str, limit: usize) -> anyhow::Result<ToolResult> {
+        // The enumeration rides `list_prefixed` — the prefix-pushed,
+        // LIMITed contract — not the unbounded full-store `list` scan the
+        // mode used before cycle-5 (measured 15.2s on the prod leader,
+        // canary v7). The wall budget stays as the belt-and-braces bound on
+        // top of the storage-side LIMIT: a slow backend is still bounded,
+        // and an over-budget enumeration fails bounded (an enumeration has
+        // no recency-fallback semantic — a partial listing would overstate
+        // completeness).
         let listed = match self.prefix_list_budget {
             Some(budget) => {
                 let start = Instant::now();
-                match tokio::time::timeout(budget, self.memory.list(None, None)).await {
+                match tokio::time::timeout(
+                    budget,
+                    self.memory.list_prefixed(prefix, limit, None),
+                )
+                .await
+                {
                     Ok(listed) => listed,
                     Err(_) => {
                         let elapsed = start.elapsed();
@@ -103,9 +116,12 @@ impl MemoryRecallTool {
                     }
                 }
             }
-            None => self.memory.list(None, None).await,
+            None => self.memory.list_prefixed(prefix, limit, None).await,
         };
         let entries = listed?;
+        // `list_prefixed` pushes the prefix filter and the limit into
+        // storage; this re-check is a defensive contract pin so the tool's
+        // semantics hold regardless of a backend's override fidelity.
         let matched: Vec<_> = entries
             .into_iter()
             .filter(|e| e.key.starts_with(prefix))
@@ -342,8 +358,11 @@ mod tests {
     }
 
     /// Fake backend whose `list` sleeps (the measured prod pathology: the
-    /// prefix-recall path rides `list`, and the postgres `list` is a
-    /// no-LIMIT full-table scan — 15.2s measured on canary v7). The ranked
+    /// prefix-recall path rode the postgres `list` — a no-LIMIT full-table
+    /// scan — 15.2s measured on canary v7). The fake has no `list_prefixed`
+    /// override, so the tool's call composes the default through this slow
+    /// `list`: the test proves the LIST budget bounds the enumeration even
+    /// for a backend that never got the native override. The ranked
     /// `recall` stays instant so a test that times out proves the LIST
     /// budget, not the recall budget, is doing the bounding.
     struct SlowListMemory {
@@ -562,6 +581,214 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("prefixed entry"));
+    }
+
+    /// Fake backend distinguishing `list` from `list_prefixed` so the tool's
+    /// routing is observable: the prefix mode must ride `list_prefixed` — the
+    /// prefix-pushed, LIMITed contract — not the unbounded full-store `list`
+    /// scan (measured 15.2s on the prod leader's 50K-row postgres store,
+    /// canary v7, before the evo SOP's enumeration was bounded-failed).
+    struct PrefixRoutedMemory {
+        list_calls: std::sync::atomic::AtomicUsize,
+        list_prefixed_calls: std::sync::atomic::AtomicUsize,
+        last_prefix_limit: Mutex<Option<usize>>,
+    }
+
+    impl PrefixRoutedMemory {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                list_calls: std::sync::atomic::AtomicUsize::new(0),
+                list_prefixed_calls: std::sync::atomic::AtomicUsize::new(0),
+                last_prefix_limit: Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Memory for PrefixRoutedMemory {
+        fn name(&self) -> &str {
+            "prefix-routed"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![MemoryEntry {
+                principal_id: None,
+                id: "list-scan:1".into(),
+                key: "p:1".into(),
+                content: "list-scan entry".into(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-10-28T00:00:00Z".into(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }])
+        }
+
+        async fn list_prefixed(
+            &self,
+            _prefix: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.list_prefixed_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_prefix_limit.lock().unwrap() = Some(limit);
+            Ok(vec![MemoryEntry {
+                principal_id: None,
+                id: "prefixed:1".into(),
+                key: "p:1".into(),
+                content: "prefixed entry".into(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-10-28T00:00:00Z".into(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }])
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for PrefixRoutedMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "PrefixRoutedMemory"
+        }
+    }
+
+    /// The prefix-recall mode must route through `list_prefixed` — the
+    /// bounded, prefix-pushed enumeration contract — and must NOT ride the
+    /// unbounded full-store `list` scan the mode used before cycle-5.
+    #[tokio::test]
+    async fn prefix_recall_routes_through_list_prefixed() {
+        let mem = PrefixRoutedMemory::new();
+        let tool = MemoryRecallTool::new(mem.clone());
+
+        let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("prefixed entry"),
+            "the prefix mode must read the list_prefixed results; got {}",
+            result.output
+        );
+        assert_eq!(
+            mem.list_prefixed_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "prefix mode must call list_prefixed"
+        );
+        assert_eq!(
+            mem.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "prefix mode must not ride the unbounded full-store list scan"
+        );
+    }
+
+    /// The tool's `limit` must reach `list_prefixed` so a backend pushes the
+    /// bound into storage instead of truncating after a full scan.
+    #[tokio::test]
+    async fn prefix_recall_threads_limit_into_list_prefixed() {
+        let mem = PrefixRoutedMemory::new();
+        let tool = MemoryRecallTool::new(mem.clone());
+
+        let result = tool
+            .execute(json!({"prefix": "p:", "limit": 7}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            mem.list_prefixed_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        assert_eq!(*mem.last_prefix_limit.lock().unwrap(), Some(7));
     }
 
     struct QueryEchoMemory {
