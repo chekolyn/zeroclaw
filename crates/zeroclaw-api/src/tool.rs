@@ -1,6 +1,7 @@
 use crate::media::RenderedMarker;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use tokio_util::sync::CancellationToken;
 
 tokio::task_local! {
@@ -531,7 +532,7 @@ pub fn clear_runtime_approval(tool_name: &str, args: &mut serde_json::Value) {
 }
 
 #[async_trait]
-pub trait Tool: Send + Sync + crate::attribution::Attributable {
+pub trait Tool: Send + Sync + Any + crate::attribution::Attributable {
     /// True when this tool does work that does not carry the RPC principal's
     /// current authority: nested, scheduled or headless runs, turns on another
     /// agent, shared procedures, or other principals' sessions. Non-admin RPC

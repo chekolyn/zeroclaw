@@ -147,6 +147,53 @@ impl ShellTool {
         self.tui_env = env;
         self
     }
+
+    /// The workspace directory shell commands spawn in — the diagnostic
+    /// view of the effective cwd (the `SecurityPolicy.workspace_dir` this
+    /// instance passes to the runtime adapter). Test-visible so the
+    /// delegate workspace tests can assert what a bounded child inherits.
+    #[cfg(test)]
+    pub(crate) fn spawn_workspace_dir(&self) -> &std::path::Path {
+        &self.security.workspace_dir
+    }
+
+    /// A shell tool for a BOUNDED delegate child: everything about this
+    /// (the caller's) instance is preserved — command classification and
+    /// the allowed-command policy, the shared action tracker, the sandbox,
+    /// env forwarding, the steering guard, the timeout, and the
+    /// persistent-write posture — with ONE delta: the spawn cwd and the
+    /// workspace-boundary root are re-pointed at the TARGET agent's
+    /// workspace.
+    ///
+    /// Why: a bounded child inherits the caller's tool instances verbatim
+    /// (delegate.rs `bounded_base_tools`), so the inherited shell spawned
+    /// its commands in `self.security.workspace_dir` — the CALLER's
+    /// workspace. Measured live 2026-10-28: a coder delegate's
+    /// relative-path shell write landed in
+    /// `/storage/agents/rocky/workspace` instead of the coder agent's own
+    /// tree, and the child then self-reported a read-back PASS against a
+    /// file it could not actually see. A delegated agent that uses relative
+    /// paths must read and write its OWN tree.
+    ///
+    /// The workspace root moves; the command AUTHORITY does not: a bounded
+    /// child must not widen (or narrow) its shell policy by adopting the
+    /// target's. Cloning the policy keeps the caller's
+    /// [`PerSenderTracker`](zeroclaw_config::policy::PerSenderTracker)
+    /// buckets shared, so the child keeps consuming the caller's action
+    /// budget exactly as the inherited instance did.
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+            runtime: Arc::clone(&self.runtime),
+            sandbox: Arc::clone(&self.sandbox),
+            timeout_secs: self.timeout_secs,
+            steer_recursive_grep: self.steer_recursive_grep,
+            tui_env: self.tui_env.clone(),
+            persistent_writes: self.persistent_writes,
+        }
+    }
 }
 
 fn decode_output(bytes: &[u8]) -> String {

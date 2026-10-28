@@ -20,6 +20,18 @@ impl<T: Tool> RateLimitedTool<T> {
     pub fn new(inner: T, security: Arc<SecurityPolicy>) -> Self {
         Self { inner, security }
     }
+
+    /// Read-only access to the wrapped tool — registry-level surgery (e.g.
+    /// the delegate child's shell re-pointing) needs to rebuild the inner
+    /// instance while keeping the wrapper's rate-limit policy handle.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// The rate-limit policy this wrapper reserves actions against.
+    pub fn security(&self) -> &Arc<SecurityPolicy> {
+        &self.security
+    }
 }
 
 impl<T: Tool> Attributable for RateLimitedTool<T> {
