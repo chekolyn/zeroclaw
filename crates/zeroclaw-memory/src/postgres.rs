@@ -59,6 +59,19 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
     }
 }
 
+/// The one operation the boot recall-index attempts need, so the
+/// warn-and-continue path is unit-testable with a mock executor instead of a
+/// live PostgreSQL instance.
+trait DdlExecutor {
+    fn exec_batch(&mut self, sql: &str) -> Result<()>;
+}
+
+impl DdlExecutor for Client {
+    fn exec_batch(&mut self, sql: &str) -> Result<()> {
+        Client::batch_execute(self, sql).map_err(Into::into)
+    }
+}
+
 pub struct PostgresMemory {
     alias: String,
     client: DropOnThread<Arc<Mutex<Client>>>,
@@ -186,13 +199,7 @@ impl PostgresMemory {
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
-                let timeout_ms = op_timeout.as_millis();
-                client
-                    .batch_execute(&format!(
-                        "SET statement_timeout = {timeout_ms}; \
-                         SET idle_in_transaction_session_timeout = {timeout_ms};"
-                    ))
-                    .context("failed to apply PostgreSQL session timeouts")?;
+                let migration_started = std::time::Instant::now();
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
                 zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
@@ -209,6 +216,28 @@ impl PostgresMemory {
                     }
                     None => true,
                 };
+
+                // The boot DDL duration at INFO so future boots are measurable
+                // (the 2026-10-28 canary incident surfaced as an 88 s index
+                // build that was invisible in the boot logs).
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "duration_secs": migration_started.elapsed().as_secs_f64()
+                        })),
+                    "PostgreSQL boot schema migration completed"
+                );
+
+                // Restore the latency-bounded session for normal memory
+                // operations. The recall soft-budget wrapper
+                // (`with_statement_timeout`) still re-bounds each ranked
+                // recall attempt below this session default.
+                client
+                    .batch_execute(&Self::bounded_session_sql(op_timeout))
+                    .context("failed to apply PostgreSQL session timeouts")?;
+
                 Ok((client, pgvector_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
@@ -225,16 +254,55 @@ impl PostgresMemory {
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
-        client.batch_execute(&Self::ensure_schema_sql(schema_ident, qualified_table))?;
+        // Boot DDL is a one-time migration, not a latency-bounded query:
+        // exempt it from statement timeouts BEFORE any DDL runs. Without
+        // this, the session `op_timeout` — or a server/role default —
+        // cancels a long index build and, because a multi-statement
+        // `batch_execute` is a single implicit transaction, the cancel rolls
+        // the whole schema batch back so every boot retry re-attempts the
+        // same doomed build: a permanent crash-loop (canary 2026-10-28, an
+        // 88 s GIN build vs a 30 s `op_timeout`). The caller restores the
+        // bounded session with `bounded_session_sql` after the full boot
+        // migration sequence.
+        client
+            .batch_execute(Self::BOOT_DDL_SESSION_SQL)
+            .context("failed to exempt the boot schema DDL from statement timeouts")?;
+
+        // Load-bearing core: the schema and the table itself. A failure here
+        // is a genuine boot failure — every memory operation depends on it.
+        client.batch_execute(&Self::ensure_core_schema_sql(schema_ident, qualified_table))?;
+
+        // Optional recall indexes: a failed (or cancelled) build is a LOUD
+        // warning and CONTINUES — a boot must never die to an optional index.
+        Self::attempt_recall_indexes(client, qualified_table);
 
         Self::migrate_session_ids_to_sanitized(client, qualified_table)?;
 
         Ok(())
     }
 
-    /// The schema/bootstrap DDL. Extracted pure so the index contract is
-    /// unit-testable without a live PostgreSQL instance.
-    fn ensure_schema_sql(schema_ident: &str, qualified_table: &str) -> String {
+    /// The session guard for the boot-DDL migration window: unbounded
+    /// statement and idle-in-transaction timeouts. Issued at the start of
+    /// [`Self::init_schema`]; restored by `initialize_client` with
+    /// [`Self::bounded_session_sql`] once the boot migration sequence is
+    /// done. Recall queries are never affected: they only run after the
+    /// restore (and the per-attempt recall wrapper re-bounds them further).
+    const BOOT_DDL_SESSION_SQL: &str =
+        "SET statement_timeout = 0; SET idle_in_transaction_session_timeout = 0;";
+
+    /// The bounded session for normal (post-migration) memory operations.
+    /// The inverse of [`Self::BOOT_DDL_SESSION_SQL`].
+    fn bounded_session_sql(op_timeout: Duration) -> String {
+        let timeout_ms = op_timeout.as_millis();
+        format!(
+            "SET statement_timeout = {timeout_ms}; \
+             SET idle_in_transaction_session_timeout = {timeout_ms};"
+        )
+    }
+
+    /// The load-bearing boot DDL: the schema and the table. A failure here is
+    /// a genuine boot failure.
+    fn ensure_core_schema_sql(schema_ident: &str, qualified_table: &str) -> String {
         format!(
             "
             CREATE SCHEMA IF NOT EXISTS {schema_ident};
@@ -250,22 +318,89 @@ impl PostgresMemory {
             );
             -- Composite (agent_id, key) uniqueness lands in the V3 migration
             -- once the `agent_id` column is added and backfilled.
-
-            CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
-            CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
-            CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
-            CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
-            -- The recall WHERE clause matches on the CONCATENATION
-            -- `to_tsvector('simple', key || ' ' || content)`, which matches
-            -- neither single-column FTS index above: every recall seq-scanned
-            -- the whole table computing tsvectors per row (measured
-            -- 2026-10-27: 6.3–6.7s per recall on a 50K-row store). This index
-            -- makes the query a first-class filter.
-            CREATE INDEX IF NOT EXISTS idx_memories_key_content_fts ON {qualified_table} USING gin(to_tsvector('simple', key || ' ' || content));
-                CREATE INDEX IF NOT EXISTS idx_memories_key_btree ON {qualified_table}(key text_pattern_ops);
             "
         )
+    }
+
+    /// The optional recall indexes as ONE standalone `IF NOT EXISTS` statement
+    /// each (each its own implicit transaction, each individually retryable on
+    /// a later boot). Attempted individually by
+    /// [`Self::attempt_recall_indexes`].
+    fn recall_index_statements(qualified_table: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "idx_memories_category",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);"
+                ),
+            ),
+            (
+                "idx_memories_session_id",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);"
+                ),
+            ),
+            (
+                "idx_memories_updated_at",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);"
+                ),
+            ),
+            (
+                "idx_memories_content_fts",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));"
+                ),
+            ),
+            (
+                "idx_memories_key_fts",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));"
+                ),
+            ),
+            // The recall WHERE clause matches on the CONCATENATION
+            // `to_tsvector('simple', key || ' ' || content)`, which matches
+            // neither single-column FTS index above: every recall seq-scanned
+            // the whole table computing tsvectors per row (measured
+            // 2026-10-27: 6.3–6.7s per recall on a 50K-row store). This index
+            // makes the query a first-class filter.
+            (
+                "idx_memories_key_content_fts",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_key_content_fts ON {qualified_table} USING gin(to_tsvector('simple', key || ' ' || content));"
+                ),
+            ),
+            (
+                "idx_memories_key_btree",
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_key_btree ON {qualified_table}(key text_pattern_ops);"
+                ),
+            ),
+        ]
+    }
+
+    /// Attempt each optional recall index independently; a failure logs a
+    /// LOUD warning and CONTINUES. Recalls then degrade to the un-indexed
+    /// seq-scan shape (bounded by the session `op_timeout` and the recall
+    /// soft budget's recent-entries fallback) and the next boot retries the
+    /// build — a boot must never die to an optional index.
+    fn attempt_recall_indexes(executor: &mut impl DdlExecutor, qualified_table: &str) {
+        for (index_name, statement) in Self::recall_index_statements(qualified_table) {
+            if let Err(err) = executor.exec_batch(&statement) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "index": index_name,
+                            "error": err.to_string(),
+                        })),
+                    "Recall index failed to build at boot; continuing WITHOUT it — \
+                     recall degrades to the un-indexed/recent shapes and the next \
+                     boot retries the build"
+                );
+            }
+        }
     }
 
     fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
@@ -1171,16 +1306,133 @@ mod tests {
     }
 
     #[test]
-    fn ensure_schema_carries_the_composite_key_content_fts_index() {
-        let sql = PostgresMemory::ensure_schema_sql("mem", "mem.memories");
+    fn recall_index_statements_carry_the_composite_key_content_fts_index() {
+        let statements = PostgresMemory::recall_index_statements("mem.memories");
+        let composite = statements
+            .iter()
+            .find(|(name, _)| *name == "idx_memories_key_content_fts")
+            .expect("the composite index must be among the recall index statements")
+            .1
+            .clone();
         assert!(
-            sql.contains("idx_memories_key_content_fts"),
-            "the recall WHERE clause matches the key||' '||content concatenation; \
-             without an index on exactly that expression every recall seq-scans"
+            composite.contains("gin(to_tsvector('simple', key || ' ' || content))"),
+            "the index expression must match the WHERE expression for the planner to use it, got: {composite}"
+        );
+    }
+
+    /// The boot-DDL session guard must drop the statement timeout entirely:
+    /// it is what exempts the one-time migration from the session
+    /// `op_timeout` and any server/role default (canary 2026-10-28).
+    #[test]
+    fn boot_ddl_guard_exempts_statement_timeouts() {
+        let guard = PostgresMemory::BOOT_DDL_SESSION_SQL;
+        assert!(
+            guard.contains("SET statement_timeout = 0"),
+            "the boot-DDL guard must unbound statement_timeout, got: {guard:?}"
         );
         assert!(
-            sql.contains("gin(to_tsvector('simple', key || ' ' || content))"),
-            "the index expression must match the WHERE expression for the planner to use it"
+            guard.contains("SET idle_in_transaction_session_timeout = 0"),
+            "the boot-DDL guard must unbound idle_in_transaction_session_timeout, got: {guard:?}"
+        );
+    }
+
+    /// The restore after the migration window must carry the operation
+    /// timeout — the latency-bounded session normal operations (and the
+    /// recall soft budget) rely on must NOT stay unbounded.
+    #[test]
+    fn bounded_session_restore_carries_the_operation_timeout() {
+        let sql = PostgresMemory::bounded_session_sql(Duration::from_secs(30));
+        assert!(
+            sql.contains("SET statement_timeout = 30000"),
+            "the restore must carry the op_timeout for statement_timeout, got: {sql:?}"
+        );
+        assert!(
+            sql.contains("SET idle_in_transaction_session_timeout = 30000"),
+            "the restore must carry the op_timeout for idle_in_transaction_session_timeout, got: {sql:?}"
+        );
+        assert!(
+            !sql.contains("= 0"),
+            "the restore must not leave the session unbounded, got: {sql:?}"
+        );
+    }
+
+    /// Each recall index must be a standalone `IF NOT EXISTS` statement: its
+    /// own implicit transaction, individually retryable on a later boot, and
+    /// a failed build must not roll its siblings back.
+    #[test]
+    fn every_recall_index_statement_is_standalone_if_not_exists() {
+        let statements = PostgresMemory::recall_index_statements("mem.memories");
+        let mut names = statements.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let unique = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            unique,
+            "recall index names must be unique: {names:?}"
+        );
+        for (name, sql) in &statements {
+            assert!(
+                sql.contains(&format!("CREATE INDEX IF NOT EXISTS {name} ")),
+                "each recall index must be a standalone IF NOT EXISTS statement, got: {sql}"
+            );
+        }
+    }
+
+    /// The degradation guard: a failed (e.g. timeout-cancelled) index build
+    /// must be attempted, logged, and CONTINUED past — the remaining indexes
+    /// are still attempted and the boot proceeds without the failed one.
+    #[test]
+    fn attempt_recall_indexes_continues_past_a_failed_index_build() {
+        struct RecordingExecutor {
+            fail_on: &'static str,
+            attempted: Vec<String>,
+        }
+
+        impl DdlExecutor for RecordingExecutor {
+            fn exec_batch(&mut self, sql: &str) -> Result<()> {
+                self.attempted.push(sql.to_string());
+                if sql.contains(self.fail_on) {
+                    anyhow::bail!("canceling statement due to statement timeout");
+                }
+                Ok(())
+            }
+        }
+
+        let mut executor = RecordingExecutor {
+            fail_on: "idx_memories_key_content_fts",
+            attempted: Vec::new(),
+        };
+        PostgresMemory::attempt_recall_indexes(&mut executor, "mem.memories");
+
+        let expected: Vec<&str> = PostgresMemory::recall_index_statements("mem.memories")
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let attempted_names: Vec<&str> = executor
+            .attempted
+            .iter()
+            .map(|sql| {
+                expected
+                    .iter()
+                    .copied()
+                    .find(|name| sql.contains(name))
+                    .expect("every attempted statement must be one of the recall indexes")
+            })
+            .collect();
+        assert_eq!(
+            attempted_names, expected,
+            "every recall index must be attempted exactly once, in order"
+        );
+
+        let failed_pos = attempted_names
+            .iter()
+            .position(|n| *n == "idx_memories_key_content_fts")
+            .expect("the failing index must have been attempted");
+        let after = &attempted_names[failed_pos + 1..];
+        assert!(
+            after.contains(&"idx_memories_key_btree"),
+            "the boot must continue past the failed build: remaining indexes still attempted, got: {after:?}"
         );
     }
 
@@ -1450,6 +1702,108 @@ mod tests {
             assert!(memory.forget("ci_key").await.unwrap());
             assert_eq!(memory.count().await.unwrap(), 0);
         });
+    }
+
+    /// Seeds the boot-DDL regression fixture: the pre-V3 memories table shape
+    /// with enough rows that the GIN tsvector index builds measurably exceed a
+    /// 1 s `op_timeout` (calibrated 2026-10-28: ~3 s for the composite build).
+    fn seed_oversized_memories(admin: &mut Client, schema_name: &str) {
+        admin
+            .batch_execute(&format!(
+                "CREATE TABLE {schema}.memories (
+                    id TEXT PRIMARY KEY,
+                    key TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    session_id TEXT
+                );
+                INSERT INTO {schema}.memories (id, key, content, category, created_at, updated_at)
+                SELECT 'seed_' || g, 'seed_key_' || g, repeat(md5(g::text || 'bootddl'), 32),
+                       'daily', NOW(), NOW()
+                FROM generate_series(1, 100000) g;",
+                schema = quote_identifier(schema_name)
+            ))
+            .expect("seeding the oversized boot-DDL fixture must succeed");
+    }
+
+    /// Live regression for the 2026-10-28 canary boot crash-loop: the
+    /// boot-time schema DDL (including the `idx_memories_key_content_fts` GIN
+    /// build — measured 88 s on the 50 K-row canary store) ran under the
+    /// session-level `op_timeout` `statement_timeout`; the cancelled build
+    /// rolled back with the whole `batch_execute` implicit transaction, so
+    /// every boot retry re-attempted it and the pod never came up. The
+    /// contract: constructing the backend MUST succeed even when the
+    /// recall-index builds exceed the configured `op_timeout` — boot DDL is a
+    /// one-time migration, not a latency-bounded query.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_new_survives_recall_index_builds_slower_than_op_timeout() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "bootddl");
+        seed_oversized_memories(&mut schema.admin, &schema.name);
+
+        let memory = PostgresMemory::new(
+            "test",
+            &database_url,
+            &schema.name,
+            "memories",
+            Some(5),
+            Some(1), // op_timeout 1 s — far below the seeded index build time
+            Some(false),
+            None,
+            None,
+        )
+        .expect("boot must survive a recall-index build slower than op_timeout");
+
+        // The restored bounded session must still serve normal operations.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime.block_on(memory.health_check()),
+            "the session restored after the boot DDL must serve operations"
+        );
+    }
+
+    /// The timeout-exemption contract at the schema-init seam: a session with
+    /// `statement_timeout = 100ms` (the server/role-default scenario) must
+    /// still complete the boot schema-init — the DDL guard overrides the
+    /// session bound for the migration window — and the composite recall
+    /// index must actually persist (the incident's poison was the
+    /// transactional rollback losing the index on every retry).
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn init_schema_completes_under_a_bounded_statement_timeout() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "bootddl100");
+        seed_oversized_memories(&mut schema.admin, &schema.name);
+
+        let mut client = Client::connect(&database_url, NoTls).unwrap();
+        client.batch_execute("SET statement_timeout = 100").unwrap();
+
+        let schema_ident = quote_identifier(&schema.name);
+        let qualified_table = format!("{schema_ident}.{}", quote_identifier("memories"));
+        PostgresMemory::init_schema(&mut client, &schema_ident, &qualified_table)
+            .expect("schema-init must complete under a bounded session statement_timeout");
+
+        let index_present: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_indexes
+                    WHERE schemaname = $1 AND indexname = 'idx_memories_key_content_fts'
+                )",
+                &[&schema.name],
+            )
+            .unwrap()
+            .get(0);
+        assert!(
+            index_present,
+            "the composite recall index must persist after the schema-init"
+        );
     }
 
     #[test]
