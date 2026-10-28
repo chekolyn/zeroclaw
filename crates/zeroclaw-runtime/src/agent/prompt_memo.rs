@@ -173,14 +173,18 @@ pub(crate) fn reset_prompt_memo() {
         .take();
 }
 
-/// Serve the memoized prompt for `key`, if one is stored.
+/// Serve the memoized prompt for `key`, if one is stored. The hit/miss
+/// counters are PRODUCTION counters (the rules hook's injection row reads
+/// [`prompt_memo_stats`]): they increment unconditionally — a
+/// `#[cfg(test)]`-gated increment compiles away in production builds and
+/// left the rules row reading 0/0 forever (measured live 2026-10-28 on the
+/// canary battery across three byte-identical coder children).
 pub(crate) fn memoized_system_prompt(key: &PromptMemoKey) -> Option<Arc<String>> {
     let hit = PROMPT_MEMO
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .and_then(|map| map.get(key).cloned());
-    #[cfg(test)]
     if hit.is_some() {
         MEMO_HITS.fetch_add(1, Ordering::SeqCst);
     } else {
@@ -190,7 +194,9 @@ pub(crate) fn memoized_system_prompt(key: &PromptMemoKey) -> Option<Arc<String>>
 }
 
 /// Store a freshly rendered prompt under `key` (flushing the table first when
-/// at capacity) and return it shared.
+/// at capacity) and return it shared. The store is counted as a miss: the
+/// render path's observable shape is lookup-miss + store for the first child
+/// of an identity, and a bare lookup hit for every repeated child.
 pub(crate) fn store_system_prompt(key: PromptMemoKey, prompt: String) -> Arc<String> {
     let shared = Arc::new(prompt);
     let mut guard = PROMPT_MEMO
@@ -201,7 +207,6 @@ pub(crate) fn store_system_prompt(key: PromptMemoKey, prompt: String) -> Arc<Str
         *map = HashMap::new();
     }
     map.insert(key, Arc::clone(&shared));
-    #[cfg(test)]
     MEMO_MISSES.fetch_add(1, Ordering::SeqCst);
     drop(guard);
     shared
@@ -241,6 +246,44 @@ mod tests {
         assert_eq!(&*hit, "prompt-bytes");
         let (hits, _) = prompt_memo_stats();
         assert_eq!(hits, 1);
+    }
+
+    /// The counter CONTRACT the production rules row reads: the first
+    /// render of an identity costs exactly two misses (the lookup miss plus
+    /// the store recorded as a miss), and a second render of the SAME key
+    /// is exactly one hit with no further misses. The production counters
+    /// must move through the same unconditional code in every build — a
+    /// `#[cfg(test)]`-gated increment compiles away in production and leaves
+    /// the rules row reading 0/0 forever (measured live on the 2026-10-28
+    /// canary battery across three byte-identical coder children).
+    #[test]
+    fn counters_track_first_render_as_miss_and_second_as_hit() {
+        let _guard = MEMO_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_prompt_memo();
+        let workspace = std::env::temp_dir();
+        let k = key(PromptRenderShape::DelegateChild, "gamma", &workspace);
+
+        // First render of the identity: lookup miss + store-as-miss.
+        assert!(memoized_system_prompt(&k).is_none());
+        store_system_prompt(k.clone(), "bytes-v1".to_string());
+        let (hits_after_first, misses_after_first) = prompt_memo_stats();
+        assert_eq!(hits_after_first, 0, "a first render cannot hit");
+        assert_eq!(
+            misses_after_first, 2,
+            "the first render must record exactly the lookup miss and the store miss"
+        );
+
+        // Second render of the SAME key: exactly one hit, no new misses.
+        assert!(memoized_system_prompt(&k).is_some());
+        let (hits_after_second, misses_after_second) = prompt_memo_stats();
+        assert_eq!(
+            hits_after_second, 1,
+            "the repeated same-key render must be exactly one hit"
+        );
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "a hit must not record a miss"
+        );
     }
 
     #[test]
