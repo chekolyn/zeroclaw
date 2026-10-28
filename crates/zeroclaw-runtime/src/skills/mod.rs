@@ -1689,6 +1689,16 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
         zeroclaw_config::schema::SkillsPromptInjectionMode::Full
     );
 
+    // Render-site canonical order: sort a LOCAL COPY by name so the section
+    // bytes are a pure function of the skill SET, not of the loader's
+    // enumeration order (`read_dir` is unsorted; the loader cache
+    // invalidates on dir-signature change and re-enumerates, so the order
+    // the renderer receives can differ between fresh assemblies). The
+    // loader's order is untouched — skill-tool matching and the memo's
+    // ordered `skills_hash` depend on it.
+    let mut ordered: Vec<&Skill> = skills.iter().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut prompt = if is_full {
         String::from(
             "## Available Skills\n\n\
@@ -1707,7 +1717,7 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
         )
     };
 
-    for skill in skills {
+    for skill in ordered {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
@@ -4996,6 +5006,82 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    // ── M4: render-site canonical order (re-order landing 1) ────────────────
+    //
+    // `load_skills_from_directory_uncached` enumerates skill dirs with
+    // unsorted `read_dir`, so two fresh loads of one workspace can hand the
+    // renderer different orders (episodic re-order class: the loader cache
+    // invalidates on dir-signature change and re-enumerates). The render-site
+    // sort makes the section bytes a pure function of the skill SET; the
+    // loader order itself is untouched (skill-tool matching and the memo's
+    // ordered skills_hash depend on it).
+
+    #[test]
+    fn skills_section_order_stable_across_read_dir_orders() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        // Creation order deliberately differs from name order: whatever
+        // order read_dir yields, the renderer must canonicalize it.
+        for (dir_name, skill_name, description) in [
+            ("zulu-skill", "zulu-skill", "last by name"),
+            ("alpha-skill", "alpha-skill", "first by name"),
+            ("mid-skill", "mid-skill", "middle by name"),
+        ] {
+            let dir = skills_dir.join(dir_name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {skill_name}\ndescription: {description}\n---\n# {skill_name}\n"),
+            )
+            .unwrap();
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        assert!(dropped.is_empty(), "all three skills must load: {dropped:?}");
+        assert_eq!(skills.len(), 3, "all three skills must load");
+
+        // The loaded (read_dir) order, its reverse, and a fresh unsorted
+        // construction all simulate different enumeration orders the
+        // renderer may receive; every rendering must be byte-identical.
+        let rendered_forward = skills_to_prompt_with_mode(
+            &skills,
+            tmp.path(),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+        let mut reversed: Vec<Skill> = skills.iter().rev().cloned().collect();
+        let rendered_reversed = skills_to_prompt_with_mode(
+            &reversed,
+            tmp.path(),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+        assert_ne!(
+            skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            reversed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            "test setup must hand the renderer two DIFFERENT input orders"
+        );
+        assert_eq!(
+            rendered_forward, rendered_reversed,
+            "the skills section bytes must not depend on the loader's enumeration order"
+        );
+
+        // The canonical order is name-sorted: the <name> elements appear in
+        // ascending order in the rendered section.
+        let names_in_render: Vec<String> = rendered_forward
+            .split("<name>")
+            .skip(1)
+            .filter_map(|chunk| chunk.split("</name>").next())
+            .map(String::from)
+            .collect();
+        let mut sorted_names = names_in_render.clone();
+        sorted_names.sort();
+        assert_eq!(
+            names_in_render, sorted_names,
+            "the render-site sort must emit skills in ascending name order"
         );
     }
 
