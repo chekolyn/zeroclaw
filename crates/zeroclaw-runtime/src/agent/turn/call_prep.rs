@@ -515,6 +515,7 @@ mod tests {
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
+            turn_started_at: std::time::Instant::now(),
             agent_alias: None,
             parent_agent_alias: None,
             serving_provider_name: None,

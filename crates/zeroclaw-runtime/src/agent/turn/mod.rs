@@ -1659,6 +1659,12 @@ async fn run_tool_call_loop_impl<'a>(
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
 ) -> Result<String> {
+    // Engine-entry clock: the `pre_call_ms` attr on every `llm_request` row
+    // measures from here, so the pre-request segment (memory recall, dispatch
+    // prep) — the stretch the 2026-10-27/28 prod captures showed as a dark
+    // gap between the rules-inject row and the first provider send — is
+    // attributable from a single trace row.
+    let turn_started_at = std::time::Instant::now();
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1907,6 +1913,7 @@ async fn run_tool_call_loop_impl<'a>(
         channel,
         draft_reasoning: knobs.draft_reasoning,
         turn_id,
+        turn_started_at,
         agent_alias,
         parent_agent_alias,
         serving_provider_name: None,
@@ -6654,6 +6661,7 @@ mod active_route_context_tests {
             channel: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "vision-route-context",
+            turn_started_at: std::time::Instant::now(),
             agent_alias: Some("coder"),
             parent_agent_alias: None,
             serving_provider_name: None,

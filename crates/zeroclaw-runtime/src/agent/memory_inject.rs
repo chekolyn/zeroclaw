@@ -321,6 +321,7 @@ pub async fn render_memory_context(
     }
     let duration = start.elapsed();
 
+    let memory_backend_label = backend.clone();
     observer.record_event(&ObserverEvent::MemoryRecall {
         query_summary,
         duration,
@@ -331,6 +332,31 @@ pub async fn render_memory_context(
         agent_alias: turn.agent_alias.map(str::to_string),
         turn_id: Some(turn.turn_id.to_string()),
     });
+
+    // Trace-row twin of the observer event: the observer metrics do not reach
+    // runtime-trace.jsonl, so the pre-request memory segment — the stretch the
+    // 2026-10-27/28 prod captures showed as a dark gap between the
+    // rules-inject row and the first `llm_request` — was invisible in traces.
+    // One row here lights that segment up for every turn path.
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(if any_ok {
+                ::zeroclaw_log::EventOutcome::Success
+            } else {
+                ::zeroclaw_log::EventOutcome::Failure
+            })
+            .with_attrs(::serde_json::json!({
+                "memory_inject_ms": duration.as_millis() as u64,
+                "memory_entries": entries.len(),
+                "memory_backend": memory_backend_label,
+                "memory_scopes": sessions.len(),
+                "memory_exclude_conversation": exclude_conversation,
+                "turn_id": turn.turn_id,
+            })),
+        "turn memory recall completed"
+    );
 
     if cfg.rerank_enabled {
         // Relevance plane: blend (retrieval + importance + recency), collapse

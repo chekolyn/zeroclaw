@@ -3611,6 +3611,50 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 zeroclaw_runtime::agent::cost::TurnUsage::default(),
             ))
         });
+        // Webhook turn attribution: mirror the dashboard-chat scope span
+        // (ws.rs) and the ACP server span (acp_server.rs) so every trace row
+        // of a webhook turn carries non-empty zc attrs (channel_type,
+        // agent_alias, model_provider, model, session_key). The
+        // process_message path's own spans only cover
+        // risk_profile/runtime_profile/memory_namespace — the 2026-10-28
+        // prod capture showed webhook rows with an empty attribution block
+        // while ACP/wss rows carried the full set.
+        let span_model = config
+            .resolved_model_provider_for_agent(&agent_alias)
+            .and_then(|(_, _, entry)| {
+                entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        let span_provider = config
+            .resolved_model_provider_for_agent(&agent_alias)
+            .map(|(provider_name, _, _)| provider_name.to_string())
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        // Session-key shape follows the gateway session registry (gw_-prefixed
+        // on the SSE/dashboard paths): a caller-supplied X-Session-Id scopes
+        // the rows; a headerless turn gets a fresh per-turn key so the rows
+        // stay attributable without pretending a session exists.
+        let span_session_src = session_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let span_session_key = format!(
+            "webhook_{}",
+            zeroclaw_api::session_keys::sanitize_session_key(&span_session_src)
+        );
+        let turn_span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            channel = "webhook",
+            agent_alias = %agent_alias,
+            model_provider = %span_provider,
+            model = %span_model,
+            session_key = %span_session_key,
+        );
+        use ::zeroclaw_log::Instrument as _;
         let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -3623,7 +3667,8 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                     Some(execution_admission),
-                ),
+                )
+                .instrument(turn_span),
             ),
         ))
         .await?;
@@ -4676,13 +4721,30 @@ async fn dispatch_gateway_turn_streaming_with_agent(
             zeroclaw_runtime::agent::cost::TurnUsage::default(),
         ))
     });
+    // Webhook turn attribution: same scope-span shape as the dashboard chat
+    // (ws.rs) and the ACP server (acp_server.rs) so SSE-webhook rows carry
+    // non-empty zc attrs. `attribution_fields` mirrors what those paths stamp;
+    // the session_key is the gateway session key the caller already reserved.
+    let (span_agent_alias, span_provider, span_model) = agent.attribution_fields();
+    let turn_span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        channel = "webhook",
+        agent_alias = %span_agent_alias,
+        model_provider = %span_provider,
+        model = %span_model,
+        session_key = %session_key,
+    );
+    use ::zeroclaw_log::Instrument as _;
     let (response, _) = Box::pin(zeroclaw_runtime::agent::loop_::scope_session_key(
         Some(session_key.to_owned()),
         zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
             turn_usage,
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                agent.turn_streamed(message, event_tx, Some(cancel_token.clone())),
+                agent
+                    .turn_streamed(message, event_tx, Some(cancel_token.clone()))
+                    .instrument(turn_span),
             ),
         ),
     ))
@@ -10540,6 +10602,52 @@ data: [DONE]\n\n";
         let stats = by_agent.get("web").expect("agent alias attribution");
         assert_eq!(stats.total_tokens, 15);
         assert!(stats.cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_rows_carry_attribution_and_pre_call() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, _tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+
+        let text = collect_production_sse(&state, "attribution probe", "attr-session").await;
+        assert!(
+            text.contains("event: done") && !text.contains("event: error"),
+            "successful production-shaped turn must finish: {text}"
+        );
+        zeroclaw_log::clear_broadcast_hook();
+
+        // The turn's llm_request row must carry the webhook attribution set
+        // (channel_type/agent_alias/model/session_key) — parity with the ACP
+        // and dashboard-wss rows — plus the engine-entry pre_call_ms. Filter
+        // by this test's unique session key so concurrent fixture turns that
+        // also emit llm_request rows cannot satisfy the assertion.
+        let mut attributed = Vec::new();
+        while let Ok(value) = receiver.try_recv() {
+            if value.get("message").and_then(|m| m.as_str()) == Some("llm_request")
+                && value["zeroclaw"]["session_key"].as_str() == Some("gw_attr-session")
+            {
+                attributed.push(value);
+            }
+        }
+        assert_eq!(
+            attributed.len(),
+            1,
+            "exactly one llm_request row for this session, got: {attributed:?}"
+        );
+        let row = &attributed[0];
+        assert_eq!(row["zeroclaw"]["channel_type"], "webhook");
+        assert_eq!(row["zeroclaw"]["agent_alias"], "web");
+        assert_eq!(row["zeroclaw"]["model"], "fixture-model");
+        assert!(
+            row["attributes"]["pre_call_ms"].is_u64(),
+            "llm_request must carry pre_call_ms, got: {row}"
+        );
     }
 
     #[tokio::test]

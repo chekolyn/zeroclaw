@@ -19794,6 +19794,157 @@ Let me check the result."#;
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn memory_inject_row_lights_up_the_pre_request_segment() {
+        use super::{ToolLoop, run_tool_call_loop};
+        use crate::observability::noop::NoopObserver;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let mem = StaticRecallMemory;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hello".to_string()),
+        ];
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 1,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                max_turn_prompt_tokens: None,
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: Some(crate::agent::memory_inject::TurnMemory {
+                handle: &mem,
+                query: "hello".to_string(),
+                sessions: vec![None],
+                suppress: false,
+                cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+            }),
+            ingress: zeroclaw_api::ingress::IngressContext::from_origin(
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
+            ),
+            agent_alias: None,
+            turn_id: "inject-turn-id",
+        })
+        .await
+        .expect("loop should succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut inject_row = None;
+        let mut llm_request_row = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    match value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                    {
+                        Some("turn memory recall completed") => inject_row = Some(value),
+                        Some("llm_request") => llm_request_row = Some(value),
+                        _ => {}
+                    }
+                    if inject_row.is_some() && llm_request_row.is_some() {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = inject_row.expect("memory-inject row must be emitted inside the engine");
+        assert_eq!(
+            value["attributes"]["memory_backend"], "static-recall",
+            "the inject row must name the backend, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["memory_entries"], 1,
+            "the inject row must carry the recalled entry count, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["memory_scopes"], 1,
+            "the inject row must carry the scope count, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["turn_id"], "inject-turn-id",
+            "the inject row must carry the turn id, got: {value}"
+        );
+        assert!(
+            value["attributes"]["memory_inject_ms"].is_u64(),
+            "the inject row must carry its elapsed ms, got: {value}"
+        );
+
+        // The same capture pins the pre_call_ms attr: the llm_request row
+        // must measure from engine entry so the pre-request segment (hooks,
+        // recall, dispatch prep) is attributable from one attr.
+        let llm = llm_request_row.expect("the loop must emit an llm_request row");
+        assert!(
+            llm["attributes"]["pre_call_ms"].is_u64(),
+            "llm_request must carry pre_call_ms, got: {llm}"
+        );
+    }
+
     fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
         use std::collections::HashMap;
         let mut model_pricing: HashMap<String, f64> = HashMap::new();

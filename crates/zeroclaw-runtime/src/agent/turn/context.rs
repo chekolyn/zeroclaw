@@ -6,6 +6,7 @@ use super::events::DraftEvent;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
+use std::time::Instant;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
@@ -35,6 +36,10 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) channel: Option<&'a dyn Channel>,
     pub(crate) draft_reasoning: StreamReasoningMode,
     pub(crate) turn_id: &'a str,
+    /// Engine-entry wall clock, taken at `run_tool_call_loop_impl` start.
+    /// `pre_call_ms` on the `llm_request` rows reads it so the pre-request
+    /// segment (memory recall, dispatch prep) is measurable from one attr.
+    pub(crate) turn_started_at: Instant,
     pub(crate) agent_alias: Option<&'a str>,
     /// The delegating agent's alias when this loop is a nested cross-agent
     /// execution (a live SOP step naming a different agent): `agent_alias` is
@@ -102,6 +107,7 @@ impl<'a> TurnCtx<'a> {
             channel: self.channel,
             draft_reasoning: self.draft_reasoning,
             turn_id: self.turn_id,
+            turn_started_at: std::time::Instant::now(),
             agent_alias: self.agent_alias,
             parent_agent_alias: self.parent_agent_alias,
             serving_provider_name: Some(provider_name.to_string()),

@@ -348,6 +348,7 @@ mod tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "trace-approval-gate",
+            turn_started_at: std::time::Instant::now(),
             serving_provider_name: None,
             serving_model: None,
         }
@@ -702,6 +703,7 @@ mod tests {
             channel: Some(&channel),
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "turn-approval",
+            turn_started_at: std::time::Instant::now(),
             agent_alias: Some("default"),
             parent_agent_alias: None,
             serving_provider_name: None,
