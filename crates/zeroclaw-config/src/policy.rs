@@ -423,6 +423,13 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "find".into(),
         "echo".into(),
         "pwd".into(),
+        // `realpath` is the only path-verification primitive the shell
+        // allowlist carries: a bounded delegate child uses it to prove
+        // where its files actually landed (the 2026-10-28 canary battery
+        // measured a coder child claiming a write location it could not
+        // verify because realpath was absent). Read-only canonicalization;
+        // classified Low by the risk tables.
+        "realpath".into(),
         "wc".into(),
         "head".into(),
         "tail".into(),
@@ -467,6 +474,7 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "grep".into(),
         "find".into(),
         "pwd".into(),
+        "realpath".into(),
         "wc".into(),
         "head".into(),
         "tail".into(),
@@ -5886,6 +5894,42 @@ mod tests {
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
         assert!(p.is_command_allowed("date"));
+    }
+
+    /// `realpath` is the only path-verification primitive a bounded
+    /// delegate child can use to prove where its files actually landed
+    /// (measured live 2026-10-28: a coder delegate's relative write landed
+    /// in the PARENT's tree and the child could not run `realpath` to
+    /// detect it). It is read-only (pure path canonicalization), so it
+    /// belongs on the default allowlist beside `pwd`/`ls`/`find`. The
+    /// allowlist delta must be exactly this one entry: the other measured
+    /// blocked commands stay blocked.
+    #[test]
+    fn default_allowlist_includes_realpath_and_widens_nothing_else() {
+        let p = default_policy();
+        assert!(
+            p.allowed_commands.iter().any(|c| c == "realpath"),
+            "realpath must be an explicit default allowlist entry"
+        );
+        assert!(
+            p.is_command_allowed("realpath ."),
+            "a delegate child must be able to resolve its effective location"
+        );
+        assert!(
+            p.is_command_allowed("realpath ../sibling/file.txt | cat"),
+            "pipelines made only of allowlisted commands stay allowed"
+        );
+        // No widening beyond the single entry: the measured-blocked set and
+        // the risk classifier are untouched.
+        assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(!p.is_command_allowed("curl http://evil.com"));
+        assert!(!p.is_command_allowed("wget http://evil.com"));
+        assert!(!p.is_command_allowed("sudo realpath /etc/shadow"));
+        assert_eq!(
+            p.command_risk_level("realpath ."),
+            CommandRiskLevel::Low,
+            "realpath stays a read-only, low-risk command"
+        );
     }
 
     #[test]
