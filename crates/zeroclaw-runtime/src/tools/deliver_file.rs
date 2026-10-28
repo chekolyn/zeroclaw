@@ -44,6 +44,28 @@ impl DeliverFileTool {
         Self { security }
     }
 
+    /// A deliver_file tool for a BOUNDED delegate child: the caller's
+    /// policy is preserved verbatim with ONE delta — the workspace root
+    /// moves to the TARGET agent's workspace (the
+    /// [`super::shell::ShellTool::for_delegate_child`] single-delta
+    /// contract). A bounded child's relative source path must resolve in
+    /// its OWN tree, not the caller's.
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+        }
+    }
+
+    /// Diagnostic view of the workspace root this instance resolves
+    /// relative paths against — the delegate-workspace tests observe the
+    /// re-point delta through it.
+    #[cfg(test)]
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.security.workspace_dir
+    }
+
     fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
         if path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");

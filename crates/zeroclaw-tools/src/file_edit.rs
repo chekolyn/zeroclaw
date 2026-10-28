@@ -26,6 +26,28 @@ impl FileEditTool {
             persistent_writes,
         }
     }
+
+    /// A file tool for a BOUNDED delegate child: the caller's policy is
+    /// preserved verbatim with ONE delta — the workspace root this tool
+    /// resolves the edit target against moves to the TARGET agent's
+    /// workspace (the shell's `for_delegate_child` single-delta contract).
+    /// A bounded child's relative edit target must resolve in its OWN tree,
+    /// not the caller's.
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+            persistent_writes: self.persistent_writes,
+        }
+    }
+
+    /// Diagnostic view of the workspace root this instance resolves
+    /// relative paths against — the runtime's delegate-workspace tests
+    /// observe the re-point delta through it.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.security.workspace_dir
+    }
 }
 
 #[async_trait]

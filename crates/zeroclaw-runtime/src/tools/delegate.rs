@@ -1081,6 +1081,32 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
+    /// The workspace root a bounded child's inherited workspace-anchored
+    /// tools should run in, or `None` to keep the inherited instances
+    /// verbatim: configless builders have no config to resolve the target's
+    /// workspace from, and a depth-0 caller carrying a SESSION workspace
+    /// override (#7263) deliberately keeps its whole toolset in the caller's
+    /// session directory. Nested hops (depth > 0) have no user session
+    /// behind them — the caller's effective workspace there is the inherited
+    /// carry, not a session — so they always re-point at their own target's
+    /// workspace.
+    fn bounded_child_target_workspace(
+        &self,
+        config: &Config,
+        target_alias: &str,
+    ) -> Option<std::path::PathBuf> {
+        if self.depth == 0 {
+            let caller_config_workspace = config.agent_workspace_dir(&self.caller_alias);
+            if caller_config_workspace.as_path() != self.security.workspace_dir.as_path() {
+                // Session workspace override on the caller (#7263): the
+                // whole child toolset runs in the caller's session directory
+                // by design.
+                return None;
+            }
+        }
+        Some(config.agent_workspace_dir(target_alias))
+    }
+
     /// Re-point the shell tool a BOUNDED delegate child inherits at the
     /// TARGET agent's workspace.
     ///
@@ -1098,15 +1124,9 @@ impl DelegateTool {
     /// steering guard, timeout) is preserved — only the workspace root
     /// moves.
     ///
-    /// #7263 carve-out: when the CALLER's policy carries a SESSION workspace
-    /// override (its `workspace_dir` differs from its config-derived agent
-    /// workspace), the bounded child deliberately works in the caller's
-    /// session directory across its whole toolset
-    /// (`delegate_target_inherits_caller_session_workspace_dir`), so the
-    /// inherited shell is left untouched at the root hop. Nested hops
-    /// (`self.depth > 0`) have no user session behind them — the caller's
-    /// effective workspace there is the inherited carry, not a session — so
-    /// they always re-point at their own target's workspace.
+    /// The #7263 session carve-out and the configless guard live in
+    /// [`Self::bounded_child_target_workspace`], shared with the file-family
+    /// re-point below.
     fn repoint_child_shell_to_target_workspace(
         &self,
         tools: Vec<Arc<dyn Tool>>,
@@ -1117,16 +1137,10 @@ impl DelegateTool {
             // Configless builders keep the inherited instance verbatim.
             return tools;
         };
-        if self.depth == 0 {
-            let caller_config_workspace = config.agent_workspace_dir(&self.caller_alias);
-            if caller_config_workspace.as_path() != self.security.workspace_dir.as_path() {
-                // Session workspace override on the caller (#7263): the
-                // whole child toolset runs in the caller's session directory
-                // by design.
-                return tools;
-            }
-        }
-        let target_workspace = config.agent_workspace_dir(target_alias);
+        let Some(target_workspace) = self.bounded_child_target_workspace(config, target_alias)
+        else {
+            return tools;
+        };
         tools
             .into_iter()
             .map(|tool| {
@@ -1160,6 +1174,117 @@ impl DelegateTool {
                 tool
             })
             .collect()
+    }
+
+    /// Re-point the workspace-anchored FILE tools a BOUNDED delegate child
+    /// inherits at the TARGET agent's workspace — the same single-delta
+    /// treatment [`Self::repoint_child_shell_to_target_workspace`] gives
+    /// the shell.
+    ///
+    /// A bounded child inherits the caller's tool instances verbatim
+    /// (`bounded_base_tools`), and every file tool resolves relative paths
+    /// through its own `SecurityPolicy.workspace_dir`
+    /// (`SecurityPolicy::resolve_tool_path`), so the inherited
+    /// file_read/file_write/file_edit/deliver_file/glob_search/
+    /// content_search instances resolved relative paths in the CALLER's
+    /// workspace. Measured live 2026-10-28 (canary v10 battery): a coder
+    /// delegate's relative `file_write cwd-probe.txt` landed in
+    /// `/storage/agents/rocky/workspace/` (the parent's) instead of the
+    /// coder agent's own tree, and the child's `file_read` then "confirmed"
+    /// the wrong location — the cycle-6 fix re-pointed only the shell.
+    ///
+    /// The workspace root moves; the AUTHORITY does not: each rebuilt inner
+    /// keeps the caller's policy (allowlists, forbidden paths, allowed
+    /// roots, shared tracker), and both wrapper handles — the rate-limit
+    /// policy (shared tracker + ceiling) and the path-guard policy — stay
+    /// the caller's Arcs. A differently-wrapped entry (plugin/skill
+    /// variants) is left untouched rather than guessed.
+    fn repoint_child_file_tools_to_target_workspace(
+        &self,
+        tools: Vec<Arc<dyn Tool>>,
+        config: Option<&Config>,
+        target_alias: &str,
+    ) -> Vec<Arc<dyn Tool>> {
+        let Some(config) = config else {
+            // Configless builders keep the inherited instances verbatim.
+            return tools;
+        };
+        let Some(target_workspace) = self.bounded_child_target_workspace(config, target_alias)
+        else {
+            return tools;
+        };
+        tools
+            .into_iter()
+            .map(|tool| {
+                let name = tool.name().to_string();
+                match name.as_str() {
+                    "file_read" => Self::repoint_guarded_file_entry::<crate::tools::FileReadTool>(
+                        &tool,
+                        &target_workspace,
+                    )
+                    .unwrap_or(tool),
+                    "file_write" => {
+                        Self::repoint_guarded_file_entry::<crate::tools::FileWriteTool>(
+                            &tool,
+                            &target_workspace,
+                        )
+                        .unwrap_or(tool)
+                    }
+                    "file_edit" => Self::repoint_guarded_file_entry::<crate::tools::FileEditTool>(
+                        &tool,
+                        &target_workspace,
+                    )
+                    .unwrap_or(tool),
+                    "deliver_file" => {
+                        Self::repoint_guarded_file_entry::<crate::tools::DeliverFileTool>(
+                            &tool,
+                            &target_workspace,
+                        )
+                        .unwrap_or(tool)
+                    }
+                    "glob_search" => {
+                        Self::repoint_guarded_file_entry::<crate::tools::GlobSearchTool>(
+                            &tool,
+                            &target_workspace,
+                        )
+                        .unwrap_or(tool)
+                    }
+                    "content_search" => {
+                        Self::repoint_guarded_file_entry::<crate::tools::ContentSearchTool>(
+                            &tool,
+                            &target_workspace,
+                        )
+                        .unwrap_or(tool)
+                    }
+                    _ => tool,
+                }
+            })
+            .collect()
+    }
+
+    /// Rebuild one `RateLimitedTool<PathGuardedTool<T>>` registry entry
+    /// with the inner instance's workspace re-pointed at the target
+    /// agent's workspace; `None` when the entry is not that shape (the
+    /// caller keeps the inherited instance rather than guess).
+    fn repoint_guarded_file_entry<T>(
+        tool: &Arc<dyn Tool>,
+        target_workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>>
+    where
+        T: Tool + DelegateChildFileRepoint + 'static,
+    {
+        let probe: Arc<dyn std::any::Any + Send + Sync> = tool.clone();
+        let wrapper = probe
+            .downcast_ref::<crate::tools::RateLimitedTool<crate::tools::PathGuardedTool<T>>>()?;
+        let guard = wrapper.inner();
+        let child_inner =
+            guard
+                .inner()
+                .for_delegate_child_workspace(target_workspace.to_path_buf());
+        Some(Arc::new(crate::tools::RateLimitedTool::new(
+            crate::tools::PathGuardedTool::new(child_inner, Arc::clone(guard.security())),
+            Arc::clone(wrapper.security()),
+        )))
     }
 
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
@@ -2906,6 +3031,56 @@ impl Tool for DelegateTool {
 
         // --- Synchronous delegation (original path) ---
         self.execute_sync(agent_name, prompt, &args).await
+    }
+}
+
+/// The workspace-anchored FILE family a bounded delegate child inherits.
+/// Every member resolves relative paths against its own policy's
+/// workspace root (`SecurityPolicy::resolve_tool_path`), so a bounded
+/// child's inherited instances need the shell's single-delta treatment:
+/// the workspace root moves to the TARGET agent's workspace while the
+/// policy's authority surface (allowlists, forbidden paths, allowed
+/// roots, shared tracker) stays the caller's. The constructors live on
+/// each tool ([`crate::tools::FileReadTool::for_delegate_child`] and
+/// siblings); this trait exists so one generic rebuild site can drive
+/// them all through the wrapper stack.
+trait DelegateChildFileRepoint: Sized {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self;
+}
+
+impl DelegateChildFileRepoint for crate::tools::FileReadTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
+    }
+}
+
+impl DelegateChildFileRepoint for crate::tools::FileWriteTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
+    }
+}
+
+impl DelegateChildFileRepoint for crate::tools::FileEditTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
+    }
+}
+
+impl DelegateChildFileRepoint for crate::tools::DeliverFileTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
+    }
+}
+
+impl DelegateChildFileRepoint for crate::tools::GlobSearchTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
+    }
+}
+
+impl DelegateChildFileRepoint for crate::tools::ContentSearchTool {
+    fn for_delegate_child_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        self.for_delegate_child(workspace)
     }
 }
 
@@ -5568,6 +5743,16 @@ impl DelegateTool {
                 // wrote into the wrong agent's tree. Every other inherited
                 // instance stays verbatim.
                 let bounded_base_tools = self.repoint_child_shell_to_target_workspace(
+                    bounded_base_tools,
+                    target_config.or(self.root_config.as_deref()),
+                    agent_name,
+                );
+                // The child's file tools must resolve relative paths in the
+                // TARGET agent's workspace for the same reason (cycle 6b):
+                // the inherited instances carried the CALLER's workspace
+                // root, so a relative `file_write` from a coder delegate
+                // landed in the caller's tree.
+                let bounded_base_tools = self.repoint_child_file_tools_to_target_workspace(
                     bounded_base_tools,
                     target_config.or(self.root_config.as_deref()),
                     agent_name,
@@ -10684,6 +10869,517 @@ mod tests {
             observed_workspace(repointed).as_deref(),
             Some(target_workspace.as_path()),
             "a root hop without a session override re-points at the target workspace"
+        );
+    }
+
+    /// Config for the bounded-child file-tool workspace fixtures: caller
+    /// and coder target with DISTINCT per-agent workspaces, a bare delegates
+    /// entry (bounded), one shared risk profile admitting the file tools.
+    fn child_file_workspace_config(
+        root: &Path,
+        caller_workspace: &Path,
+        target_workspace: &Path,
+    ) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::multi_agent::AgentWorkspaceConfig;
+
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "worker".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_commands: vec!["pwd".to_string(), "touch".to_string()],
+                allowed_tools: vec![
+                    "shell".to_string(),
+                    "file_read".to_string(),
+                    "file_write".to_string(),
+                ],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 6,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "worker".into(),
+                runtime_profile: "agentic_test".into(),
+                model_provider: "openrouter.caller".into(),
+                workspace: AgentWorkspaceConfig {
+                    path: Some(caller_workspace.to_path_buf()),
+                    ..AgentWorkspaceConfig::default()
+                },
+                delegates: vec![DelegateTargetConfig {
+                    agent: "coder".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "worker".into(),
+                runtime_profile: "agentic_test".into(),
+                model_provider: "openrouter.coder".into(),
+                workspace: AgentWorkspaceConfig {
+                    path: Some(target_workspace.to_path_buf()),
+                    ..AgentWorkspaceConfig::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// The caller-owned file-tool entries in the PRODUCTION registry shape
+    /// (`RateLimitedTool<PathGuardedTool<Inner>>`, the shape
+    /// `all_tools_with_runtime_on_thread` registers): every layer holds the
+    /// caller's policy Arc, so the inherited child instances resolve
+    /// relative paths against the CALLER's workspace until re-pointed.
+    fn child_file_fixture_tools(
+        caller_policy: &Arc<SecurityPolicy>,
+    ) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(crate::tools::RateLimitedTool::new(
+                crate::tools::PathGuardedTool::new(
+                    crate::tools::FileWriteTool::new_with_persistence(
+                        Arc::clone(caller_policy),
+                        true,
+                    ),
+                    Arc::clone(caller_policy),
+                ),
+                Arc::clone(caller_policy),
+            )) as Arc<dyn Tool>,
+            Arc::new(crate::tools::RateLimitedTool::new(
+                crate::tools::PathGuardedTool::new(
+                    crate::tools::FileReadTool::new_with_persistence(Arc::clone(caller_policy), true),
+                    Arc::clone(caller_policy),
+                ),
+                Arc::clone(caller_policy),
+            )) as Arc<dyn Tool>,
+        ]
+    }
+
+    fn child_file_fixture(config: &Arc<Config>, caller_policy: Arc<SecurityPolicy>) -> DelegateTool {
+        let tools = child_file_fixture_tools(&caller_policy);
+        let effective_caller_workspace = caller_policy.workspace_dir.clone();
+        DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_workspace_dir(effective_caller_workspace)
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_parent_tools(Arc::new(RwLock::new(tools)))
+    }
+
+    /// A bounded delegate child's FILE tools must resolve relative paths in
+    /// the TARGET agent's workspace. The cycle-6 fix re-pointed only the
+    /// inherited shell; the inherited file tools kept resolving against the
+    /// CALLER's `SecurityPolicy.workspace_dir`. Measured live 2026-10-28: a
+    /// coder delegate's relative `file_write cwd-probe.txt` landed in
+    /// `/storage/agents/rocky/workspace/` (the parent's) instead of the
+    /// coder agent's own tree, and the child's `file_read` then
+    /// "confirmed" the wrong location.
+    #[tokio::test]
+    async fn bounded_child_relative_file_write_lands_in_target_tree() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+
+        let config = child_file_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"),
+        );
+        let tool = child_file_fixture(&config, caller_policy);
+        let coder_config = config.agents.get("coder").expect("coder agent").clone();
+
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "file_write",
+            tool_arguments: serde_json::json!({
+                "path": "child-marker.txt",
+                "content": "child-tree bytes"
+            })
+            .to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = tool
+            .execute_agentic(
+                "coder",
+                &coder_config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "child loop should finish: {result:?}");
+        let messages = provider.tool_messages.lock().unwrap();
+        assert!(
+            messages.iter().any(|message| !message.contains("error")),
+            "the child's file_write must succeed, got tool results: {messages:?}"
+        );
+        assert!(
+            target_workspace.join("child-marker.txt").exists(),
+            "the relative-path file_write must land in the CHILD agent's tree"
+        );
+        assert!(
+            !caller_workspace.join("child-marker.txt").exists(),
+            "the relative-path file_write must NOT land in the caller agent's tree"
+        );
+    }
+
+    /// The read half of the same defect: a relative-path `file_read` from
+    /// the bounded child must read the CHILD's tree — the incident's
+    /// false-location claim came from the child "confirming" a write it
+    /// could not actually see.
+    #[tokio::test]
+    async fn bounded_child_relative_file_read_reads_target_tree() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+        std::fs::write(target_workspace.join("child-read.txt"), "child-tree-bytes")
+            .unwrap();
+        // A same-named file in the CALLER's tree with DIFFERENT bytes: a
+        // child read that resolves against the caller's workspace serves the
+        // wrong content and the assertion catches it.
+        std::fs::write(caller_workspace.join("child-read.txt"), "caller-tree-bytes")
+            .unwrap();
+
+        let config = child_file_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"),
+        );
+        let tool = child_file_fixture(&config, caller_policy);
+        let coder_config = config.agents.get("coder").expect("coder agent").clone();
+
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "file_read",
+            tool_arguments: serde_json::json!({"path": "child-read.txt"}).to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = tool
+            .execute_agentic(
+                "coder",
+                &coder_config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "child loop should finish: {result:?}");
+        let messages = provider.tool_messages.lock().unwrap();
+        assert!(
+            messages.iter().any(|message| message.contains("child-tree-bytes")),
+            "the child's relative file_read must serve the CHILD tree's bytes; \
+             got tool results: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| message.contains("caller-tree-bytes")),
+            "the child's relative file_read must never serve the caller tree's bytes"
+        );
+    }
+
+    /// The re-point helper's adjudication matrix for the FILE family,
+    /// observed on the rebuilt inner instances directly: every
+    /// workspace-anchored file tool (file_read/file_write/file_edit/
+    /// deliver_file/glob_search/content_search) re-points at the target's
+    /// workspace, a configless builder keeps the inherited instances, a
+    /// depth-0 session override keeps them (#7263), and the wrapper
+    /// authority (both policy handles) is preserved.
+    #[tokio::test]
+    async fn repoint_child_file_tools_adjudication_matrix() {
+        use crate::tools::{
+            ContentSearchTool, DeliverFileTool, FileEditTool, GlobSearchTool, PathGuardedTool,
+            RateLimitedTool,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("worker-ws");
+        let foreign_workspace = tmp.path().join("inherited-carry");
+        for dir in [&caller_workspace, &target_workspace, &foreign_workspace] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let config = child_file_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+
+        let inherited_policy = Arc::new(SecurityPolicy {
+            workspace_dir: foreign_workspace.clone(),
+            ..child_shell_fixture_policy(&foreign_workspace).as_ref().clone()
+        });
+        let file_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    crate::tools::FileReadTool::new_with_persistence(Arc::clone(&inherited_policy), true),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    crate::tools::FileWriteTool::new_with_persistence(
+                        Arc::clone(&inherited_policy),
+                        true,
+                    ),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    FileEditTool::new_with_persistence(Arc::clone(&inherited_policy), true),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    DeliverFileTool::new(Arc::clone(&inherited_policy)),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    GlobSearchTool::new(Arc::clone(&inherited_policy)),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+            Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    ContentSearchTool::new(Arc::clone(&inherited_policy)),
+                    Arc::clone(&inherited_policy),
+                ),
+                Arc::clone(&inherited_policy),
+            )),
+        ];
+
+        // Observe the inner instance's workspace root through the wrapper
+        // stack, per tool name.
+        let observed_roots = |tools: &[Arc<dyn Tool>]| -> Vec<(String, PathBuf)> {
+            tools
+                .iter()
+                .map(|tool| {
+                    let probe: Arc<dyn std::any::Any + Send + Sync> = tool.clone();
+                    let root = (|| {
+                        macro_rules! observe {
+                            ($ty:ty) => {
+                                if let Some(wrapper) = probe.downcast_ref::<RateLimitedTool<
+                                    PathGuardedTool<$ty>,
+                                >>() {
+                                    return Some(wrapper.inner().inner().workspace_root().to_path_buf());
+                                }
+                            };
+                        }
+                        observe!(crate::tools::FileReadTool);
+                        observe!(crate::tools::FileWriteTool);
+                        observe!(crate::tools::FileEditTool);
+                        observe!(crate::tools::DeliverFileTool);
+                        observe!(crate::tools::GlobSearchTool);
+                        observe!(crate::tools::ContentSearchTool);
+                        None
+                    })()
+                    .unwrap_or_else(|| panic!("unobserved tool shape: {}", tool.name()));
+                    (tool.name().to_string(), root)
+                })
+                .collect()
+        };
+
+        // Depth 1 with an inherited (non-config) caller workspace: nested
+        // hops re-point every file tool at their own target's workspace.
+        let nested_tool = DelegateTool::with_depth(
+            config.agents.clone(),
+            None,
+            Arc::new(SecurityPolicy {
+                workspace_dir: foreign_workspace.clone(),
+                ..child_shell_fixture_policy(&foreign_workspace).as_ref().clone()
+            }),
+            1,
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        let repointed =
+            nested_tool.repoint_child_file_tools_to_target_workspace(file_tools.clone(), Some(&config), "coder");
+        for (name, root) in observed_roots(&repointed) {
+            assert_eq!(
+                root,
+                target_workspace,
+                "a nested hop must re-point {name} at its target's workspace"
+            );
+        }
+
+        // Configless builder: the inherited instances stay verbatim.
+        let configless_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            child_shell_fixture_policy(&caller_workspace),
+        )
+        .with_caller_alias("caller");
+        let untouched = configless_tool.repoint_child_file_tools_to_target_workspace(
+            file_tools.clone(),
+            None,
+            "coder",
+        );
+        for (name, root) in observed_roots(&untouched) {
+            assert_eq!(
+                root,
+                foreign_workspace,
+                "a configless builder keeps {name} inherited"
+            );
+        }
+
+        // Depth 0 with a SESSION override on the caller (#7263): the whole
+        // child toolset runs in the caller's session directory — the file
+        // tools stay inherited.
+        let session_workspace = tmp.path().join("session-ws");
+        std::fs::create_dir_all(&session_workspace).unwrap();
+        let mut override_policy = SecurityPolicy::for_agent(&config, "caller")
+            .expect("caller policy resolves");
+        override_policy.workspace_dir = session_workspace.clone();
+        let override_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::new(override_policy),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        // Session-override tools carry the session workspace.
+        let session_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(
+                crate::tools::FileReadTool::new_with_persistence(
+                    Arc::new(SecurityPolicy {
+                        workspace_dir: session_workspace.clone(),
+                        ..child_shell_fixture_policy(&session_workspace).as_ref().clone()
+                    }),
+                    true,
+                ),
+                Arc::new(SecurityPolicy {
+                    workspace_dir: session_workspace.clone(),
+                    ..child_shell_fixture_policy(&session_workspace).as_ref().clone()
+                }),
+            ),
+            Arc::new(SecurityPolicy {
+                workspace_dir: session_workspace.clone(),
+                ..child_shell_fixture_policy(&session_workspace).as_ref().clone()
+            }),
+        ))];
+        let kept = override_tool.repoint_child_file_tools_to_target_workspace(
+            session_tools,
+            Some(&config),
+            "coder",
+        );
+        for (name, root) in observed_roots(&kept) {
+            assert_eq!(
+                root,
+                session_workspace,
+                "a session-override caller keeps the #7263 inheritance: {name} stays \
+                 in the caller's session workspace"
+            );
+        }
+
+        // Depth 0, no session override: re-point at the target workspace.
+        let root_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::new(
+                SecurityPolicy::for_agent(&config, "caller")
+                    .expect("caller policy resolves"),
+            ),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        let repointed_root = root_tool.repoint_child_file_tools_to_target_workspace(
+            file_tools,
+            Some(&config),
+            "coder",
+        );
+        for (name, root) in observed_roots(&repointed_root) {
+            assert_eq!(
+                root,
+                target_workspace,
+                "a root hop without a session override re-points {name} at the target workspace"
+            );
+        }
+    }
+
+    /// The workspace root moves; the WRAPPER authority does not: the rebuilt
+    /// file-tool entries keep the caller's rate-limit policy handle (the
+    /// shared tracker) and the caller's path-guard policy — the same
+    /// single-delta contract [`ShellTool::for_delegate_child`] gives the
+    /// shell.
+    #[tokio::test]
+    async fn repoint_child_file_tools_preserve_wrapper_authority() {
+        use crate::tools::{PathGuardedTool, RateLimitedTool};
+
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+
+        let config = child_file_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"),
+        );
+        let rate_security = Arc::clone(&caller_policy);
+        let guard_security = Arc::clone(&caller_policy);
+        let entry: Arc<dyn Tool> = Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(
+                crate::tools::FileReadTool::new_with_persistence(Arc::clone(&caller_policy), true),
+                Arc::clone(&guard_security),
+            ),
+            Arc::clone(&rate_security),
+        ));
+
+        let root_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::clone(&caller_policy),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        let repointed =
+            root_tool.repoint_child_file_tools_to_target_workspace(vec![entry], Some(&config), "coder");
+
+        let probe: Arc<dyn std::any::Any + Send + Sync> = repointed[0].clone();
+        let wrapper = probe
+            .downcast_ref::<RateLimitedTool<PathGuardedTool<crate::tools::FileReadTool>>>()
+            .expect("the rebuilt entry keeps the production wrapper shape");
+        assert!(
+            Arc::ptr_eq(wrapper.security(), &rate_security),
+            "the rate-limit handle (shared tracker + ceiling) must be the caller's Arc"
+        );
+        assert!(
+            Arc::ptr_eq(wrapper.inner().security(), &guard_security),
+            "the path-guard policy must stay the caller's Arc — only the inner's \
+             workspace root moves"
         );
     }
 

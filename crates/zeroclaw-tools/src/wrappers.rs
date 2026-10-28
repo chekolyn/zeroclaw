@@ -121,6 +121,19 @@ impl<T: Tool> PathGuardedTool<T> {
         }
     }
 
+    /// Read-only access to the wrapped tool — registry-level surgery (e.g.
+    /// the delegate child's file-tool workspace re-pointing) needs to
+    /// rebuild the inner instance while keeping the wrapper's path-guard
+    /// policy handle.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// The path-guard policy this wrapper gates paths against.
+    pub fn security(&self) -> &Arc<SecurityPolicy> {
+        &self.security
+    }
+
     /// Supply a custom path-extraction closure for tools with non-standard arg names.
     pub fn with_extractor<F>(mut self, f: F) -> Self
     where

@@ -26,6 +26,29 @@ impl ContentSearchTool {
         }
     }
 
+    /// A content_search tool for a BOUNDED delegate child: the caller's
+    /// policy is preserved verbatim with ONE delta — the workspace root the
+    /// search runs in moves to the TARGET agent's workspace (the shell's
+    /// `for_delegate_child` single-delta contract). A bounded child's
+    /// relative search must match content in its OWN tree, not the
+    /// caller's. The detected backend is preserved (re-detection is pure
+    /// overhead, and a mid-loop PATH change must not flip the dialect).
+    pub fn for_delegate_child(&self, target_workspace_dir: std::path::PathBuf) -> Self {
+        let mut security = (*self.security).clone();
+        security.workspace_dir = target_workspace_dir;
+        Self {
+            security: Arc::new(security),
+            backend: self.backend,
+        }
+    }
+
+    /// Diagnostic view of the workspace root this instance searches
+    /// against — the runtime's delegate-workspace tests observe the
+    /// re-point delta through it.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.security.workspace_dir
+    }
+
     #[cfg(test)]
     fn new_with_backend(security: Arc<SecurityPolicy>, backend: SearchBackend) -> Self {
         Self { security, backend }
