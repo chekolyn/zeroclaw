@@ -2505,6 +2505,188 @@ mod tests {
         assert!(!result.output.contains("original-backend"));
     }
 
+    /// The rebind must carry the prefix-recall budget: a principal-routed
+    /// session's rebuilt `memory_recall` keeps the bounded prefix listing
+    /// the assembly gave it (the measured canary gap rode exactly this
+    /// path unbounbed). Knob `0` disables — legacy unbounded.
+    #[tokio::test]
+    async fn rebind_memory_tools_carries_the_prefix_recall_budget() {
+        use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry, SqliteMemory};
+        use zeroclaw_tools::memory_recall::MemoryRecallTool;
+        use std::time::{Duration, Instant};
+
+        struct SlowListMemory;
+
+        fn prefixed_entry() -> MemoryEntry {
+            MemoryEntry {
+                principal_id: None,
+                id: "p:1".into(),
+                key: "p:1".into(),
+                content: "prefixed entry".into(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-10-27T00:00:00Z".into(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for SlowListMemory {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Memory(
+                    zeroclaw_api::attribution::MemoryKind::InMemory,
+                )
+            }
+            fn alias(&self) -> &str {
+                "SlowListMemory"
+            }
+        }
+
+        #[async_trait]
+        impl Memory for SlowListMemory {
+            fn name(&self) -> &str {
+                "slow-list"
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _: &str,
+                _: usize,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _: Option<&MemoryCategory>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(vec![prefixed_entry()])
+            }
+            async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn forget_for_agent(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn store_with_agent(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall_for_agents(
+                &self,
+                _: &[&str],
+                _: &str,
+                _: usize,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let original_dir = tempfile::TempDir::new().unwrap();
+        let fast: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("fast", original_dir.path()).unwrap());
+        let slow: Arc<dyn Memory> = Arc::new(SlowListMemory);
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with(vec![Box::new(MemoryRecallTool::new(Arc::clone(&fast)))]),
+            None,
+            false,
+        )
+        .await;
+
+        // Budgeted rebind: the slow listing fails bounded inside the knob.
+        assembled
+            .registry
+            .rebind_memory_tools(Arc::clone(&slow), Arc::clone(&security), 100);
+        let tool = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "memory_recall")
+            .expect("memory_recall present after rebind");
+        let start = Instant::now();
+        let result = tool
+            .execute(serde_json::json!({"prefix": "p:"}))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            !result.success,
+            "the rebound recall tool must bound the prefix listing"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft budget")),
+            "got {:?}",
+            result.error
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the rebound prefix recall must stay bounded; took {elapsed:?}"
+        );
+
+        // Disabled rebind (0): the listing runs unbounded to completion.
+        assembled
+            .registry
+            .rebind_memory_tools(Arc::clone(&slow), Arc::clone(&security), 0);
+        let tool = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "memory_recall")
+            .expect("memory_recall present after rebind");
+        let result = tool
+            .execute(serde_json::json!({"prefix": "p:"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "a disabled budget must not bound the rebound listing"
+        );
+    }
+
     #[tokio::test]
     async fn supplied_memory_keeps_its_store_through_seal_rebind_and_parent_withdrawal() {
         use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};

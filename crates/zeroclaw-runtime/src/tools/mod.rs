@@ -876,6 +876,9 @@ pub(crate) struct NativeMemoryBinding {
     /// set = no filtering; threaded into the Recall tool built from this
     /// binding so specialist subagents filter telemetry by default.
     recall_excludes: RecallExcludes,
+    /// `[memory] recall_soft_timeout_ms` — the prefix-recall wall budget for
+    /// the Recall tool built from this binding (0 disables = legacy).
+    recall_soft_timeout_ms: u64,
 }
 
 impl NativeMemoryBinding {
@@ -886,6 +889,7 @@ impl NativeMemoryBinding {
             routed: std::sync::OnceLock::new(),
             operation_started: parking_lot::Mutex::new(false),
             recall_excludes: RecallExcludes::default(),
+            recall_soft_timeout_ms: 0,
         }
     }
 
@@ -894,6 +898,14 @@ impl NativeMemoryBinding {
     /// binding filters by the given namespaces/categories/key_prefixes.
     fn with_recall_excludes(mut self, excludes: RecallExcludes) -> Self {
         self.recall_excludes = excludes;
+        self
+    }
+
+    /// Thread the prefix-recall wall budget into this binding (cheknet
+    /// prefix-recall bounding patch: the Recall tool built from this binding
+    /// bounds its prefix `list` path by the same knob the assembly used).
+    fn with_recall_soft_timeout_ms(mut self, soft_timeout_ms: u64) -> Self {
+        self.recall_soft_timeout_ms = soft_timeout_ms;
         self
     }
 
@@ -1365,9 +1377,10 @@ impl NativeMemoryOrigins {
         let actual: Arc<dyn Tool> = match kind {
             NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
             NativeMemoryKind::Recall => {
-                Arc::new(MemoryRecallTool::new_with_excludes(
+                Arc::new(MemoryRecallTool::new_with_excludes_and_budget(
                     memory,
                     binding.recall_excludes.clone(),
+                    binding.recall_soft_timeout_ms,
                 ))
             }
             NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
@@ -2544,13 +2557,14 @@ fn all_tools_with_runtime_on_thread(
     register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
     register_tool!(
         "memory_recall",
-        Arc::new(MemoryRecallTool::new_with_excludes(
+        Arc::new(MemoryRecallTool::new_with_excludes_and_budget(
             memory.clone(),
             RecallExcludes {
                 namespaces: root_config.memory.exclude_namespaces.clone(),
                 categories: root_config.memory.exclude_categories.clone(),
                 key_prefixes: root_config.memory.exclude_key_prefixes.clone(),
             },
+            root_config.memory.recall_soft_timeout_ms,
         ))
     );
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
