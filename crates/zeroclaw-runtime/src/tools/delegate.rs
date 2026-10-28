@@ -1081,6 +1081,87 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
+    /// Re-point the shell tool a BOUNDED delegate child inherits at the
+    /// TARGET agent's workspace.
+    ///
+    /// A bounded child inherits the caller's tool instances verbatim
+    /// (`bounded_base_tools`), so the inherited shell spawns its commands in
+    /// the CALLER's `SecurityPolicy.workspace_dir` — a relative-path shell
+    /// command from a delegated agent wrote into the caller agent's tree.
+    /// Measured live 2026-10-28: a coder delegate's relative write landed in
+    /// `/storage/agents/rocky/workspace` while its absolute-path writes
+    /// correctly landed in its own tree, and the child self-reported a
+    /// read-back PASS against a file it could not actually see. The child's
+    /// shell instance is rebuilt via
+    /// [`ShellTool::for_delegate_child`]: the caller's command authority
+    /// (allowed commands, shared action tracker, sandbox, env forwarding,
+    /// steering guard, timeout) is preserved — only the workspace root
+    /// moves.
+    ///
+    /// #7263 carve-out: when the CALLER's policy carries a SESSION workspace
+    /// override (its `workspace_dir` differs from its config-derived agent
+    /// workspace), the bounded child deliberately works in the caller's
+    /// session directory across its whole toolset
+    /// (`delegate_target_inherits_caller_session_workspace_dir`), so the
+    /// inherited shell is left untouched at the root hop. Nested hops
+    /// (`self.depth > 0`) have no user session behind them — the caller's
+    /// effective workspace there is the inherited carry, not a session — so
+    /// they always re-point at their own target's workspace.
+    fn repoint_child_shell_to_target_workspace(
+        &self,
+        tools: Vec<Arc<dyn Tool>>,
+        config: Option<&Config>,
+        target_alias: &str,
+    ) -> Vec<Arc<dyn Tool>> {
+        let Some(config) = config else {
+            // Configless builders keep the inherited instance verbatim.
+            return tools;
+        };
+        if self.depth == 0 {
+            let caller_config_workspace = config.agent_workspace_dir(&self.caller_alias);
+            if caller_config_workspace.as_path() != self.security.workspace_dir.as_path() {
+                // Session workspace override on the caller (#7263): the
+                // whole child toolset runs in the caller's session directory
+                // by design.
+                return tools;
+            }
+        }
+        let target_workspace = config.agent_workspace_dir(target_alias);
+        tools
+            .into_iter()
+            .map(|tool| {
+                if tool.name() != "shell" {
+                    return tool;
+                }
+                // Production registry shape: RateLimitedTool<ShellTool> —
+                // rebuild the inner instance, keep the wrapper's own
+                // rate-limit policy handle (the caller's shared tracker and
+                // ceiling). The `Any` supertrait lets an erased Arc clone
+                // coerce to `Arc<dyn Any + Send + Sync>` and downcast_ref the
+                // concrete shapes; the original stays alive for the
+                // fall-through.
+                let probe: Arc<dyn std::any::Any + Send + Sync> = tool.clone();
+                if let Some(wrapper) =
+                    probe.downcast_ref::<crate::tools::RateLimitedTool<crate::tools::ShellTool>>()
+                {
+                    let child_inner = wrapper.inner().for_delegate_child(target_workspace.clone());
+                    return Arc::new(crate::tools::RateLimitedTool::new(
+                        child_inner,
+                        Arc::clone(wrapper.security()),
+                    )) as Arc<dyn Tool>;
+                }
+                // Bare instance (test-built parents, unwrapped registries).
+                if let Some(shell) = probe.downcast_ref::<crate::tools::ShellTool>() {
+                    return Arc::new(shell.for_delegate_child(target_workspace.clone()))
+                        as Arc<dyn Tool>;
+                }
+                // A differently-wrapped "shell" (plugin/skill variants):
+                // leave the inherited instance untouched rather than guess.
+                tool
+            })
+            .collect()
+    }
+
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
         let Some(caller) = config.agents.get(&self.caller_alias) else {
             return format!(
@@ -5480,6 +5561,17 @@ impl DelegateTool {
                         .cloned()
                         .collect()
                 };
+                // The child's shell must spawn in the TARGET agent's
+                // workspace (see `repoint_child_shell_to_target_workspace`):
+                // the inherited instance runs its commands in the CALLER's
+                // workspace, so a relative-path shell command from the child
+                // wrote into the wrong agent's tree. Every other inherited
+                // instance stays verbatim.
+                let bounded_base_tools = self.repoint_child_shell_to_target_workspace(
+                    bounded_base_tools,
+                    target_config.or(self.root_config.as_deref()),
+                    agent_name,
+                );
 
                 // Target-bound delegate tool: its delegation calls must resolve
                 // `delegation_policy`, reachability, and the advertised roster
@@ -5980,7 +6072,7 @@ mod tests {
     use crate::platform::NativeRuntime;
     use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use crate::tools::{MemoryRecallTool, MemoryStoreTool};
+    use crate::tools::{MemoryRecallTool, MemoryStoreTool, ShellTool};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
@@ -10205,6 +10297,393 @@ mod tests {
                 .any(|message| message
                     .contains("Command requires explicit approval (approved=true)")),
             "caller command policy must receive approved=false: {messages:?}"
+        );
+    }
+
+    // ── bounded child shell workspace ─────────────────────────────────────
+
+    /// The shell policy the fixture's caller-owned shell instance carries:
+    /// Full autonomy over a small allowlist, jailed to the caller workspace.
+    fn child_shell_fixture_policy(
+        workspace_dir: &Path,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            workspace_dir: workspace_dir.to_path_buf(),
+            workspace_only: true,
+            allowed_commands: vec!["pwd".to_string(), "touch".to_string()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Config for the bounded-child shell workspace fixtures: caller and
+    /// coder target with DISTINCT per-agent workspaces, a bare delegates
+    /// entry (bounded), one shared risk profile with shell granted.
+    fn child_shell_workspace_config(
+        root: &Path,
+        caller_workspace: &Path,
+        target_workspace: &Path,
+    ) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::multi_agent::AgentWorkspaceConfig;
+
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "worker".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_commands: vec!["pwd".to_string(), "touch".to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 6,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "worker".into(),
+                runtime_profile: "agentic_test".into(),
+                model_provider: "openrouter.caller".into(),
+                workspace: AgentWorkspaceConfig {
+                    path: Some(caller_workspace.to_path_buf()),
+                    ..AgentWorkspaceConfig::default()
+                },
+                delegates: vec![DelegateTargetConfig {
+                    agent: "coder".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "worker".into(),
+                runtime_profile: "agentic_test".into(),
+                model_provider: "openrouter.coder".into(),
+                workspace: AgentWorkspaceConfig {
+                    path: Some(target_workspace.to_path_buf()),
+                    ..AgentWorkspaceConfig::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// Assemble the fixture: a daemon-shaped caller policy (config-derived
+    /// workspace, no session override) plus a caller registry whose shell
+    /// entry carries the production wrapper shape
+    /// (`RateLimitedTool<ShellTool>`, the shape
+    /// `all_tools_with_runtime_on_thread` registers).
+    fn child_shell_fixture(
+        config: &Arc<Config>,
+        caller_policy: Arc<SecurityPolicy>,
+        shell_policy: Arc<SecurityPolicy>,
+    ) -> DelegateTool {
+        let shell = Arc::new(crate::tools::RateLimitedTool::new(
+            ShellTool::new(shell_policy, Arc::new(NativeRuntime::new())),
+            Arc::clone(&caller_policy),
+        )) as Arc<dyn Tool>;
+        let effective_caller_workspace = caller_policy.workspace_dir.clone();
+        DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_workspace_dir(effective_caller_workspace)
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![shell])))
+    }
+
+    /// A bounded delegate child's shell tool must spawn its commands in the
+    /// TARGET agent's workspace. The bounded child inherits the caller's
+    /// tool instances verbatim, so the inherited shell spawned in the
+    /// CALLER's workspace: a relative-path shell command from a delegated
+    /// agent wrote into the wrong agent's tree (measured live 2026-10-28 —
+    /// a coder delegate's relative write landed in
+    /// /storage/agents/rocky/workspace). `pwd` is the direct observation of
+    /// the child's effective cwd.
+    #[tokio::test]
+    async fn bounded_child_shell_runs_in_target_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+
+        let config = child_shell_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"),
+        );
+        let shell_policy = child_shell_fixture_policy(&caller_workspace);
+        let tool = child_shell_fixture(&config, caller_policy, shell_policy);
+        let coder_config = config.agents.get("coder").expect("coder agent").clone();
+
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "shell",
+            tool_arguments: serde_json::json!({"command": "pwd"}).to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = tool
+            .execute_agentic(
+                "coder",
+                &coder_config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "child loop should finish: {result:?}");
+        let messages = provider.tool_messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains(target_workspace.to_str().expect("utf-8 path"))),
+            "the bounded child's shell cwd must be the TARGET agent's workspace \
+             ({target_workspace:?}); got tool results: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| message
+                .contains(caller_workspace.to_str().expect("utf-8 path"))),
+            "the bounded child's shell must not run in the caller's workspace"
+        );
+    }
+
+    /// A relative-path write issued through the bounded child's shell must
+    /// land in the CHILD's tree — the wrong-tree write the live incident
+    /// measured (2026-10-28).
+    #[tokio::test]
+    async fn bounded_child_relative_write_lands_in_target_tree() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        std::fs::create_dir_all(&caller_workspace).unwrap();
+        std::fs::create_dir_all(&target_workspace).unwrap();
+
+        let config = child_shell_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"),
+        );
+        let shell_policy = child_shell_fixture_policy(&caller_workspace);
+        let tool = child_shell_fixture(&config, caller_policy, shell_policy);
+        let coder_config = config.agents.get("coder").expect("coder agent").clone();
+
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "shell",
+            tool_arguments: serde_json::json!({"command": "touch child-marker.txt"})
+                .to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = tool
+            .execute_agentic(
+                "coder",
+                &coder_config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "child loop should finish: {result:?}");
+        assert!(
+            target_workspace.join("child-marker.txt").exists(),
+            "the relative-path write must land in the child agent's tree"
+        );
+        assert!(
+            !caller_workspace.join("child-marker.txt").exists(),
+            "the relative-path write must NOT land in the caller agent's tree"
+        );
+    }
+
+    /// #7263 carve-out: when the CALLER's policy carries a SESSION workspace
+    /// override (its workspace differs from its config-derived workspace),
+    /// the bounded child keeps working in the caller's session directory —
+    /// the inherited shell instance is left untouched at the root hop.
+    #[tokio::test]
+    async fn bounded_child_shell_keeps_caller_session_workspace_override() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("coder-ws");
+        let session_workspace = tmp.path().join("session-ws");
+        for dir in [&caller_workspace, &target_workspace, &session_workspace] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let config = child_shell_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+        // Build the caller's policy the way the interactive builders do:
+        // config-derived, then session_cwd override.
+        let mut caller_policy = SecurityPolicy::for_agent(&config, "caller")
+            .expect("caller policy resolves");
+        caller_policy.workspace_dir = session_workspace.clone();
+        let caller_policy = Arc::new(caller_policy);
+        // The caller-owned shell instance runs in the session workspace.
+        let shell_policy = child_shell_fixture_policy(&session_workspace);
+        let tool = child_shell_fixture(&config, caller_policy, shell_policy);
+        let coder_config = config.agents.get("coder").expect("coder agent").clone();
+
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "shell",
+            tool_arguments: serde_json::json!({"command": "pwd"}).to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = tool
+            .execute_agentic(
+                "coder",
+                &coder_config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "child loop should finish: {result:?}");
+        let messages = provider.tool_messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message
+                    .contains(session_workspace.to_str().expect("utf-8 path"))),
+            "a session-override caller keeps the #7263 inheritance: the child's \
+             shell cwd must stay the caller's session workspace; got {messages:?}"
+        );
+    }
+
+    /// The re-point helper's adjudication matrix, observed on the rebuilt
+    /// shell instance directly: nested hops (depth > 0) re-point even when
+    /// the caller's effective workspace is the inherited carry (not its
+    /// config workspace), configless builders keep the inherited instance,
+    /// and the depth-0 non-override case re-points.
+    #[tokio::test]
+    async fn repoint_child_shell_adjudication_matrix() {
+        let tmp = TempDir::new().unwrap();
+        let caller_workspace = tmp.path().join("caller-ws");
+        let target_workspace = tmp.path().join("worker-ws");
+        let foreign_workspace = tmp.path().join("inherited-carry");
+        for dir in [&caller_workspace, &target_workspace, &foreign_workspace] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let config = child_shell_workspace_config(tmp.path(), &caller_workspace, &target_workspace);
+
+        let observed_workspace = |tools: Vec<Arc<dyn Tool>>| -> Option<PathBuf> {
+            tools
+                .into_iter()
+                .find(|tool| tool.name() == "shell")
+                .and_then(|shell| {
+                    let probe: Arc<dyn std::any::Any + Send + Sync> = shell.clone();
+                    if let Some(wrapper) =
+                        probe.downcast_ref::<crate::tools::RateLimitedTool<ShellTool>>()
+                    {
+                        return Some(wrapper.inner().spawn_workspace_dir().to_path_buf());
+                    }
+                    probe
+                        .downcast_ref::<ShellTool>()
+                        .map(|shell| shell.spawn_workspace_dir().to_path_buf())
+                })
+        };
+
+        // Depth 1 with an inherited (non-config) caller workspace: nested
+        // hops always re-point at their own target's workspace.
+        let nested_tool = DelegateTool::with_depth(
+            config.agents.clone(),
+            None,
+            Arc::new(SecurityPolicy {
+                workspace_dir: foreign_workspace.clone(),
+                ..child_shell_fixture_policy(&foreign_workspace).as_ref().clone()
+            }),
+            1,
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        let shell = Arc::new(ShellTool::new(
+            child_shell_fixture_policy(&foreign_workspace),
+            Arc::new(NativeRuntime::new()),
+        )) as Arc<dyn Tool>;
+        let repointed = nested_tool.repoint_child_shell_to_target_workspace(
+            vec![shell],
+            Some(&config),
+            "coder",
+        );
+        assert_eq!(
+            observed_workspace(repointed).as_deref(),
+            Some(target_workspace.as_path()),
+            "a nested hop must re-point the shell at its target's workspace"
+        );
+
+        // Configless builder: the inherited instance is kept verbatim.
+        let configless_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            child_shell_fixture_policy(&caller_workspace),
+        )
+        .with_caller_alias("caller");
+        let shell = Arc::new(ShellTool::new(
+            child_shell_fixture_policy(&caller_workspace),
+            Arc::new(NativeRuntime::new()),
+        )) as Arc<dyn Tool>;
+        let untouched = configless_tool.repoint_child_shell_to_target_workspace(
+            vec![shell],
+            None,
+            "coder",
+        );
+        assert_eq!(
+            observed_workspace(untouched).as_deref(),
+            Some(caller_workspace.as_path()),
+            "a configless builder keeps the inherited instance"
+        );
+
+        // Depth 0, no session override: re-point at the target workspace.
+        let root_tool = DelegateTool::new(
+            config.agents.clone(),
+            None,
+            Arc::new(
+                SecurityPolicy::for_agent(&config, "caller")
+                    .expect("caller policy resolves"),
+            ),
+        )
+        .with_root_config(Arc::clone(&config))
+        .with_caller_alias("caller");
+        let shell = Arc::new(ShellTool::new(
+            child_shell_fixture_policy(&caller_workspace),
+            Arc::new(NativeRuntime::new()),
+        )) as Arc<dyn Tool>;
+        let repointed = root_tool.repoint_child_shell_to_target_workspace(
+            vec![shell],
+            Some(&config),
+            "coder",
+        );
+        assert_eq!(
+            observed_workspace(repointed).as_deref(),
+            Some(target_workspace.as_path()),
+            "a root hop without a session override re-points at the target workspace"
         );
     }
 

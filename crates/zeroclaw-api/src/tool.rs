@@ -1,6 +1,7 @@
 use crate::media::RenderedMarker;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use tokio_util::sync::CancellationToken;
 
 tokio::task_local! {
@@ -507,7 +508,7 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
 }
 
 #[async_trait]
-pub trait Tool: Send + Sync + crate::attribution::Attributable {
+pub trait Tool: Send + Sync + Any + crate::attribution::Attributable {
     /// True when this tool starts nested execution without carrying the RPC
     /// principal's current tool and agent ceilings. Constrained RPC sessions
     /// must omit it. Wrappers forward the target's value so a renamed skill
