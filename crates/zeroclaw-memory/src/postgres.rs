@@ -585,6 +585,38 @@ pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
+/// Ranking input bound for the content arm of the recall score expression.
+///
+/// The ranked arm re-parses `to_tsvector(m.content)` for every candidate row
+/// the FTS filter produced. On a large store with blob-sized entries (SOP run
+/// transcripts, tool-output dumps with >2047-char tokens) that parse dominates
+/// the whole query: measured 2026-10-28 on the prod gateway leader, the same
+/// 270-candidate recall took 8.07s unbounded vs 0.22s with a 4096-char prefix.
+/// The unbounded shape burned the 2s recall soft budget on every unscoped
+/// recall (`recall_budget` degradation rows in prod traces) and fell back to
+/// recent entries — the ranked results were computed and then thrown away.
+///
+/// The FTS FILTER stays full-content, so a document that matches only deep in
+/// its body is still recalled — it ranks by its key score / recency instead of
+/// a deep-position content rank. Keys stay unbounded (they are short).
+const RECALL_RANK_CONTENT_PREFIX_CHARS: usize = 4096;
+
+/// The recall score expression shared by `recall` and `recall_for_agents`.
+/// `$1` is the plainto_tsquery parameter; caller supplies the FROM alias
+/// (`m.`), which both call sites already use.
+fn recall_rank_expression() -> String {
+    format!(
+        "\
+         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)\
+           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0\
+           ELSE 0.0 END +\
+         CASE WHEN to_tsvector('simple', left(m.content, {prefix})) @@ plainto_tsquery('simple', $1)\
+           THEN ts_rank_cd(to_tsvector('simple', left(m.content, {prefix})), plainto_tsquery('simple', $1))\
+           ELSE 0.0 END",
+        prefix = RECALL_RANK_CONTENT_PREFIX_CHARS,
+    )
+}
+
 fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
     match (since, until) {
         (true, true) => format!(
@@ -790,14 +822,8 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
-                       (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
-                           ELSE 0.0 END
-                       ) AS score
+                       ({rank})
+                       AS score
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
@@ -806,6 +832,7 @@ impl Memory for PostgresMemory {
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
                 ",
+                rank = recall_rank_expression(),
             );
 
             #[allow(clippy::cast_possible_wrap)]
@@ -1185,14 +1212,8 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
-                       (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
-                           ELSE 0.0 END
-                       ) AS score
+                       ({rank})
+                       AS score
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
@@ -1202,6 +1223,7 @@ impl Memory for PostgresMemory {
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
                 ",
+                rank = recall_rank_expression(),
             );
 
             #[allow(clippy::cast_possible_wrap)]
@@ -1434,6 +1456,34 @@ mod tests {
             after.contains(&"idx_memories_key_btree"),
             "the boot must continue past the failed build: remaining indexes still attempted, got: {after:?}"
         );
+    }
+
+    #[test]
+    fn recall_rank_expression_bounds_content_and_keeps_key_arm_whole() {
+        let sql = recall_rank_expression();
+
+        // The content arm must rank over a BOUNDED prefix: the unbounded
+        // `to_tsvector('simple', m.content)` re-parse per candidate row was
+        // measured at 8.07s per recall on the prod leader (2026-10-28) and
+        // burned the 2s recall soft budget on every unscoped recall.
+        assert!(
+            sql.contains("left(m.content, 4096)"),
+            "content rank arm must be bounded to the prefix const, got: {sql}"
+        );
+        assert!(
+            !sql.contains("to_tsvector('simple', m.content)"),
+            "no unbounded content tsvector may remain in the rank expression, got: {sql}"
+        );
+        // The key arm stays whole: keys are short and carry the canonical name.
+        assert!(
+            sql.contains("to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)")
+                && sql.contains(
+                    "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0"
+                ),
+            "key rank arm must stay unbounded at 2.0 weight, got: {sql}"
+        );
+        // Both arms bind the same query placeholder.
+        assert_eq!(sql.matches("plainto_tsquery('simple', $1)").count(), 4);
     }
 
     #[test]
