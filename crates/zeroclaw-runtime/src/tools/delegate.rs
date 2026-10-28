@@ -1476,12 +1476,14 @@ impl DelegateTool {
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
         excludes: RecallExcludes,
+        recall_soft_timeout_ms: u64,
     ) -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryRecallTool::new_with_excludes(
+            Box::new(MemoryRecallTool::new_with_excludes_and_budget(
                 memory.clone(),
                 excludes,
+                recall_soft_timeout_ms,
             )),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
@@ -5405,14 +5407,19 @@ impl DelegateTool {
                     // target's recall tool so specialist subagents filter
                     // telemetry by default — matching the main agent runtime
                     // (tools/mod.rs). Configless test builders (`root_config`
-                    // unset) fall back to an empty (no-op) exclude set.
-                    let recall_excludes = match self.root_config.as_deref() {
-                        Some(config) => RecallExcludes {
-                            namespaces: config.memory.exclude_namespaces.clone(),
-                            categories: config.memory.exclude_categories.clone(),
-                            key_prefixes: config.memory.exclude_key_prefixes.clone(),
-                        },
-                        None => RecallExcludes::default(),
+                    // unset) fall back to an empty (no-op) exclude set and a
+                    // disabled (0 = legacy unbounded) prefix-recall budget.
+                    let (recall_excludes, recall_soft_timeout_ms) = match self.root_config.as_deref()
+                    {
+                        Some(config) => (
+                            RecallExcludes {
+                                namespaces: config.memory.exclude_namespaces.clone(),
+                                categories: config.memory.exclude_categories.clone(),
+                                key_prefixes: config.memory.exclude_key_prefixes.clone(),
+                            },
+                            config.memory.recall_soft_timeout_ms,
+                        ),
+                        None => (RecallExcludes::default(), 0),
                     };
                     match self
                         .memory_for_target_agent(target_config, agent_name)
@@ -5422,6 +5429,7 @@ impl DelegateTool {
                             memory,
                             Arc::clone(&target_policy),
                             recall_excludes,
+                            recall_soft_timeout_ms,
                         )
                         .into_iter()
                         .map(|tool| (tool.name().to_string(), tool))
@@ -10278,7 +10286,7 @@ mod tests {
             ..Default::default()
         };
         let security = Arc::new(SecurityPolicy::default());
-        let tools = DelegateTool::memory_tools_for_target(memory, security, excludes);
+        let tools = DelegateTool::memory_tools_for_target(memory, security, excludes, 0);
         let recall = tools
             .iter()
             .find(|t| t.name() == "memory_recall")

@@ -1743,13 +1743,14 @@ fn all_tools_with_runtime_on_thread(
     );
     register_tool!(
         "memory_recall",
-        Arc::new(MemoryRecallTool::new_with_excludes(
+        Arc::new(MemoryRecallTool::new_with_excludes_and_budget(
             memory.clone(),
             RecallExcludes {
                 namespaces: root_config.memory.exclude_namespaces.clone(),
                 categories: root_config.memory.exclude_categories.clone(),
                 key_prefixes: root_config.memory.exclude_key_prefixes.clone(),
             },
+            root_config.memory.recall_soft_timeout_ms,
         ))
     );
     register_tool!(

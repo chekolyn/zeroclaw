@@ -489,6 +489,11 @@ pub struct Agent {
     /// principal-scoped handle without re-deriving policy: session memory must
     /// follow its owner across the tools too, not only the `memory` field.
     memory_security: Arc<SecurityPolicy>,
+    /// `[memory] recall_soft_timeout_ms`, carried so
+    /// [`Agent::route_memory_to_principal`]'s tool rebind can rebuild the
+    /// recall tool with the same prefix-recall wall budget the assembly
+    /// gave it. Defaults to the schema default (`MemoryConfig::default()`).
+    memory_recall_soft_timeout_ms: u64,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
@@ -757,6 +762,7 @@ pub struct AgentBuilder {
     tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
     memory_security: Option<Arc<SecurityPolicy>>,
+    memory_recall_soft_timeout_ms: u64,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -822,6 +828,8 @@ impl AgentBuilder {
             tools: None,
             memory: None,
             memory_security: None,
+            memory_recall_soft_timeout_ms: zeroclaw_config::schema::MemoryConfig::default()
+                .recall_soft_timeout_ms,
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
@@ -898,6 +906,15 @@ impl AgentBuilder {
     /// production constructor always supplies the agent's real policy.
     pub fn memory_security(mut self, security: Arc<SecurityPolicy>) -> Self {
         self.memory_security = Some(security);
+        self
+    }
+
+    /// `[memory] recall_soft_timeout_ms` — the prefix-recall wall budget the
+    /// recall tool must carry across a `route_memory_to_principal` rebind.
+    /// Defaults to the schema default; the production constructor supplies
+    /// the configured value explicitly.
+    pub fn memory_recall_soft_timeout_ms(mut self, soft_timeout_ms: u64) -> Self {
+        self.memory_recall_soft_timeout_ms = soft_timeout_ms;
         self
     }
 
@@ -1275,6 +1292,7 @@ impl AgentBuilder {
             memory_security: self
                 .memory_security
                 .unwrap_or_else(|| Arc::new(SecurityPolicy::default())),
+            memory_recall_soft_timeout_ms: self.memory_recall_soft_timeout_ms,
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -2036,8 +2054,11 @@ impl Agent {
         // private — so rebind them to the routed handle here, before any prompt
         // exercises them. This never adds a tool name: memory tools already
         // withdrawn by policy narrowing stay withdrawn.
-        self.tools
-            .rebind_memory_tools(routed, Arc::clone(&self.memory_security));
+        self.tools.rebind_memory_tools(
+            routed,
+            Arc::clone(&self.memory_security),
+            self.memory_recall_soft_timeout_ms,
+        );
         self.memory_principal = Some(scope.principal_id);
         Ok(())
     }
@@ -3154,6 +3175,7 @@ impl Agent {
             .tools(tools)
             .memory(memory.clone())
             .memory_security(Arc::clone(&security))
+            .memory_recall_soft_timeout_ms(config.memory.recall_soft_timeout_ms)
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)

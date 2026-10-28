@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::{Memory, RecallExcludes};
 
@@ -12,6 +13,22 @@ pub struct MemoryRecallTool {
     /// exclude_categories / exclude_key_prefixes`. Applied when the caller
     /// does not opt out via `scope = "all"` (the audit/debug escape hatch).
     excludes: RecallExcludes,
+    /// Wall-clock budget for the prefix-recall listing path, derived from
+    /// the same `[memory] recall_soft_timeout_ms` knob as the recall-budget
+    /// decorator (`0` disables — legacy unbounded listing).
+    ///
+    /// Why the bound lives HERE and not in [`BudgetedMemory::list`]: the
+    /// prefix-recall mode is the one recall-shaped consumer of `list()`,
+    /// and the measured prod gap (canary v7: `memory_recall (15220ms)`,
+    /// 2026-10-27) was exactly this path — the decorator deliberately
+    /// passes `list` through unbounded because `memory_export` (GDPR) and
+    /// the RPC memory-listing surface ride the same method and a bulk
+    /// listing is their point. Bounding the tool's own use keeps the
+    /// cycle-3 contract (a caller-visible recall is bounded ≈ budget;
+    /// here: one attempt, no fallback — an enumeration has no recency
+    /// fallback semantic, so an over-budget listing fails bounded rather
+    /// than returning unrelated recent entries).
+    prefix_list_budget: Option<Duration>,
 }
 
 impl MemoryRecallTool {
@@ -19,6 +36,7 @@ impl MemoryRecallTool {
         Self {
             memory,
             excludes: RecallExcludes::default(),
+            prefix_list_budget: None,
         }
     }
 
@@ -27,12 +45,67 @@ impl MemoryRecallTool {
     /// [`new`](Self::new) constructor is kept for tests and config-less
     /// callers (empty excludes → no-op filter).
     pub fn new_with_excludes(memory: Arc<dyn Memory>, excludes: RecallExcludes) -> Self {
-        Self { memory, excludes }
+        Self {
+            memory,
+            excludes,
+            prefix_list_budget: None,
+        }
+    }
+
+    /// Construct with the excludes AND the prefix-recall wall budget from
+    /// `[memory] recall_soft_timeout_ms` (`0` disables the bound). Every
+    /// production construction site must use this constructor — the
+    /// legacy constructors exist for tests and config-less callers only
+    /// and leave the prefix-recall path unbounded.
+    pub fn new_with_excludes_and_budget(
+        memory: Arc<dyn Memory>,
+        excludes: RecallExcludes,
+        recall_soft_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            memory,
+            excludes,
+            prefix_list_budget: if recall_soft_timeout_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(recall_soft_timeout_ms))
+            },
+        }
     }
 
     /// Handle prefix recall mode: list all entries whose key starts with `prefix`.
     async fn handle_prefix_recall(&self, prefix: &str, limit: usize) -> anyhow::Result<ToolResult> {
-        let entries = self.memory.list(None, None).await?;
+        let listed = match self.prefix_list_budget {
+            Some(budget) => {
+                let start = Instant::now();
+                match tokio::time::timeout(budget, self.memory.list(None, None)).await {
+                    Ok(listed) => listed,
+                    Err(_) => {
+                        let elapsed = start.elapsed();
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "recall": "prefix_list",
+                                    "elapsed_ms": elapsed.as_millis() as u64,
+                                    "soft_timeout_ms": budget.as_millis() as u64,
+                                })),
+                            "memory prefix recall exceeded the soft budget; listing abandoned"
+                        );
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "prefix recall exceeded the soft budget ({budget:?}); the full-memory listing was abandoned"
+                            )),
+                        });
+                    }
+                }
+            }
+            None => self.memory.list(None, None).await,
+        };
+        let entries = listed?;
         let matched: Vec<_> = entries
             .into_iter()
             .filter(|e| e.key.starts_with(prefix))
@@ -258,6 +331,7 @@ impl Tool for MemoryRecallTool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory, is_recent_recall_query};
 
@@ -265,6 +339,229 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
+    }
+
+    /// Fake backend whose `list` sleeps (the measured prod pathology: the
+    /// prefix-recall path rides `list`, and the postgres `list` is a
+    /// no-LIMIT full-table scan — 15.2s measured on canary v7). The ranked
+    /// `recall` stays instant so a test that times out proves the LIST
+    /// budget, not the recall budget, is doing the bounding.
+    struct SlowListMemory {
+        list_delay: Duration,
+        list_error: bool,
+    }
+
+    impl SlowListMemory {
+        fn new(list_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                list_delay,
+                list_error: false,
+            })
+        }
+    }
+
+    fn prefixed_entry() -> MemoryEntry {
+        MemoryEntry {
+            principal_id: None,
+            id: "p:1".into(),
+            key: "p:1".into(),
+            content: "prefixed entry".into(),
+            category: MemoryCategory::Core,
+            timestamp: "2026-10-27T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    #[async_trait]
+    impl Memory for SlowListMemory {
+        fn name(&self) -> &str {
+            "slow-list"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            tokio::time::sleep(self.list_delay).await;
+            if self.list_error {
+                anyhow::bail!("list backend down");
+            }
+            Ok(vec![prefixed_entry()])
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for SlowListMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "SlowListMemory"
+        }
+    }
+
+    /// Control (legacy constructors stay unbounded): with no budget the same
+    /// slow listing runs to completion — this documents the mechanism the
+    /// budget closes and guards the legacy byte-identical contract.
+    #[tokio::test]
+    async fn legacy_constructor_prefix_recall_has_no_budget() {
+        let mem = SlowListMemory::new(Duration::from_millis(400));
+        let tool = MemoryRecallTool::new_with_excludes(mem, RecallExcludes::default());
+        let start = Instant::now();
+        let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "the legacy constructor must not bound the listing"
+        );
+        assert!(result.success);
+        assert!(result.output.contains("prefixed entry"));
+    }
+
+    /// The measured prod gap (canary v7, `memory_recall (15220ms)`): the
+    /// prefix-recall mode rode `list()` — which the recall-budget decorator
+    /// passes through unbounded — so a full-enumeration recall stalled the
+    /// tool past the recall budget's ≈3s contract. The tool owns the bound
+    /// for its recall-shaped use of `list`: an over-budget listing fails
+    /// bounded (no fake fallback data for an enumeration).
+    #[tokio::test]
+    async fn prefix_recall_listing_exceeding_the_budget_fails_bounded() {
+        let mem = SlowListMemory::new(Duration::from_secs(5));
+        let tool = MemoryRecallTool::new_with_excludes_and_budget(
+            mem,
+            RecallExcludes::default(),
+            100, // recall_soft_timeout_ms
+        );
+        let start = Instant::now();
+        let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !result.success,
+            "an over-budget prefix listing must fail bounded"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft budget")),
+            "the bounded failure must name the soft budget; got {:?}",
+            result.error
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "the prefix recall must stay bounded by the soft budget; took {elapsed:?}"
+        );
+    }
+
+    /// `recall_soft_timeout_ms = 0` disables the budget entirely — the
+    /// decorator's disabled contract, mirrored here: the legacy unbounded
+    /// listing passes through untouched.
+    #[tokio::test]
+    async fn prefix_recall_budget_zero_is_legacy_unbounded() {
+        let mem = SlowListMemory::new(Duration::from_millis(400));
+        let tool =
+            MemoryRecallTool::new_with_excludes_and_budget(mem, RecallExcludes::default(), 0);
+        let start = Instant::now();
+        let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "a disabled budget must not interrupt the listing"
+        );
+        assert!(result.success);
+        assert!(result.output.contains("prefixed entry"));
+    }
+
+    /// A listing within the budget returns entries unchanged — the bound
+    /// must not degrade the healthy path.
+    #[tokio::test]
+    async fn prefix_recall_within_budget_returns_entries() {
+        let mem = SlowListMemory::new(Duration::from_millis(50));
+        let tool = MemoryRecallTool::new_with_excludes_and_budget(
+            mem,
+            RecallExcludes::default(),
+            2000,
+        );
+        let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("prefixed entry"));
     }
 
     struct QueryEchoMemory {
