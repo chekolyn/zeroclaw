@@ -1225,6 +1225,11 @@ impl ScopedToolRegistry {
             "file_edit",
             "memory_recall",
             "memory_store",
+            // The compact-skills loader: `skills_prompt_mode_with_loader_fallback`
+            // promotes Compact→Full (inlining every skill body) whenever
+            // `read_skill` is not visible for the turn, so deferring its schema
+            // regresses the prompt. Eager-served keeps compact mode safe.
+            "read_skill",
         ];
         let builtin_deferral = !list_deferred_mcp_specs
             && config
@@ -1987,6 +1992,44 @@ mod tests {
         let activated = assembled.activated_handle.as_ref().unwrap().lock().unwrap();
         assert!(activated.get("calendar").is_none());
         assert!(activated.tool_specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_deferral_keeps_read_skill_eager_for_compact_skills_mode() {
+        // Compact skills mode is only safe when `read_skill` is visible for the
+        // turn (`skills_prompt_mode_with_loader_fallback` promotes Compact→Full
+        // otherwise, inlining every skill body). Deferring `read_skill`'s schema
+        // therefore regresses the system prompt: the loader must stay eager.
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with_counting_tools(Arc::clone(&calls), &["shell", "read_skill", "calendar"]),
+            None,
+            false,
+        )
+        .await;
+        let hidden = assembled.registry.hidden_builtin_names();
+        assert!(
+            !hidden.contains("read_skill"),
+            "read_skill must stay eagerly served under builtin deferral: hiding its \
+             schema trips the compact-skills loader fallback into full-body inline \
+             mode (deferral hid: {hidden:?})"
+        );
+        assert!(
+            hidden.contains("calendar"),
+            "sanity: builtin deferral must still hide non-eager builtins"
+        );
+        // The deferred-builtin prompt section advertises what `tool_search` can
+        // re-expose; `read_skill` is eager, so it must not appear there either.
+        let activated = assembled.activated_handle.as_ref().unwrap().lock().unwrap();
+        let section = activated.deferred_builtin_prompt_section();
+        assert!(
+            !section.contains("read_skill"),
+            "the deferred-builtin section must not advertise the eager read_skill loader"
+        );
     }
 
     #[tokio::test]
