@@ -1326,6 +1326,12 @@ mod payload_capture_tests {
                 "llm_request must carry {key}, got: {row}"
             );
         }
+        for key in super::super::pre_call::PREFLIGHT_PARTITION_KEYS {
+            assert!(
+                attrs.get(key).is_some_and(|v| v.is_u64()),
+                "llm_request must carry {key}, got: {row}"
+            );
+        }
         // The `named_sum + pre_other_ms == pre_call_ms` reconciliation is NOT
         // asserted here: the preset buckets above are virtual durations that
         // did not actually elapse inside this test's microsecond window, so

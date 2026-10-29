@@ -19969,6 +19969,32 @@ Let me check the result."#;
                 .expect("u64 checked above"),
             "the partition family must reconcile to the row's pre_call_ms, got: {llm}"
         );
+
+        // The preflight sub-family decomposes the row's pre_preflight_ms the
+        // same way: the six marked dispatch-gate steps plus the
+        // preflight_other_ms residual must reconcile to the bucket they
+        // partition.
+        for key in crate::agent::turn::pre_call::PREFLIGHT_PARTITION_KEYS {
+            assert!(
+                llm["attributes"][key].is_u64(),
+                "llm_request must carry {key}, got: {llm}"
+            );
+        }
+        let preflight_sum: u64 = crate::agent::turn::pre_call::PREFLIGHT_PARTITION_KEYS
+            .iter()
+            .filter(|key| **key != "preflight_other_ms")
+            .map(|key| llm["attributes"][*key].as_u64().expect("u64 checked above"))
+            .sum();
+        assert_eq!(
+            preflight_sum
+                + llm["attributes"]["preflight_other_ms"]
+                    .as_u64()
+                    .expect("u64 checked above"),
+            llm["attributes"]["pre_preflight_ms"]
+                .as_u64()
+                .expect("u64 checked above"),
+            "the preflight sub-partition must reconcile to the row's pre_preflight_ms, got: {llm}"
+        );
     }
 
     fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {

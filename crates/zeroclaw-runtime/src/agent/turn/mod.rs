@@ -1042,7 +1042,6 @@ fn effective_dispatch_trim_budget(
         Some(cap) => base_trim_budget.min(cap),
     }
 }
->>>>>>> b9c592942 (feat(runtime): per-identity-key child prompt memoization + off-by-default max_turn_prompt_tokens (tuning cycle 2))
 
 fn context_window_exceeded_error(
     (provider_name, model): (&str, &str),
@@ -2716,9 +2715,11 @@ async fn run_tool_call_loop_impl<'a>(
                 ),
             ));
         }
+        pre_call_timings.preflight_budget(preflight_mark.elapsed());
 
         // Recovery must use the final dispatch population, never a snapshot
         // containing turns removed by the pre-dispatch budget trim.
+        let image_mark = Instant::now();
         let submitted_image_ids =
             zeroclaw_providers::multimodal::provider_image_ids(&provider_request_messages);
         let accepted_image_ids = image_cache
@@ -2742,6 +2743,7 @@ async fn run_tool_call_loop_impl<'a>(
             .as_deref()
             .map(zeroclaw_providers::multimodal::provider_image_ids)
             .unwrap_or_default();
+        pre_call_timings.preflight_image(image_mark.elapsed());
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -2750,8 +2752,11 @@ async fn run_tool_call_loop_impl<'a>(
         // called. The warning goes first so a turn that is about to be
         // stopped by the hard limit is never the first sign of trouble.
         announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent);
+        let enforce_mark = Instant::now();
         enforce_tool_loop_budget()?;
+        pre_call_timings.preflight_enforce(enforce_mark.elapsed());
 
+        let notice_mark = Instant::now();
         if single_tool_rounds_requested
             && !tool_specs.is_empty()
             && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Batch
@@ -2767,7 +2772,9 @@ async fn run_tool_call_loop_impl<'a>(
             }
             single_tool_limitation_reported = true;
         }
+        pre_call_timings.preflight_notice(notice_mark.elapsed());
 
+        let strict_mark = Instant::now();
         if strict_tool_parsing
             && !tool_specs.is_empty()
             && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
@@ -2781,14 +2788,17 @@ async fn run_tool_call_loop_impl<'a>(
             }
             .into());
         }
+        pre_call_timings.preflight_strict(strict_mark.elapsed());
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
+        let request_tools_mark = Instant::now();
         let request_tools = if use_native_tools {
             Some(tool_specs)
         } else {
             None
         };
+        pre_call_timings.preflight_request_tools(request_tools_mark.elapsed());
         pre_call_timings.preflight(preflight_mark.elapsed());
         let llm_started_at = announce_llm_request(
             &ctx,
