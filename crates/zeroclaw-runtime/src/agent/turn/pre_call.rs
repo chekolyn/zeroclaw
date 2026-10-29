@@ -3,6 +3,10 @@
 //! the first provider send. Each mark pair is two `Instant::now` calls around
 //! one step; nothing measured is copied or serialized. The residual
 //! (`pre_other_ms`) keeps the family reconciling to the row's `pre_call_ms`.
+//! The dominant bucket (`pre_preflight_ms`, the pre-announce dispatch gates)
+//! carries its own second-level partition with the same shape: named
+//! sub-buckets plus a `preflight_other_ms` residual reconciling to the row's
+//! `pre_preflight_ms`.
 
 use std::time::Duration;
 
@@ -11,7 +15,10 @@ use std::time::Duration;
 /// marked bucket. Test-side single home: the trace-emission tests pin the
 /// family's presence by this list, so a bucket rename or reorder fails them
 /// here first. (`emit_into` writes the family; [`MARKED_KEYS`] carries the
-/// production-side bucket order.)
+/// production-side bucket order. The `pre_preflight_ms` bucket carries its
+/// own second-level family — [`PREFLIGHT_PARTITION_KEYS`] — which is NOT a
+/// member of this list: its sub-buckets decompose `pre_preflight_ms` and
+/// would double-count it in this family's reconciliation.)
 #[cfg(test)]
 pub(crate) const PRE_CALL_PARTITION_KEYS: [&str; 14] = [
     "pre_loop_setup_ms",
@@ -45,6 +52,35 @@ const MARKED_KEYS: [&str; 13] = [
     "pre_preflight_ms",
     "pre_announce_ms",
     "pre_fingerprint_ms",
+];
+
+/// The `preflight_*_ms` sub-family emitted on the iteration-0 `llm_request`
+/// row, in span order. `preflight_other_ms` is last: the sub-family's
+/// residual, not a marked bucket. The sub-buckets decompose the row's
+/// `pre_preflight_ms` (the pre-announce dispatch-gate span, turn/mod.rs) and
+/// must NOT join [`PRE_CALL_PARTITION_KEYS`] — they are sub-intervals of a
+/// bucket that family already counts, so mixing the levels would
+/// double-count the span in the top-level reconciliation.
+#[cfg(test)]
+pub(crate) const PREFLIGHT_PARTITION_KEYS: [&str; 7] = [
+    "preflight_budget_ms",
+    "preflight_image_ms",
+    "preflight_enforce_ms",
+    "preflight_notice_ms",
+    "preflight_strict_ms",
+    "preflight_request_tools_ms",
+    "preflight_other_ms",
+];
+
+/// The six marked preflight sub-buckets in span order
+/// (`preflight_other_ms` excluded).
+const PREFLIGHT_MARKED_KEYS: [&str; 6] = [
+    "preflight_budget_ms",
+    "preflight_image_ms",
+    "preflight_enforce_ms",
+    "preflight_notice_ms",
+    "preflight_strict_ms",
+    "preflight_request_tools_ms",
 ];
 
 /// Accumulated pre-call step timings for one tool-call loop run.
@@ -96,8 +132,31 @@ pub(crate) struct PreCallTimings {
     /// The pre-announce dispatch gates: the retained-tokens context-window
     /// gate, the image-recovery view, `enforce_tool_loop_budget`, the
     /// single-tool-rounds notice, the strict-parsing capability gate, and the
-    /// `request_tools` selection.
+    /// `request_tools` selection. Partitioned one level down — the six
+    /// `preflight_*_ms` sub-buckets below plus a `preflight_other_ms`
+    /// residual reconcile to this total on the emitted row.
     preflight_ms: u64,
+    /// The retained-tokens context-window gate: `dispatch_tokens` plus the
+    /// `> model_context_window` check that fails the turn closed.
+    preflight_budget_ms: u64,
+    /// The image-recovery view: submitted/accepted image-id collection,
+    /// `prepare_provider_image_recovery_view`, and the recovery-view unwrap.
+    preflight_image_ms: u64,
+    /// `enforce_tool_loop_budget` — the fail-closed local tool-loop budget
+    /// check ahead of the announce.
+    preflight_enforce_ms: u64,
+    /// The single-tool-rounds limitation notice. Contains two awaited channel
+    /// sends (`emit_posthoc_turn_chunk` and the `StreamDelta` send) — a slow
+    /// delta consumer lands here, the same suspension class as
+    /// `pre_announce_ms`.
+    preflight_notice_ms: u64,
+    /// The strict-tool-parsing capability gate: the
+    /// `has_mixed_native_tool_support_for_model` rejection under strict
+    /// parsing.
+    preflight_strict_ms: u64,
+    /// The `request_tools` selection: the `use_native_tools` if-expression
+    /// ahead of the announce.
+    preflight_request_tools_ms: u64,
     /// The announce prologue inside `announce_llm_request` ahead of the
     /// fingerprint: the `WaitingOnModel` progress send, the draft-reasoning
     /// status delta, and the `LlmRequest` observer record. Channel sends can
@@ -153,6 +212,30 @@ impl PreCallTimings {
         self.preflight_ms += elapsed.as_millis() as u64;
     }
 
+    pub(crate) fn preflight_budget(&mut self, elapsed: Duration) {
+        self.preflight_budget_ms += elapsed.as_millis() as u64;
+    }
+
+    pub(crate) fn preflight_image(&mut self, elapsed: Duration) {
+        self.preflight_image_ms += elapsed.as_millis() as u64;
+    }
+
+    pub(crate) fn preflight_enforce(&mut self, elapsed: Duration) {
+        self.preflight_enforce_ms += elapsed.as_millis() as u64;
+    }
+
+    pub(crate) fn preflight_notice(&mut self, elapsed: Duration) {
+        self.preflight_notice_ms += elapsed.as_millis() as u64;
+    }
+
+    pub(crate) fn preflight_strict(&mut self, elapsed: Duration) {
+        self.preflight_strict_ms += elapsed.as_millis() as u64;
+    }
+
+    pub(crate) fn preflight_request_tools(&mut self, elapsed: Duration) {
+        self.preflight_request_tools_ms += elapsed.as_millis() as u64;
+    }
+
     pub(crate) fn announce(&mut self, elapsed: Duration) {
         self.announce_ms += elapsed.as_millis() as u64;
     }
@@ -167,7 +250,10 @@ impl PreCallTimings {
     /// after the sub-bucket partition that is only the unmarked slivers (the
     /// engine-entry clock/init lines, the inter-mark statement boundaries,
     /// and any gap between the existing named marks) so the family always
-    /// sums to the total.
+    /// sums to the total. The `preflight_*_ms` sub-family decomposes the
+    /// row's `pre_preflight_ms` the same way: the six marked dispatch-gate
+    /// steps plus a `preflight_other_ms` residual (saturating at the
+    /// millisecond-rounding edge) sum to `pre_preflight_ms`.
     pub(crate) fn emit_into(
         &self,
         map: &mut serde_json::Map<String, serde_json::Value>,
@@ -194,12 +280,33 @@ impl PreCallTimings {
             map.insert((*key).to_string(), serde_json::json!(value));
         }
         map.insert("pre_other_ms".to_string(), serde_json::json!(other));
+
+        let preflight_values: [u64; 6] = [
+            self.preflight_budget_ms,
+            self.preflight_image_ms,
+            self.preflight_enforce_ms,
+            self.preflight_notice_ms,
+            self.preflight_strict_ms,
+            self.preflight_request_tools_ms,
+        ];
+        let preflight_sum: u64 = preflight_values.iter().sum();
+        for (key, value) in PREFLIGHT_MARKED_KEYS.iter().zip(preflight_values) {
+            map.insert((*key).to_string(), serde_json::json!(value));
+        }
+        let preflight_other = self.preflight_ms.saturating_sub(preflight_sum);
+        map.insert(
+            "preflight_other_ms".to_string(),
+            serde_json::json!(preflight_other),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PreCallTimings, MARKED_KEYS, PRE_CALL_PARTITION_KEYS};
+    use super::{
+        MARKED_KEYS, PRE_CALL_PARTITION_KEYS, PREFLIGHT_MARKED_KEYS, PREFLIGHT_PARTITION_KEYS,
+        PreCallTimings,
+    };
     use std::time::Duration;
 
     #[test]
@@ -276,8 +383,90 @@ mod tests {
     fn zero_timings_still_emit_the_full_family() {
         let mut map = serde_json::Map::new();
         PreCallTimings::default().emit_into(&mut map, 0);
-        for key in PRE_CALL_PARTITION_KEYS {
+        for key in PRE_CALL_PARTITION_KEYS
+            .iter()
+            .copied()
+            .chain(PREFLIGHT_PARTITION_KEYS)
+        {
             assert_eq!(map[key].as_u64(), Some(0), "{key} present even at zero");
         }
+    }
+
+    #[test]
+    fn preflight_sub_family_reconciles_to_the_preflight_total() {
+        let mut timings = PreCallTimings::default();
+        timings.preflight_budget(Duration::from_millis(2));
+        timings.preflight_image(Duration::from_millis(3));
+        timings.preflight_enforce(Duration::from_millis(1));
+        timings.preflight_notice(Duration::from_millis(0));
+        timings.preflight_strict(Duration::from_millis(0));
+        timings.preflight_request_tools(Duration::from_millis(1));
+        // The measured span total (the `preflight_mark` pair): the six named
+        // sub-buckets sum to 7; the remaining 3ms are the inter-mark slivers.
+        timings.preflight(Duration::from_millis(10));
+
+        let mut map = serde_json::Map::new();
+        timings.emit_into(&mut map, 100);
+
+        for key in PREFLIGHT_PARTITION_KEYS {
+            assert!(
+                map[key].is_u64(),
+                "{key} must be emitted as a u64, got: {map:?}"
+            );
+        }
+        assert_eq!(map["preflight_budget_ms"].as_u64(), Some(2));
+        assert_eq!(map["preflight_image_ms"].as_u64(), Some(3));
+        assert_eq!(map["preflight_enforce_ms"].as_u64(), Some(1));
+        assert_eq!(map["preflight_notice_ms"].as_u64(), Some(0));
+        assert_eq!(map["preflight_strict_ms"].as_u64(), Some(0));
+        assert_eq!(map["preflight_request_tools_ms"].as_u64(), Some(1));
+        let sub_sum: u64 = PREFLIGHT_MARKED_KEYS
+            .iter()
+            .map(|key| map[*key].as_u64().expect("u64 checked above"))
+            .sum();
+        assert_eq!(
+            sub_sum
+                + map["preflight_other_ms"]
+                    .as_u64()
+                    .expect("u64 checked above"),
+            map["pre_preflight_ms"].as_u64().expect("u64 checked above"),
+            "the preflight sub-partition must reconcile to the row's pre_preflight_ms"
+        );
+        assert_eq!(
+            map["preflight_other_ms"].as_u64(),
+            Some(3),
+            "residual = pre_preflight_ms minus the six named sub-buckets (2+3+1+0+0+1)"
+        );
+        // The top-level family still partitions pre_call_ms: its named buckets
+        // include pre_preflight_ms (10), so the residual closes to 100.
+        let named_sum: u64 = MARKED_KEYS
+            .iter()
+            .map(|key| map[*key].as_u64().expect("u64 checked above"))
+            .sum();
+        assert_eq!(
+            named_sum + map["pre_other_ms"].as_u64().expect("u64 checked above"),
+            100,
+            "the top-level family must still partition the row's pre_call_ms"
+        );
+    }
+
+    #[test]
+    fn preflight_other_saturates_at_the_rounding_edge() {
+        let mut timings = PreCallTimings::default();
+        timings.preflight_budget(Duration::from_millis(5));
+        // No `preflight()` total: the sub-bucket sum sits above the (zero)
+        // measured total — the per-bucket truncation edge shape.
+        let mut map = serde_json::Map::new();
+        timings.emit_into(&mut map, 10);
+        assert_eq!(
+            map["preflight_other_ms"].as_u64(),
+            Some(0),
+            "the preflight residual saturates at zero"
+        );
+        assert_eq!(
+            map["preflight_budget_ms"].as_u64(),
+            Some(5),
+            "marked preflight sub-buckets stay intact"
+        );
     }
 }
