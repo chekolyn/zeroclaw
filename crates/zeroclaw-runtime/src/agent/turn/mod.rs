@@ -15,6 +15,7 @@ pub(crate) mod media_degrade;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
+pub(crate) mod pre_call;
 pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
@@ -1048,7 +1049,6 @@ fn effective_dispatch_trim_budget(
         Some(cap) => base_trim_budget.min(cap),
     }
 }
->>>>>>> b9c592942 (feat(runtime): per-identity-key child prompt memoization + off-by-default max_turn_prompt_tokens (tuning cycle 2))
 
 fn context_window_exceeded_error(
     (provider_name, model): (&str, &str),
@@ -1708,6 +1708,10 @@ async fn run_tool_call_loop_impl<'a>(
     // gap between the rules-inject row and the first provider send — is
     // attributable from a single trace row.
     let turn_started_at = std::time::Instant::now();
+    // The pre-call partition: named elapsed-ms buckets over the steps between
+    // this clock and the first provider send, emitted as the `pre_*_ms` attr
+    // family on the iteration-0 `llm_request` row (see `pre_call`).
+    let mut pre_call_timings = pre_call::PreCallTimings::default();
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1855,6 +1859,7 @@ async fn run_tool_call_loop_impl<'a>(
         }
     }
 
+    let memory_mark = std::time::Instant::now();
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -1897,6 +1902,7 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
     }
+    pre_call_timings.memory(memory_mark.elapsed());
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2193,6 +2199,7 @@ async fn run_tool_call_loop_impl<'a>(
             .into());
         }
 
+        let resolve_mark = Instant::now();
         let (vision_model_provider_box, degrade_strip_images) =
             vision_route::resolve_vision_provider_with_allowed_refs(
                 config,
@@ -2207,6 +2214,7 @@ async fn run_tool_call_loop_impl<'a>(
                 knobs.provider_attempt_allowlist.as_deref(),
             )
             .await?;
+        pre_call_timings.resolve(resolve_mark.elapsed());
 
         let (
             active_model_provider,
@@ -2225,6 +2233,7 @@ async fn run_tool_call_loop_impl<'a>(
                 (model_provider, provider_name, model, dispatch_model)
             };
 
+        let specs_mark = Instant::now();
         let mut iteration_tool_specs = build_iteration_tool_specs(
             active_model_provider,
             active_dispatch_model,
@@ -2232,6 +2241,7 @@ async fn run_tool_call_loop_impl<'a>(
             excluded_tools,
             activated_tools,
         )?;
+        pre_call_timings.tool_specs(specs_mark.elapsed());
 
         // The request is built from a population in which turns older than
         // the newest `keep_tool_context_turns + 1` have lost their tool rows.
@@ -2246,6 +2256,7 @@ async fn run_tool_call_loop_impl<'a>(
         if iteration == 0 && collapsed.dropped_messages > 0 {
             record_tool_context_collapse(&collapsed, keep_tool_context_turns, turn_id);
         }
+        let assemble_mark = Instant::now();
         let (prepared_messages, prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
                 &collapsed.messages,
@@ -2254,6 +2265,7 @@ async fn run_tool_call_loop_impl<'a>(
                 image_cache.as_mut().map(|state| &mut *state.cache),
             )
             .await?;
+        pre_call_timings.assemble(assemble_mark.elapsed());
         // Source rows must index the working history, not the collapsed copy.
         let mut prepared_source_rows: Vec<usize> = prepared_source_rows
             .iter()
@@ -2264,6 +2276,7 @@ async fn run_tool_call_loop_impl<'a>(
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
 
+        let hooks_mark = Instant::now();
         if let Some(hooks) = base_ctx.hooks.filter(|hooks| !hooks.is_empty()) {
             let mut candidate_model = active_model.to_string();
             match hooks
@@ -2284,6 +2297,7 @@ async fn run_tool_call_loop_impl<'a>(
                 }
             }
         }
+        pre_call_timings.hooks(hooks_mark.elapsed());
         // Capture hook-added suffix (messages appended after the original
         // prepared messages, with that original population otherwise intact
         // and in place) so a pre-dispatch trim can rebuild the post-hook
@@ -2350,6 +2364,7 @@ async fn run_tool_call_loop_impl<'a>(
         } else {
             active_model
         };
+        let limits_mark = Instant::now();
         let active_context_limits = resolve_context_limits_for_call(
             context_limits_resolver.as_ref(),
             config,
@@ -2358,6 +2373,7 @@ async fn run_tool_call_loop_impl<'a>(
             provider_request_model,
             context_limits,
         );
+        pre_call_timings.resolve(limits_mark.elapsed());
         let context_token_budget = active_context_limits.context_token_budget;
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
@@ -2380,6 +2396,7 @@ async fn run_tool_call_loop_impl<'a>(
                 context_limits: active_context_limits,
             });
         }
+        let specs_refresh_mark = Instant::now();
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let tool_specs = iteration_tool_specs.request_tool_specs();
         let use_native_tools = iteration_tool_specs.use_native_tools;
@@ -2399,6 +2416,7 @@ async fn run_tool_call_loop_impl<'a>(
                 }
             })
         });
+        pre_call_timings.tool_specs(specs_refresh_mark.elapsed());
 
         let single_tool_rounds_requested = config
             .zip(agent_alias)
@@ -2415,6 +2433,7 @@ async fn run_tool_call_loop_impl<'a>(
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
         // chooses a different model; unscoped callers retain their own prompt.
+        let framing_mark = Instant::now();
         refresh_prompt_anchor(turn_state.history, use_native_tools);
         refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
         refresh_scoped_tool_protocol_prompt(
@@ -2444,7 +2463,9 @@ async fn run_tool_call_loop_impl<'a>(
             // A request-only system row must survive whole-turn trimming.
             prepared_source_rows.insert(0, usize::MAX);
         }
+        pre_call_timings.assemble(framing_mark.elapsed());
 
+        let estimate_mark = Instant::now();
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -2490,6 +2511,7 @@ async fn run_tool_call_loop_impl<'a>(
         let mut reported_population_estimated =
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 + tool_schema_tokens;
+        pre_call_timings.estimate(estimate_mark.elapsed());
 
         // Reuse a report only for the route that produced it. A model switch
         // must not inherit another model's token calibration. Keep the existing
@@ -2506,6 +2528,7 @@ async fn run_tool_call_loop_impl<'a>(
         // prompt framing. Rebuild after each whole-turn drop without invoking
         // the hook again. The soft target never makes the newest turn droppable;
         // only the model's capacity can reject its final retained population.
+        let trim_mark = Instant::now();
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
         let tokens_before_dispatch = dispatch_tokens(reported_population_estimated);
@@ -2743,6 +2766,7 @@ async fn run_tool_call_loop_impl<'a>(
                 },
             );
         }
+        pre_call_timings.trim(trim_mark.elapsed());
         let retained_tokens = dispatch_tokens(reported_population_estimated);
         if retained_tokens > model_context_window as u64 {
             return Err(context_window_exceeded_error(
@@ -2838,6 +2862,7 @@ async fn run_tool_call_loop_impl<'a>(
             active_model_provider_name,
             provider_request_model,
             iteration,
+            &mut pre_call_timings,
         )
         .await;
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);

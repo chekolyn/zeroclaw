@@ -110,6 +110,7 @@ pub(crate) async fn announce_llm_request(
     active_model_provider_name: &str,
     active_model: &str,
     iteration: usize,
+    pre_call: &mut super::pre_call::PreCallTimings,
 ) -> Instant {
     // ── Progress: LLM thinking ────────────────────────────
     send_progress(ctx.on_delta, ProgressEvent::WaitingOnModel).await;
@@ -134,7 +135,10 @@ pub(crate) async fn announce_llm_request(
         // Prefix fingerprints are hashes and counts, not content: they carry
         // no credentials or message text, so unlike the payload capture
         // below they are emitted on every event, whatever the policy.
+        let fingerprint_mark = Instant::now();
         let fingerprint = prefix_fingerprint(request_messages, request_tools);
+        pre_call.fingerprint(fingerprint_mark.elapsed());
+        let pre_call_ms = ctx.turn_started_at.elapsed().as_millis() as u64;
         let mut attrs = ::serde_json::json!({
             "iteration": iteration + 1,
             "messages_count": request_messages.len(),
@@ -145,9 +149,18 @@ pub(crate) async fn announce_llm_request(
             // iterations). The iteration-1 value is the turn's pre-call
             // latency: hooks, memory recall, and dispatch prep sit between
             // the turn's first row and this send.
-            "pre_call_ms": ctx.turn_started_at.elapsed().as_millis() as u64,
+            "pre_call_ms": pre_call_ms,
             "trace_id": ctx.turn_id,
         });
+        // The pre-call partition (the `pre_*_ms` family) decomposes this
+        // row's pre_call_ms into the named engine steps plus a residual; it
+        // is emitted on the iteration-0 row only — the row whose pre_call_ms
+        // is the turn's pre-call latency.
+        if iteration == 0
+            && let ::serde_json::Value::Object(map) = &mut attrs
+        {
+            pre_call.emit_into(map, pre_call_ms);
+        }
         if let ::serde_json::Value::Object(map) = &mut attrs {
             if let Some(system_sha256) = fingerprint.system_sha256.as_deref() {
                 map.insert("system_sha256".to_string(), system_sha256.into());
@@ -705,6 +718,7 @@ pub(crate) async fn call_provider(
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
+    use super::super::pre_call::PreCallTimings;
     use super::{announce_llm_request, prefix_fingerprint};
     use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
@@ -795,8 +809,17 @@ mod payload_capture_tests {
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
             let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
-            let _ = announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0)
-                .await;
+            let _ = announce_llm_request(
+                &ctx,
+                &history,
+                None,
+                &provider,
+                "stub",
+                "stub-model",
+                0,
+                &mut PreCallTimings::default(),
+            )
+            .await;
             drop(tx);
             assert!(matches!(
                 rx.recv().await,
@@ -810,8 +833,17 @@ mod payload_capture_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
         let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
-        let _ =
-            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 3).await;
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            None,
+            &provider,
+            "stub",
+            "stub-model",
+            3,
+            &mut PreCallTimings::default(),
+        )
+        .await;
         drop(tx);
         assert!(matches!(
             rx.recv().await,
@@ -893,8 +925,17 @@ mod payload_capture_tests {
 
         let mut ctx = test_ctx(&observer, &pacing);
         ctx.turn_id = "trace-payload-capture-test";
-        let _ =
-            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            None,
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+            &mut PreCallTimings::default(),
+        )
+        .await;
         let on_record = next_llm_request(&mut rx, ctx.turn_id).await;
 
         let attrs = on_record
@@ -934,8 +975,17 @@ mod payload_capture_tests {
 
         let mut ctx = test_ctx(&observer, &pacing);
         ctx.turn_id = "trace-payload-capture-test";
-        let _ =
-            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            None,
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+            &mut PreCallTimings::default(),
+        )
+        .await;
         let off_record = next_llm_request(&mut rx, ctx.turn_id).await;
 
         let off_attrs = off_record
@@ -1148,6 +1198,7 @@ mod payload_capture_tests {
             "stub",
             "stub-model",
             0,
+            &mut PreCallTimings::default(),
         )
         .await;
         let record = next_llm_request(&mut rx, ctx.turn_id).await;
@@ -1204,6 +1255,100 @@ mod payload_capture_tests {
                 .tools_sha256
                 .as_deref()
                 .expect("helper computes a tools hash")
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_carries_the_pre_call_partition_on_iteration_zero_only() {
+        // Serialize against writer::tests and the broadcast-hook tests (the
+        // same shared-subscriber discipline as the payload-capture test).
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let provider = StubProvider;
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+
+        // Iteration 0: the full pre_*_ms family is present. Preset buckets
+        // prove the attrs flow from the caller's accumulator.
+        install_writer("off");
+        while rx.try_recv().is_ok() {}
+
+        let mut ctx = test_ctx(&observer, &pacing);
+        ctx.turn_id = "trace-pre-call-partition-test";
+        let mut timings = PreCallTimings::default();
+        timings.memory(std::time::Duration::from_millis(11));
+        timings.tool_specs(std::time::Duration::from_millis(4));
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            None,
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+            &mut timings,
+        )
+        .await;
+        let row = next_llm_request(&mut rx, ctx.turn_id).await;
+        let attrs = row
+            .get("attributes")
+            .expect("llm_request record carries attributes");
+        assert_eq!(
+            attrs.get("pre_memory_ms").and_then(|v| v.as_u64()),
+            Some(11),
+            "the preset memory bucket must flow onto the row, got: {row}"
+        );
+        assert_eq!(
+            attrs.get("pre_tool_specs_ms").and_then(|v| v.as_u64()),
+            Some(4),
+            "the preset tool-specs bucket must flow onto the row, got: {row}"
+        );
+        for key in super::super::pre_call::PRE_CALL_PARTITION_KEYS {
+            assert!(
+                attrs.get(key).is_some_and(|v| v.is_u64()),
+                "llm_request must carry {key}, got: {row}"
+            );
+        }
+        // The `named_sum + pre_other_ms == pre_call_ms` reconciliation is NOT
+        // asserted here: the preset buckets above are virtual durations that
+        // did not actually elapse inside this test's microsecond window, so
+        // the sum can exceed the total. In the real engine the marks are
+        // sub-intervals of the measured window, and the reconciliation holds
+        // exactly — it is pinned by the pre_call unit tests and by the
+        // engine-path test `memory_inject_row_lights_up_the_pre_request_segment`.
+
+        // Iteration != 0: the family is absent — the partition describes the
+        // turn's pre-call segment, which only the iteration-0 row measures.
+        while rx.try_recv().is_ok() {}
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            None,
+            &provider,
+            "stub",
+            "stub-model",
+            3,
+            &mut PreCallTimings::default(),
+        )
+        .await;
+        let later_row = next_llm_request(&mut rx, ctx.turn_id).await;
+        let later_attrs = later_row
+            .get("attributes")
+            .expect("llm_request record carries attributes");
+        assert!(
+            later_attrs.get("pre_memory_ms").is_none(),
+            "the pre-call partition is iteration-0 only, got: {later_row}"
         );
 
         zeroclaw_log::clear_broadcast_hook();
