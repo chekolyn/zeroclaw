@@ -19943,6 +19943,32 @@ Let me check the result."#;
             llm["attributes"]["pre_call_ms"].is_u64(),
             "llm_request must carry pre_call_ms, got: {llm}"
         );
+
+        // The pre-call partition family decomposes that pre_call_ms into the
+        // named engine steps plus a residual: the marks run inside
+        // `run_tool_call_loop_impl` and land on the iteration-0 row via
+        // `announce_llm_request`. The engine-path emission pin.
+        for key in crate::agent::turn::pre_call::PRE_CALL_PARTITION_KEYS {
+            assert!(
+                llm["attributes"][key].is_u64(),
+                "llm_request must carry {key}, got: {llm}"
+            );
+        }
+        let named_sum: u64 = crate::agent::turn::pre_call::PRE_CALL_PARTITION_KEYS
+            .iter()
+            .filter(|key| **key != "pre_other_ms")
+            .map(|key| llm["attributes"][*key].as_u64().expect("u64 checked above"))
+            .sum();
+        assert_eq!(
+            named_sum
+                + llm["attributes"]["pre_other_ms"]
+                    .as_u64()
+                    .expect("u64 checked above"),
+            llm["attributes"]["pre_call_ms"]
+                .as_u64()
+                .expect("u64 checked above"),
+            "the partition family must reconcile to the row's pre_call_ms, got: {llm}"
+        );
     }
 
     fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {

@@ -107,7 +107,16 @@ impl<'a> TurnCtx<'a> {
             channel: self.channel,
             draft_reasoning: self.draft_reasoning,
             turn_id: self.turn_id,
-            turn_started_at: std::time::Instant::now(),
+            // Carry the engine-entry clock, NOT a fresh `Instant::now()`:
+            // `pre_call_ms` on the `llm_request` rows reads this field and its
+            // contract is the engine-entry wall clock (`run_tool_call_loop_impl`
+            // start), so the pre-request segment — memory recall, dispatch prep
+            // — is measurable from the first row. A fresh clock here shrank
+            // every row's `pre_call_ms` to the route-boundary→announce span
+            // (found 2026-10-29 wiring the pre-call partition family: the
+            // family's marks begin at engine entry, and a reset route clock
+            // made the named sum exceed the row's total).
+            turn_started_at: self.turn_started_at,
             agent_alias: self.agent_alias,
             parent_agent_alias: self.parent_agent_alias,
             serving_provider_name: Some(provider_name.to_string()),
