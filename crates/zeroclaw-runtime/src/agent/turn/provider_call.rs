@@ -112,6 +112,11 @@ pub(crate) async fn announce_llm_request(
     iteration: usize,
     pre_call: &mut super::pre_call::PreCallTimings,
 ) -> Instant {
+    // Announce-prologue span: the progress/status sends and the LlmRequest
+    // observer record ahead of the fingerprint — the last sub-bucket of the
+    // former `pre_other_ms` residual. The progress send can suspend on a slow
+    // consumer; a stalled channel lands here.
+    let announce_mark = Instant::now();
     // ── Progress: LLM thinking ────────────────────────────
     send_progress(ctx.on_delta, ProgressEvent::WaitingOnModel).await;
     if ctx.draft_reasoning == StreamReasoningMode::Status
@@ -135,6 +140,7 @@ pub(crate) async fn announce_llm_request(
         // Prefix fingerprints are hashes and counts, not content: they carry
         // no credentials or message text, so unlike the payload capture
         // below they are emitted on every event, whatever the policy.
+        pre_call.announce(announce_mark.elapsed());
         let fingerprint_mark = Instant::now();
         let fingerprint = prefix_fingerprint(request_messages, request_tools);
         pre_call.fingerprint(fingerprint_mark.elapsed());

@@ -1670,6 +1670,10 @@ async fn run_tool_call_loop_impl<'a>(
     // this clock and the first provider send, emitted as the `pre_*_ms` attr
     // family on the iteration-0 `llm_request` row (see `pre_call`).
     let mut pre_call_timings = pre_call::PreCallTimings::default();
+    // Loop-setup span: engine entry through the memory mark (the destructure,
+    // TurnState, the ingress policy, the principal stamp) — the first
+    // sub-bucket of the former `pre_other_ms` residual.
+    let loop_setup_mark = Instant::now();
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1810,6 +1814,7 @@ async fn run_tool_call_loop_impl<'a>(
         }
     }
 
+    pre_call_timings.loop_setup(loop_setup_mark.elapsed());
     let memory_mark = std::time::Instant::now();
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
@@ -1855,6 +1860,9 @@ async fn run_tool_call_loop_impl<'a>(
     }
     pre_call_timings.memory(memory_mark.elapsed());
 
+    // Loop-head setup span (detector/pacing config, base_ctx, the SOP exec
+    // cache, the usage seed) — the second sub-bucket of the residual.
+    let pacing_mark = Instant::now();
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1940,7 +1948,12 @@ async fn run_tool_call_loop_impl<'a>(
     // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
     let mut budget_warning_sent = false;
 
+    pre_call_timings.pacing(pacing_mark.elapsed());
     for iteration in 0..max_iterations {
+        // Per-iteration head span (step-scope exclusions, steering, budget
+        // reserve, preflight maintenance, the model-switch check) — the third
+        // sub-bucket of the residual.
+        let step_scope_mark = Instant::now();
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
         //
@@ -2134,6 +2147,7 @@ async fn run_tool_call_loop_impl<'a>(
             .into());
         }
 
+        pre_call_timings.step_scope(step_scope_mark.elapsed());
         let resolve_mark = Instant::now();
         let (vision_model_provider_box, degrade_strip_images) =
             vision_route::resolve_vision_provider_with_allowed_refs(
@@ -2683,6 +2697,11 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
         pre_call_timings.trim(trim_mark.elapsed());
+        // Pre-announce dispatch-gate span (the context-window gate, the
+        // image-recovery view, the tool-loop budget, the notices, the
+        // strict-parsing gate, the request_tools selection) — the fourth
+        // sub-bucket of the residual.
+        let preflight_mark = Instant::now();
         let retained_tokens = dispatch_tokens(reported_population_estimated);
         if retained_tokens > model_context_window as u64 {
             return Err(context_window_exceeded_error(
@@ -2770,6 +2789,7 @@ async fn run_tool_call_loop_impl<'a>(
         } else {
             None
         };
+        pre_call_timings.preflight(preflight_mark.elapsed());
         let llm_started_at = announce_llm_request(
             &ctx,
             &provider_request_messages,
