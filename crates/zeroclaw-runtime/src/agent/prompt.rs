@@ -1146,14 +1146,19 @@ mod tests {
 
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
-        assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
+        // Compact diet: one line per skill — name + capped description; the
+        // `<location>` tag is dropped (read_skill(name) needs only the name).
+        assert!(output.contains("- deploy: Release safely"));
+        assert!(!output.contains("<location>"));
+        assert!(!output.contains("<skill>"));
         assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Compact mode should still include tools so the LLM knows about them.
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
-        assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy__release_checklist</name>"));
+        // Registered tools (shell kind) appear as one `callable:` line with the
+        // prefixed name.
+        assert!(
+            output.contains("callable: deploy__release_checklist — Validate release readiness")
+        );
     }
 
     #[test]
@@ -1197,9 +1202,10 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_keeps_instructions_for_always_skill() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SkillToolTestTool(
-            "security-policy__release_checklist",
-        ))];
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadSkillTestTool),
+            Box::new(SkillToolTestTool("security-policy__release_checklist")),
+        ];
         let skills = vec![crate::skills::Skill {
             name: "security-policy".into(),
             description: "Critical safety rules".into(),
@@ -1245,12 +1251,15 @@ mod tests {
 
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
-        assert!(output.contains("<name>security-policy</name>"));
+        assert!(output.contains("- security-policy: Critical safety rules"));
         // `always: true` forces instructions to stay inlined even in compact mode.
-        assert!(output.contains("<instruction>Never skip the safety review.</instruction>"));
+        assert!(output.contains("instructions: Never skip the safety review."));
         // Tools are still listed as in any other skill.
-        assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>security-policy__release_checklist</name>"));
+        assert!(
+            output.contains(
+                "callable: security-policy__release_checklist — Validate release readiness"
+            )
+        );
     }
 
     #[test]

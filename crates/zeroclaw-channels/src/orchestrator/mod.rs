@@ -38820,8 +38820,8 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
-        assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
+        assert!(prompt.contains("- code-review: Review code for bugs"));
+        assert!(!prompt.contains("<location>"));
         assert!(prompt.contains("loaded on demand"));
         assert!(!prompt.contains("<instructions>"));
         assert!(
@@ -38830,9 +38830,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )
         );
         // Compact mode should still include tools so the LLM knows about them.
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
-        assert!(prompt.contains("<callable_tools"));
-        assert!(prompt.contains("<name>code-review__lint</name>"));
+        // Registered tools (shell kind) appear as one `callable:` line with the
+        // prefixed name.
+        assert!(prompt.contains("callable: code-review__lint — Run static checks"));
     }
 
     #[test]
@@ -46793,14 +46793,15 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(cached_compact_prompt.contains("read_skill(name)"));
         assert!(!cached_compact_prompt.contains("Expose this skill on fresh sessions."));
-        let callable = cached_compact_prompt
-            .split_once("<callable_tools")
-            .and_then(|(_, rest)| rest.split_once("</callable_tools>"))
-            .map(|(block, _)| block)
-            .expect("registered shell skill should remain callable after refresh");
-        assert!(callable.contains("<name>refresh-test__shell</name>"));
-        assert!(!callable.contains("<name>refresh-test__fetch</name>"));
-        assert!(cached_compact_prompt.contains("<name>fetch</name>"));
+        // Compact diet: registered skill tools render as one `callable:` line
+        // per tool, prefixed-name first; unregistered ones stay listed but
+        // distinct.
+        assert!(
+            cached_compact_prompt.contains("callable: refresh-test__shell — Run the refresh check"),
+            "registered shell skill should remain callable after refresh"
+        );
+        assert!(!cached_compact_prompt.contains("refresh-test__fetch"));
+        assert!(cached_compact_prompt.contains("tool (http): fetch — Fetch refresh status"));
         let mut provider_transition_history = vec![ChatMessage::system(cached_compact_prompt)];
         refresh_channel_history_skills(
             runtime_ctx.as_ref(),

@@ -1669,6 +1669,26 @@ pub fn skills_to_prompt_with_mode(
     skills_to_prompt_with_mode_and_availability(skills, workspace_dir, mode, |_| true)
 }
 
+/// Compact-mode description cap for the one-line skill index. The discovery
+/// surface is the name + the trigger gist; the full description (and the
+/// whole skill body) loads on demand via `read_skill`.
+const COMPACT_SKILL_DESC_MAX_CHARS: usize = 100;
+
+/// Flatten a description to the single line the compact index renders:
+/// newlines become spaces so every skill stays exactly one list entry.
+fn compact_one_line(text: &str) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= COMPACT_SKILL_DESC_MAX_CHARS {
+        return flattened;
+    }
+    let mut cut: String = flattened
+        .chars()
+        .take(COMPACT_SKILL_DESC_MAX_CHARS)
+        .collect();
+    cut.push('…');
+    cut
+}
+
 /// Build the available-skills prompt while checking callable names against the
 /// effective tool surface. Tools that fail this availability check remain in
 /// descriptive metadata so the skill and its instructions are not dropped.
@@ -1699,23 +1719,83 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
     let mut ordered: Vec<&Skill> = skills.iter().collect();
     ordered.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut prompt = if is_full {
-        String::from(
-            "## Available Skills\n\n\
-             Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-             <available_skills>\n",
-        )
-    } else {
-        String::from(
+    if !is_full {
+        // Compact diet: one line per skill — `- name: description(≤100)`.
+        // The `<location>` tag is dropped: `read_skill(name)` resolves by
+        // name alone, so the per-skill path was pure prompt weight. The
+        // `<available_skills>` wrapper stays so the channel mode detector's
+        // section slicing (`</available_skills>`) keeps working.
+        let mut prompt = String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
-             Skills marked `always` include full instructions below even in compact mode.\n\
-             The `location` field is included for reference.\n\n\
-             <available_skills>\n",
-        )
-    };
+             Skill instructions are loaded on demand: call `read_skill(name)` when you need the full skill file.\n\
+             Skills marked `always` include full instructions below even in compact mode.\n\n",
+        );
+        let any_callable = ordered.iter().any(|skill| {
+            skill.tools.iter().any(|t| {
+                skill_tool_is_prompt_callable(t)
+                    && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                        &skill.name,
+                        &t.name,
+                    ))
+            })
+        });
+        if any_callable {
+            prompt.push_str(
+                "Tools listed under a skill are registered callable specs — invoke them directly by their prefixed name.\n\n",
+            );
+        }
+        prompt.push_str("<available_skills>\n");
+        for skill in ordered {
+            let _ = writeln!(
+                prompt,
+                "- {}: {}",
+                skill.name,
+                compact_one_line(&skill.description)
+            );
+            // Always-injected skills keep their instructions inline even in
+            // compact mode; other instructions load through `read_skill`.
+            if skill.always && !skill.prompts.is_empty() {
+                for instruction in &skill.prompts {
+                    let _ = writeln!(prompt, "  instructions: {}", compact_one_line(instruction));
+                }
+            }
+            if !skill.tools.is_empty() {
+                for tool in &skill.tools {
+                    let callable = skill_tool_is_prompt_callable(tool)
+                        && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &tool.name,
+                        ));
+                    if callable {
+                        let _ = writeln!(
+                            prompt,
+                            "  callable: {} — {}",
+                            crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
+                            compact_one_line(&tool.description)
+                        );
+                    } else {
+                        let _ = writeln!(
+                            prompt,
+                            "  tool ({}): {} — {}",
+                            tool.kind,
+                            tool.name,
+                            compact_one_line(&tool.description)
+                        );
+                    }
+                }
+            }
+        }
+        prompt.push_str("</available_skills>\n");
+        return prompt;
+    }
+
+    let mut prompt = String::from(
+        "## Available Skills\n\n\
+         Skill instructions and tool metadata are preloaded below.\n\
+         Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
+         <available_skills>\n",
+    );
 
     for skill in ordered {
         let _ = writeln!(prompt, "  <skill>");
@@ -5250,6 +5330,112 @@ mod prompt_callable_name_tests {
             orphan_at > tools_at,
             "target-less mcp skill tool must render as unregistered, not callable:\n{prompt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_render_diet_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn skill(name: &str, description: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: Some(Path::new("/tmp/workspace/skills/x/SKILL.md").to_path_buf()),
+        }
+    }
+
+    fn compact(skills: &[Skill]) -> String {
+        skills_to_prompt_with_mode(
+            skills,
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        )
+    }
+
+    #[test]
+    fn compact_renders_one_line_per_skill_without_location() {
+        let skills = vec![skill("alpha", "First skill"), skill("beta", "Second skill")];
+        let prompt = compact(&skills);
+        assert!(prompt.contains("- alpha: First skill"), "got:\n{prompt}");
+        assert!(prompt.contains("- beta: Second skill"), "got:\n{prompt}");
+        assert!(!prompt.contains("<location>"));
+        assert!(!prompt.contains("<skill>"));
+        // The section stays sliceable by the channel mode detector.
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.trim_end().ends_with("</available_skills>"));
+    }
+
+    #[test]
+    fn compact_caps_description_at_100_chars() {
+        let long = "x".repeat(250);
+        let prompt = compact(&[skill("long", &long)]);
+        let expected = format!("- long: {}…", "x".repeat(100));
+        assert!(
+            prompt.contains(&expected),
+            "capped one-liner missing:\n{prompt}"
+        );
+        assert!(!prompt.contains(&"x".repeat(120)));
+    }
+
+    #[test]
+    fn compact_flattens_newlines_in_description() {
+        let prompt = compact(&[skill("multi", "line one\nline two")]);
+        assert!(
+            prompt.contains("- multi: line one line two"),
+            "got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn compact_keeps_callable_tools_with_prefixed_names() {
+        let mut s = skill("deploy", "Release safely");
+        s.tools = vec![SkillTool {
+            name: "release_checklist".to_string(),
+            description: "Validate release readiness".to_string(),
+            kind: "shell".to_string(),
+            command: "echo ok".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }];
+        let prompt = compact(&[s]);
+        assert!(
+            prompt.contains("callable: deploy__release_checklist — Validate release readiness"),
+            "got:\n{prompt}"
+        );
+        assert!(prompt.contains("invoke them directly by their prefixed name"));
+    }
+
+    #[test]
+    fn compact_omits_callable_hint_when_no_skill_has_tools() {
+        let prompt = compact(&[skill("alpha", "First skill")]);
+        assert!(
+            !prompt.contains("registered callable specs"),
+            "the callable hint must not render when no skill has tools:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn full_mode_keeps_xml_and_location() {
+        let prompt = skills_to_prompt_with_mode(
+            &[skill("alpha", "First skill")],
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+        assert!(prompt.contains("<skill>"));
+        assert!(prompt.contains("<location>"));
+        assert!(!prompt.contains("- alpha:"));
     }
 }
 
