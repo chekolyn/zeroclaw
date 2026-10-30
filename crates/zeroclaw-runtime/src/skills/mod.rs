@@ -1672,7 +1672,7 @@ pub fn skills_to_prompt_with_mode(
 /// Compact-mode description cap for the one-line skill index. The discovery
 /// surface is the name + the trigger gist; the full description (and the
 /// whole skill body) loads on demand via `read_skill`.
-const COMPACT_SKILL_DESC_MAX_CHARS: usize = 100;
+const COMPACT_SKILL_DESC_MAX_CHARS: usize = 80;
 
 /// Flatten a description to the single line the compact index renders:
 /// newlines become spaces so every skill stays exactly one list entry.
@@ -5376,15 +5376,15 @@ mod compact_render_diet_tests {
     }
 
     #[test]
-    fn compact_caps_description_at_100_chars() {
+    fn compact_caps_description_at_80_chars() {
         let long = "x".repeat(250);
         let prompt = compact(&[skill("long", &long)]);
-        let expected = format!("- long: {}…", "x".repeat(100));
+        let expected = format!("- long: {}…", "x".repeat(80));
         assert!(
             prompt.contains(&expected),
             "capped one-liner missing:\n{prompt}"
         );
-        assert!(!prompt.contains(&"x".repeat(120)));
+        assert!(!prompt.contains(&"x".repeat(90)));
     }
 
     #[test]
