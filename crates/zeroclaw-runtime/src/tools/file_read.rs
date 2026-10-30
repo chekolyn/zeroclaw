@@ -83,7 +83,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode."
+        "Read file contents with line numbers"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -91,21 +91,17 @@ impl Tool for FileReadTool {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
+                    "type": "string"
                 },
                 "offset": {
-                    "type": "integer",
-                    "description": "Starting line number (1-based, default: 1). Ignored when encoding is 'base64'."
+                    "type": "integer"
                 },
                 "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to return (default: all). Ignored when encoding is 'base64'."
+                    "type": "integer"
                 },
                 "encoding": {
                     "type": "string",
-                    "enum": ["utf8", "base64"],
-                    "description": "Output encoding (default: 'utf8'). Use 'base64' to read binary files as base64-encoded bytes."
+                    "enum": ["utf8", "base64"]
                 }
             },
             "required": ["path"]
@@ -526,6 +522,33 @@ mod tests {
                 .unwrap()
                 .contains(&json!("offset"))
         );
+    }
+
+    #[test]
+    fn file_read_eager_schema_is_shape_only() {
+        // The eager-served tools carry the schema SHAPE on the wire; property
+        // descriptions are stripped (the base64/offset semantics live in
+        // TOOLS.md + references/tool-catalog.md, and the full schema prose is
+        // a per-turn wire cost on every call).
+        let tool = test_tool(std::env::temp_dir());
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        for (name, prop) in schema["properties"].as_object().expect("properties object") {
+            assert!(
+                prop.get("description").is_none(),
+                "property `{name}` must not carry a description on the eager wire"
+            );
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+        }
+        // The encoding enum is SHAPE — it stays.
+        assert!(schema["properties"]["encoding"]["enum"].is_array());
     }
 
     #[tokio::test]

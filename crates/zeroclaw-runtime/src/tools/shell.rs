@@ -251,7 +251,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Run a shell command in the workspace"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -259,13 +259,10 @@ impl Tool for ShellTool {
             "type": "object",
             "properties": {
                 "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
+                    "type": "string"
                 },
                 "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
+                    "type": "boolean"
                 }
             },
             "required": ["command"]
@@ -894,6 +891,31 @@ mod tests {
                 .contains(&json!("command"))
         );
         assert!(schema["properties"]["approved"].is_object());
+    }
+
+    #[test]
+    fn shell_eager_schema_is_shape_only() {
+        // The eager-served tools carry the schema SHAPE on the wire; property
+        // descriptions/defaults are stripped — the discovery prose lives in
+        // TOOLS.md + references, and `shell` stays name-identifiable via its
+        // short tool-level description.
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        for (name, prop) in schema["properties"].as_object().expect("properties object") {
+            assert!(
+                prop.get("description").is_none(),
+                "property `{name}` must not carry a description on the eager wire"
+            );
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+        }
     }
 
     #[cfg(all(any(unix, windows), not(target_os = "android")))]

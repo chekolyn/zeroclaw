@@ -74,7 +74,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write contents to a file in the workspace. Text by default; set encoding=\"base64\" to write binary files (e.g. .xlsx/.docx) by decoding base64 content into raw bytes."
+        "Write content to a file in the workspace"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -82,17 +82,14 @@ impl Tool for FileWriteTool {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                    "type": "string"
                 },
                 "content": {
-                    "type": "string",
-                    "description": "Content to write. UTF-8 text when encoding is 'utf8'; base64-encoded bytes when encoding is 'base64'."
+                    "type": "string"
                 },
                 "encoding": {
                     "type": "string",
-                    "enum": ["utf8", "base64"],
-                    "description": "How to interpret 'content' before writing (default: 'utf8'). Use 'base64' for binary files."
+                    "enum": ["utf8", "base64"]
                 }
             },
             "required": ["path", "content"]
@@ -499,6 +496,31 @@ mod tests {
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("path")));
         assert!(required.contains(&json!("content")));
+    }
+
+    #[test]
+    fn file_write_eager_schema_is_shape_only() {
+        // The eager-served tools carry the schema SHAPE on the wire; property
+        // descriptions are stripped (discovery prose lives in TOOLS.md +
+        // references/tool-catalog.md).
+        let tool = test_tool(std::env::temp_dir());
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        for (name, prop) in schema["properties"].as_object().expect("properties object") {
+            assert!(
+                prop.get("description").is_none(),
+                "property `{name}` must not carry a description on the eager wire"
+            );
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+        }
+        assert!(schema["properties"]["encoding"]["enum"].is_array());
     }
 
     #[tokio::test]
