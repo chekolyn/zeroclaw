@@ -57,7 +57,7 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing an exact string match with new content"
+        "Replace an exact string match in a file"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -65,16 +65,13 @@ impl Tool for FileEditTool {
             "type": "object",
             "properties": {
                 "path": {
-                    "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                    "type": "string"
                 },
                 "old_string": {
-                    "type": "string",
-                    "description": "The exact text to find and replace (must appear exactly once in the file)"
+                    "type": "string"
                 },
                 "new_string": {
-                    "type": "string",
-                    "description": "The replacement text (empty string to delete the matched text)"
+                    "type": "string"
                 }
             },
             "required": ["path", "old_string", "new_string"]
@@ -497,6 +494,30 @@ mod tests {
         assert!(required.contains(&json!("path")));
         assert!(required.contains(&json!("old_string")));
         assert!(required.contains(&json!("new_string")));
+    }
+
+    #[test]
+    fn file_edit_eager_schema_is_shape_only() {
+        // The eager-served tools carry the schema SHAPE on the wire; property
+        // descriptions are stripped (discovery prose lives in TOOLS.md +
+        // references/tool-catalog.md).
+        let tool = test_tool(std::env::temp_dir());
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        for (name, prop) in schema["properties"].as_object().expect("properties object") {
+            assert!(
+                prop.get("description").is_none(),
+                "property `{name}` must not carry a description on the eager wire"
+            );
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+        }
     }
 
     #[tokio::test]

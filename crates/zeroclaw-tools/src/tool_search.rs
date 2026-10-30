@@ -181,8 +181,7 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch full schema definitions for deferred built-in and MCP tools. \
-         Use \"select:name1,name2\" for exact match or keywords to search."
+        "Fetch full schemas for deferred tools"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -190,13 +189,10 @@ impl Tool for ToolSearchTool {
             "type": "object",
             "properties": {
                 "query": {
-                    "description": "Query to find deferred tools. Use \"select:<tool_name>\" for direct selection, or keywords to search.",
                     "type": "string"
                 },
                 "max_results": {
-                    "description": "Maximum number of results to return (default: 5)",
-                    "type": "number",
-                    "default": DEFAULT_MAX_RESULTS
+                    "type": "number"
                 }
             },
             "required": ["query"]
@@ -454,6 +450,39 @@ mod tests {
         DeferredMcpToolStub, build_deferred_tools_section, build_deferred_tools_section_filtered,
     };
     use crate::mcp_protocol::McpToolDef;
+
+    #[tokio::test]
+    async fn tool_search_eager_schema_is_shape_only() {
+        // The eager-served tools carry the schema SHAPE on the wire; property
+        // descriptions are stripped — the deferred-fetch usage prose lives in
+        // the deferred section header the model already sees.
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![]).await,
+            std::sync::Arc::new(std::sync::Mutex::new(ActivatedToolSet::new())),
+        );
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        for (name, prop) in schema["properties"].as_object().expect("properties object") {
+            assert!(
+                prop.get("description").is_none(),
+                "property `{name}` must not carry a description on the eager wire"
+            );
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+        }
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("query"))
+        );
+    }
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
