@@ -381,6 +381,11 @@ pub(crate) fn build_deferred_builtin_tools_section(
     })
 }
 
+/// One-line summary cap for the deferred BUILT-IN tool stubs. The stub's only
+/// job is name + gist (tool_search fetches the full schema on demand); the
+/// 120-char cap let verbose upstream descriptions dominate the section.
+const BUILTIN_STUB_SUMMARY_MAX_CHARS: usize = 60;
+
 fn render_deferred_builtin_tools_section(
     activated: &ActivatedToolSet,
     is_allowed: impl Fn(&str) -> bool,
@@ -404,7 +409,10 @@ fn render_deferred_builtin_tools_section(
     for spec in specs {
         out.push_str(&spec.name);
         out.push_str(" - ");
-        out.push_str(&summary_line(&spec.description, 120));
+        out.push_str(&summary_line(
+            &spec.description,
+            BUILTIN_STUB_SUMMARY_MAX_CHARS,
+        ));
         out.push('\n');
     }
     out.push_str("</available-deferred-builtin-tools>\n");
@@ -582,7 +590,7 @@ mod tests {
         let prompt = build_deferred_builtin_tools_section(&set, Some(&policy));
         assert!(prompt.contains("tool_search"));
         assert!(prompt.contains("select:name1,name2"));
-        assert!(prompt.contains(&format!("calendar - {}...\n", "é".repeat(120))));
+        assert!(prompt.contains(&format!("calendar - {}...\n", "é".repeat(60))));
         assert!(!prompt.contains("Args:"));
         assert!(!prompt.contains("private_schema_marker"));
         assert!(!prompt.contains("denied"));
