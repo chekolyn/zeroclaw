@@ -210,6 +210,9 @@ fn quarantine_poison_row(
         last_progress_at: now.clone(),
         redacted: false,
         trigger_source: SopTriggerSource::Manual,
+        // The tombstone is not an engine write — no writer identity. A stale
+        // copy cannot "revive" past a tombstone anyway: the row is terminal.
+        writer: None,
     };
     let reason = format!("persisted row unparseable: {error}");
     let forensics = serde_json::json!({

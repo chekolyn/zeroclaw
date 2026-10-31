@@ -5133,7 +5133,7 @@ mod prompt_callable_name_tests {
             tmp.path(),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
         );
-        let mut reversed: Vec<Skill> = skills.iter().rev().cloned().collect();
+        let reversed: Vec<Skill> = skills.iter().rev().cloned().collect();
         let rendered_reversed = skills_to_prompt_with_mode(
             &reversed,
             tmp.path(),
