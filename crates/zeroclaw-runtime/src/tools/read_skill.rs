@@ -27,7 +27,7 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read the full source file for an available skill by name. Use this in compact skills mode when you need the complete skill instructions without remembering file paths."
+        "Read a skill's full source by name"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -35,8 +35,7 @@ impl Tool for ReadSkillTool {
             "type": "object",
             "properties": {
                 "name": {
-                    "type": "string",
-                    "description": "The skill name exactly as listed in <available_skills>."
+                    "type": "string"
                 }
             },
             "required": ["name"]
@@ -143,6 +142,35 @@ mod tests {
 
     fn make_tool(config: Config) -> ReadSkillTool {
         ReadSkillTool::new(Arc::new(config), "default".to_string())
+    }
+
+    #[test]
+    fn eager_schema_is_slim() {
+        // `read_skill` is in the runtime's EAGER_BUILTINS: its spec rides the
+        // wire on every call. Shape only — the skill names are already listed
+        // in <available_skills>, so the parameter needs no prose.
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(config_for_tmp(&tmp));
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        let wire = serde_json::to_string(&schema).unwrap();
+        assert!(
+            wire.len() <= 112,
+            "eager schema wire must stay under 112 bytes, got {}: {wire}",
+            wire.len()
+        );
+        assert_eq!(schema["required"], json!(["name"]));
+        let props = schema["properties"].as_object().expect("properties object");
+        assert_eq!(props.len(), 1, "property set must not drift");
+        assert_eq!(props["name"]["type"], "string");
+        assert!(
+            props["name"].get("description").is_none(),
+            "property `name` must not carry a description on the eager wire"
+        );
     }
 
     #[tokio::test]
