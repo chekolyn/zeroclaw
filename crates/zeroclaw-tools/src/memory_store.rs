@@ -25,7 +25,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."
+        "Store a fact in long-term memory"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -33,20 +33,17 @@ impl Tool for MemoryStoreTool {
             "type": "object",
             "properties": {
                 "key": {
-                    "type": "string",
-                    "description": "Unique key for this memory (e.g. 'user_lang', 'project_stack')"
+                    "type": "string"
                 },
                 "content": {
-                    "type": "string",
-                    "description": "The information to remember"
+                    "type": "string"
                 },
                 "category": {
                     "type": "string",
-                    "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                    "description": "core, daily, conversation, or custom (default core)"
                 },
                 "append": {
-                    "type": "boolean",
-                    "description": "If true, append to any existing value instead of overwriting. JSON-array values get a new element; text values are newline-joined."
+                    "type": "boolean"
                 }
             },
             "required": ["key", "content"]
@@ -149,6 +146,51 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["content"].is_object());
+    }
+
+    #[test]
+    fn eager_schema_is_slim() {
+        // `memory_store` is in the runtime's EAGER_BUILTINS: its spec rides
+        // the wire on every call. The slimmed eager wire keeps the SHAPE
+        // (names/types/required); only the category value space stays as a
+        // one-liner (it is not inferable from the name alone).
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        let wire = serde_json::to_string(&schema).unwrap();
+        assert!(
+            wire.len() <= 320,
+            "eager schema wire must stay under 320 bytes, got {}: {wire}",
+            wire.len()
+        );
+        assert_eq!(schema["required"], json!(["key", "content"]));
+        let props = schema["properties"].as_object().expect("properties object");
+        assert_eq!(props.len(), 4, "property set must not drift");
+        assert_eq!(props["key"]["type"], "string");
+        assert_eq!(props["content"]["type"], "string");
+        assert_eq!(props["category"]["type"], "string");
+        assert_eq!(props["append"]["type"], "boolean");
+        for (name, prop) in props {
+            if let Some(desc) = prop.get("description").and_then(|d| d.as_str()) {
+                assert!(
+                    desc.chars().count() <= 64,
+                    "property `{name}` description must stay a one-liner: {desc}"
+                );
+            }
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+            assert!(
+                prop.get("examples").is_none(),
+                "property `{name}` must not carry examples on the eager wire"
+            );
+        }
     }
 
     #[tokio::test]

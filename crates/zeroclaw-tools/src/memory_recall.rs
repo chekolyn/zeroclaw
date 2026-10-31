@@ -159,7 +159,7 @@ impl Tool for MemoryRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Supports keyword search, recent recall with omitted query or bare '*', time-only query (since/until), or both."
+        "Search long-term memory; omit query for recent"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -168,45 +168,41 @@ impl Tool for MemoryRecallTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords or phrase to search for in memory. Omit or pass bare '*' to return recent memories; non-bare wildcard terms remain keyword searches."
+                    "description": "Keywords; omit or '*' for recent memories"
                 },
                 "limit": {
-                    "type": "integer",
-                    "description": "Max results to return (default: 5 for keyword, 100 for prefix)"
+                    "type": "integer"
                 },
                 "since": {
                     "type": "string",
-                    "description": "Filter memories created at or after this time (RFC 3339, e.g. 2025-03-01T00:00:00Z)"
+                    "description": "RFC 3339 timestamp"
                 },
                 "until": {
                     "type": "string",
-                    "description": "Filter memories created at or before this time (RFC 3339)"
+                    "description": "RFC 3339 timestamp"
                 },
                 "search_mode": {
                     "type": "string",
-                    "enum": ["bm25", "embedding", "hybrid"],
-                    "description": "Search strategy: bm25 (keyword), embedding (semantic), or hybrid (both). Defaults to config value."
+                    "enum": ["bm25", "embedding", "hybrid"]
                 },
                 "category": {
                     "type": "string",
-                    "description": "Filter by memory category (core, workstream, daily, conversation)"
+                    "description": "core, workstream, daily, conversation, or custom"
                 },
                 "namespace": {
-                    "type": "string",
-                    "description": "Filter by namespace (e.g. 'telemetry' for audit, 'ws' for workstream)"
+                    "type": "string"
                 },
                 "key_prefix": {
-                    "type": "string",
-                    "description": "Filter by key prefix (e.g. 'ws:infra:id:' for a workstream enumeration)"
+                    "type": "string"
                 },
                 "scope": {
                     "type": "string",
                     "enum": ["filtered", "all"],
-                    "description": "'filtered' (default, applies config exclusion) or 'all' (no exclusion). Use 'all' for audit/debug."
+                    "description": "filtered=default exclusions; all=no exclusions"
                 },
                 "prefix": {
                     "type": "string",
-                    "description": "If set, return ALL entries whose key starts with this prefix (unranked, complete list), ignoring query/since/until/search_mode."
+                    "description": "enumerate all keys with this prefix; ignores query/filters"
                 }
             }
         })
@@ -1123,6 +1119,78 @@ mod tests {
         assert!(enum_values.contains(&json!("bm25")));
         assert!(enum_values.contains(&json!("embedding")));
         assert!(enum_values.contains(&json!("hybrid")));
+    }
+
+    #[test]
+    fn eager_schema_is_slim() {
+        // `memory_recall` is in the runtime's EAGER_BUILTINS: its spec rides
+        // the wire on every call. The slimmed eager wire keeps the SHAPE
+        // (names/types/enums/required) plus one-liner descriptions only where
+        // the semantic is not inferable from the name alone (the bare-`*`
+        // recent-recall contract, the RFC 3339 format, the scope semantics);
+        // the discovery prose lives in TOOLS.md.
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        assert!(
+            tool.description().chars().count() <= 60,
+            "eager tool description must stay a short clause: {}",
+            tool.description()
+        );
+        let schema = tool.parameters_schema();
+        let wire = serde_json::to_string(&schema).unwrap();
+        assert!(
+            wire.len() <= 768,
+            "eager schema wire must stay under 768 bytes, got {}: {wire}",
+            wire.len()
+        );
+        // Shape snapshot: the full property set keeps its types.
+        let props = schema["properties"].as_object().expect("properties object");
+        let expected: &[(&str, &str)] = &[
+            ("query", "string"),
+            ("limit", "integer"),
+            ("since", "string"),
+            ("until", "string"),
+            ("search_mode", "string"),
+            ("category", "string"),
+            ("namespace", "string"),
+            ("key_prefix", "string"),
+            ("scope", "string"),
+            ("prefix", "string"),
+        ];
+        assert_eq!(props.len(), expected.len(), "property set must not drift");
+        for (name, ty) in expected {
+            assert_eq!(
+                props[*name]["type"].as_str(),
+                Some(*ty),
+                "property `{name}` must keep its type on the eager wire"
+            );
+        }
+        // The semantic enums stay — they are shape, not prose.
+        let search_mode_enum = schema["properties"]["search_mode"]["enum"]
+            .as_array()
+            .expect("search_mode enum");
+        assert_eq!(search_mode_enum.len(), 3);
+        let scope_enum = schema["properties"]["scope"]["enum"]
+            .as_array()
+            .expect("scope enum");
+        assert_eq!(scope_enum.len(), 2);
+        // One-liners only; no defaults/examples on the wire.
+        for (name, prop) in props {
+            if let Some(desc) = prop.get("description").and_then(|d| d.as_str()) {
+                assert!(
+                    desc.chars().count() <= 64,
+                    "property `{name}` description must stay a one-liner: {desc}"
+                );
+            }
+            assert!(
+                prop.get("default").is_none(),
+                "property `{name}` must not carry a default on the eager wire"
+            );
+            assert!(
+                prop.get("examples").is_none(),
+                "property `{name}` must not carry examples on the eager wire"
+            );
+        }
     }
 
     #[tokio::test]
