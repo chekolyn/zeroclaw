@@ -169,6 +169,7 @@ allowlist: 6f5f141fa — docs: PATCHES.md — the v0.8.5 patch entry (Lever-2b +
 allowlist: 795288e6f — docs: PATCHES.md — the arg_deny_exemptions entry
 allowlist: 43e26eb21 — realignment-fixup: the v0.8.6 conflict resolutions compiled coherent (upstreamed headless/migration/steering surfaces adopted; the fork carries merged; AppState/LoopDetectorConfig/memory-entry test fixtures threaded; the loop-detector knobs both-threaded)
 allowlist: 6021cd122 — realignment-fixup: the v0.8.6 test-suite reconciliation (the no-progress ladder adopts upstream's Block cap — the fork's Break arm dropped, 3 fork tests re-pinned; the ADE exemption validation rehomed per-profile with the alias path prefix; the git delegation check skips table-modeled subcommands; mqtt_publish in OUTSIDE_INVENTORY)
+allowlist: cff5ada50 — realignment-fixup: the v0.8.7 conflict resolutions compiled coherent (the quarantine tombstone carries the stale-run-fix writer field, None = not-an-engine-write; the skills-diet test drops an upstream-superseded mut; the lockfile syncs rumqttc 0.25.1 + the v0.8.7 security bumps)
 
 ## Realignment notes (v0.8.3 → v0.8.4)
 
@@ -319,6 +320,7 @@ old-table rows (the class-b rows below `gateway`/`delegate-*`).
 | 795288e6f | c | docs | PATCHES.md — the arg_deny_exemptions entry |
 | 43e26eb21 | c | 43e26eb21 | the v0.8.6 conflict resolutions compiled coherent (upstreamed surfaces adopted, fork carries merged, test fixtures threaded) |
 | 6021cd122 | c | 6021cd122 | the v0.8.6 test-suite reconciliation — the no-progress ladder adopts upstream's Block cap; ADE validation rehomed per-profile; git delegation check skips table-modeled subcommands |
+| cff5ada50 | c | cff5ada50 | the v0.8.7 conflict resolutions compiled coherent — the tombstone writer field (None = not-an-engine-write), the skills-diet mut drop, the lockfile sync (rumqttc 0.25.1 + security bumps) |
 | a5cab2e89 | a | U1 | the allow_scripts subagent propagation fix — cherry-picked from cheknet-pached `352672c02` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 | cbcd4630e | a | U2 | the cron chat-leak fix — cherry-picked from cheknet-pached `69dd83ed4` (the dead upstreamed-by-v0.8.4 claim, resolved by the C.1 remediation) |
 | 11a669513 | a | SOP-POISON-QUARANTINE | the SOP ledger poison-row quarantine — tolerant restore scans + terminal tombstones + the reaped_stuck_runs reporting fix (the 2026-10-03..05 restore-wedge / slots-full root cause) |
