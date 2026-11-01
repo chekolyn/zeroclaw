@@ -16216,6 +16216,12 @@ mod tests {
                 row.revision += 1;
                 row.last_progress_at = ts.to_string();
                 engine.store.save_run(&row).unwrap();
+                // The direct store write is a second writer this engine has
+                // not seen: note the bumped revision so the engine's next
+                // persist (the reaper's terminal write) is not refused as a
+                // divergent same-revision write by the stale-run revision
+                // guard (v0.8.7 #11861).
+                engine.note_run_revision(rid, row.revision);
             }
             None => {
                 engine

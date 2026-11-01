@@ -10,11 +10,13 @@ target
 web/node_modules
 web/dist
 
-# Documentation (not needed for runtime). NOTE: crate-level `examples/`
-# directories must SHIP — v0.8.6's zeroclaw-plugins declares
-# `examples/sign_manifest.rs` as a cargo example target, and cargo fails
-# manifest parse when a declared example is absent from the context.
+# Documentation (not needed for runtime). `examples` is ROOT-ANCHORED in
+# dockerignore semantics — it never excluded the crate-level
+# `crates/*/examples/` targets cargo needs (the earlier "examples must
+# ship" note mis-attributed a warming-stage failure; the warming stub in
+# the debops Dockerfile.debian-full remains the guard for that).
 docs
+examples
 
 # Markdown files (README, CHANGELOG, etc.)
 *.md
