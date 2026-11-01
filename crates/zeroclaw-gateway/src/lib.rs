@@ -2831,7 +2831,12 @@ pub async fn run_gateway_with_plugin_webhooks(
     // (cheknet patch: routes registered from config, not hardcoded)
     #[cfg(feature = "channel-webhook")]
     let inner = {
-        let mut inner = inner;
+        // The dynamic routes live on their own sub-router: by this point the
+        // merged upload router has already consumed the router's state, so a
+        // direct `inner.route(...)` builds a MethodRouter<AppState> that
+        // cannot merge into the stateless inner (E0308). The sub-router
+        // re-binds AppState here, before the later `.with_state(state)` move.
+        let mut webhook_router: Router<AppState> = Router::new();
         for (path_str, secret) in &state.generic_webhook_secrets {
             let secret = secret.clone();
             let path_str = path_str.clone();
@@ -2842,7 +2847,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 .unwrap_or_else(|| "X-Hub-Signature-256".to_string());
             let path_for_route = path_str.clone();
             let path_for_handler = path_str;
-            inner = inner.route(
+            webhook_router = webhook_router.route(
                 &path_for_route,
                 post(move |state, peer_addr, headers, body| {
                     handle_generic_webhook(
@@ -2865,7 +2870,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 &format!("Registered {} dynamic webhook route(s)", state.generic_webhook_secrets.len())
             );
         }
-        inner
+        inner.merge(webhook_router.with_state(state.clone()))
     };
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
@@ -4868,19 +4873,15 @@ async fn handle_generic_webhook(
     )
     .await
     {
-        Ok(GatewayChatOutcome {
-            response,
-            input_tokens,
-            output_tokens,
-            cost_usd,
-        }) => {
+        // The token/cost fields were never live: the GatewayChatOutcome
+        // struct carries `response` only on every lineage this
+        // destructure shipped with, so the 4-field form never compiled.
+        // Destructure with `..` and report the response only.
+        Ok(GatewayChatOutcome { response, .. }) => {
             let body = serde_json::json!({
                 "status": "ok",
                 "response": response,
                 "model": state.model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost_usd": cost_usd,
             });
             (StatusCode::OK, Json(body))
         }
