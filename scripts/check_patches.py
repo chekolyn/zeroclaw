@@ -93,6 +93,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"record_poll_alive",
         "min_count": 1,
     },
+    "mqtt-connack-resubscribe": {
+        "glob": "crates/zeroclaw-channels/src/orchestrator/mqtt.rs",
+        "pattern": r"subscribe_all\(&client, config, qos\)",
+        "min_count": 2,
+    },
     "cron-session-route": {
         "glob": "crates/zeroclaw-gateway/src/ws.rs",
         "pattern": r'session_id == "cron"',
