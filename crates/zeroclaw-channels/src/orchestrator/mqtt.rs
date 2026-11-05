@@ -43,16 +43,11 @@ pub async fn run_mqtt_sop_listener(
         _ => QoS::ExactlyOnce,
     };
 
-    // Subscribe to all configured topics
-    for topic in &config.topics {
-        client.subscribe(topic, qos).await?;
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"topic": topic})),
-            "MQTT SOP listener: subscribed to ''"
-        );
-    }
+    // Subscribe to all configured topics. A failed boot subscribe logs and
+    // continues: with the ConnAck resubscribe below, the first reconnect
+    // self-heals it — killing the task here (the old `?`) silenced the lane
+    // permanently with /health still green.
+    subscribe_all(&client, config, qos).await;
 
     zeroclaw_runtime::health::mark_component_ok("mqtt");
 
@@ -66,49 +61,80 @@ pub async fn run_mqtt_sop_listener(
                 record_poll_alive();
                 match event {
                     Event::Incoming(Packet::Publish(msg)) => {
-                        let payload_raw = String::from_utf8_lossy(&msg.payload);
-                        let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
-                        if let Some(sink) = driver_sink.as_ref() {
-                            ingress = ingress.with_driver_sink(sink);
-                        }
-                        // The outcome MUST be logged: discarding it made a dedup'd
-                        // `Skipped` indistinguishable from a dead activation at the
-                        // listener (2026-10-17 prod evidence). describe() carries the
-                        // per-result summary; Unavailable is WARN-worthy, the rest INFO.
-                        let outcome = ingress
-                            .dispatch(
-                                SopTriggerSource::Mqtt,
-                                Some(&msg.topic),
-                                Some(&payload_raw),
-                                None,
-                                None,
-                            )
-                            .await;
-                        let summary = outcome.describe();
-                        let attrs = ::serde_json::json!({
-                            "topic": msg.topic,
-                            "outcome": summary,
-                        });
-                        match &outcome {
-                            SopIngressOutcome::Unavailable(_) => ::zeroclaw_log::record!(
+                        // rumqttc-v4-next 0.34 (v0.8.7) carries the topic as
+                        // raw Bytes — extract the &str once and use it for
+                        // both the dispatch and the outcome attrs. A non-UTF8
+                        // topic must NOT kill the listener task (the old `?`
+                        // propagated out of run_mqtt_sop_listener and silenced
+                        // the lane permanently) — log and skip the message.
+                        let Ok(topic) = std::str::from_utf8(&msg.topic) else {
+                            ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                "MQTT SOP listener: non-UTF8 topic on publish — message skipped"
+                            );
+                            continue;
+                        };
+                        let payload_raw = String::from_utf8_lossy(&msg.payload).into_owned();
+                        let topic = topic.to_string();
+                        let engine = engine.clone();
+                        let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
+                        // Spawn, never await inline: an inline dispatch blocks
+                        // the eventloop poll for the whole agent turn — the
+                        // keepalive expires mid-turn, the broker drops the
+                        // connection, and the listener reconnects into a
+                        // fresh clean session (deaf unless the ConnAck
+                        // resubscribe below fires). The spawned task keeps
+                        // the poll loop responsive through long turns; the
+                        // dispatch future is Send by contract (the
+                        // dispatch.rs span comment).
+                        tokio::spawn(async move {
+                            let mut ingress =
+                                SopIngress::new(Some(&engine), Some(audit.as_ref()));
+                            if let Some(sink) = driver_sink.as_ref() {
+                                ingress = ingress.with_driver_sink(sink);
+                            }
+                            // The outcome MUST be logged: discarding it made a dedup'd
+                            // `Skipped` indistinguishable from a dead activation at the
+                            // listener (2026-10-17 prod evidence). describe() carries the
+                            // per-result summary; Unavailable is WARN-worthy, the rest INFO.
+                            let outcome = ingress
+                                .dispatch(
+                                    SopTriggerSource::Mqtt,
+                                    Some(&topic),
+                                    Some(&payload_raw),
+                                    None,
+                                    None,
                                 )
-                                .with_attrs(attrs),
-                                &format!("MQTT SOP dispatch: {summary}")
-                            ),
-                            _ => ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(attrs),
-                                &format!("MQTT SOP dispatch: {summary}")
-                            ),
-                        }
+                                .await;
+                            let summary = outcome.describe();
+                            let attrs = ::serde_json::json!({
+                                "topic": topic,
+                                "outcome": summary,
+                            });
+                            match &outcome {
+                                SopIngressOutcome::Unavailable(_) => ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(attrs),
+                                    &format!("MQTT SOP dispatch: {summary}")
+                                ),
+                                _ => ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(attrs),
+                                    &format!("MQTT SOP dispatch: {summary}")
+                                ),
+                            }
+                        });
                     }
                     Event::Incoming(Packet::ConnAck(_)) => {
                         ::zeroclaw_log::record!(
@@ -119,6 +145,16 @@ pub async fn run_mqtt_sop_listener(
                             ),
                             "MQTT SOP listener: connected to broker"
                         );
+                        // Resubscribe on EVERY ConnAck: rumqttc's default
+                        // clean session drops the broker-side subscriptions on
+                        // any disconnect, and the auto-reconnect establishes a
+                        // FRESH session — without this the listener is
+                        // connected but deaf after the first reconnect
+                        // (2026-11-05 prod evidence: the activation-execution
+                        // lane went silent after the first post-boot dispatch;
+                        // /health stayed green because record_poll_alive
+                        // stamps the subscribed-to-nothing poll loop).
+                        subscribe_all(&client, config, qos).await;
                     }
                     // Other events (PingResp, SubAck, outgoing) — alive,
                     // already stamped by the per-poll record above.
@@ -137,6 +173,33 @@ pub async fn run_mqtt_sop_listener(
                 // rumqttc handles auto-reconnect; loop continues
             }
         }
+    }
+}
+
+/// Subscribe to every configured topic, logging each result.
+///
+/// Used at boot AND on every `ConnAck` (the reconnect path): rumqttc's
+/// default clean session drops broker-side subscriptions on disconnect, so
+/// the reconnect must re-establish them. A failed subscribe is logged and
+/// does not abort the caller — the next reconnect retries.
+async fn subscribe_all(client: &AsyncClient, config: &MqttConfig, qos: QoS) {
+    for topic in &config.topics {
+        if let Err(e) = client.subscribe(topic, qos).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"topic": topic, "error": format!("{e}")})),
+                &format!("MQTT SOP listener: subscribe failed for '{topic}'")
+            );
+            continue;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"topic": topic})),
+            "MQTT SOP listener: subscribed to ''"
+        );
     }
 }
 
