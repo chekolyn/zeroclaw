@@ -1682,7 +1682,9 @@ pub fn create_resilient_model_provider_with_options(
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone());
+    .with_api_keys(reliability.api_keys.clone())
+    .with_provider_max_backoff_ms(reliability.provider_max_backoff_ms)
+    .with_provider_rate_limit_budget_ms(reliability.provider_rate_limit_budget_ms);
 
     Ok(Box::new(reliable))
 }
@@ -1752,7 +1754,9 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone());
+    .with_api_keys(reliability.api_keys.clone())
+    .with_provider_max_backoff_ms(reliability.provider_max_backoff_ms)
+    .with_provider_rate_limit_budget_ms(reliability.provider_rate_limit_budget_ms);
 
     Ok(Box::new(reliable))
 }

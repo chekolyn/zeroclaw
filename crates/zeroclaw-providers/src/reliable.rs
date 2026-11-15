@@ -2051,6 +2051,12 @@ impl ReliableModelProviderEntry {
     }
 }
 
+/// Construction-time defaults for the rate-limit wait knobs (spec
+/// 2026-11-15 provider rate-limit backoff): production wiring overrides
+/// them via the `with_provider_*` builders from `[reliability]`.
+const DEFAULT_PROVIDER_MAX_BACKOFF_MS: u64 = 60_000;
+const DEFAULT_PROVIDER_RATE_LIMIT_BUDGET_MS: u64 = 300_000;
+
 /// ModelProvider wrapper with retry + auth-key rotation. The model_provider Vec exists
 /// for tests to exercise multi-provider failover; production wiring always
 /// passes a single primary. Per-model failover chains are also test-only —
@@ -2061,6 +2067,10 @@ pub struct ReliableModelProvider {
     model_providers: Vec<ReliableModelProviderEntry>,
     max_retries: u32,
     base_backoff_ms: u64,
+    /// Per-wait ceiling (ms) for rate-limit-class waits.
+    provider_max_backoff_ms: u64,
+    /// Per-call total rate-limit wait budget (ms).
+    provider_rate_limit_budget_ms: u64,
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
@@ -2144,6 +2154,8 @@ impl ReliableModelProvider {
             model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
+            provider_max_backoff_ms: DEFAULT_PROVIDER_MAX_BACKOFF_MS,
+            provider_rate_limit_budget_ms: DEFAULT_PROVIDER_RATE_LIMIT_BUDGET_MS,
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
@@ -2182,6 +2194,18 @@ impl ReliableModelProvider {
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
+        self
+    }
+
+    /// Set the per-wait ceiling (ms) for rate-limit-class waits.
+    pub fn with_provider_max_backoff_ms(mut self, ms: u64) -> Self {
+        self.provider_max_backoff_ms = ms.max(1);
+        self
+    }
+
+    /// Set the per-call total rate-limit wait budget (ms).
+    pub fn with_provider_rate_limit_budget_ms(mut self, ms: u64) -> Self {
+        self.provider_rate_limit_budget_ms = ms.max(1);
         self
     }
 
@@ -8821,6 +8845,32 @@ mod tests {
     async fn auth_rotation_returns_none_when_empty() {
         let model_provider = ReliableModelProvider::new("test", vec![], 0, 1);
         assert!(model_provider.rotate_key().is_none());
+    }
+
+    #[test]
+    fn builder_knobs_default_and_clamp_below_one() {
+        // Spec 2026-11-15 provider rate-limit backoff: construction-time
+        // defaults come from the private consts, and the two builder knobs
+        // clamp sub-1 (0/None-as-unset) up to 1 ms rather than zero.
+        let entry = |provider: Box<dyn ModelProvider>| ("p".to_string(), provider);
+        let mock = || -> Box<dyn ModelProvider> {
+            Box::new(MockModelProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail_until_attempt: 0,
+                response: "ok",
+                error: "",
+            })
+        };
+
+        let provider = ReliableModelProvider::new("t", vec![entry(mock())], 2, 500);
+        assert_eq!(provider.provider_max_backoff_ms, 60_000);
+        assert_eq!(provider.provider_rate_limit_budget_ms, 300_000);
+
+        let clamped = ReliableModelProvider::new("t", vec![entry(mock())], 2, 500)
+            .with_provider_max_backoff_ms(0)
+            .with_provider_rate_limit_budget_ms(0);
+        assert_eq!(clamped.provider_max_backoff_ms, 1);
+        assert_eq!(clamped.provider_rate_limit_budget_ms, 1);
     }
 
     // ── New tests: Retry-After parsing ──
