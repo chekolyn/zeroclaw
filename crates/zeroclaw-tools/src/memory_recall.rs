@@ -83,41 +83,23 @@ impl MemoryRecallTool {
         // and an over-budget enumeration fails bounded (an enumeration has
         // no recency-fallback semantic — a partial listing would overstate
         // completeness).
-        let listed = match self.prefix_list_budget {
-            Some(budget) => {
-                let start = Instant::now();
-                match tokio::time::timeout(
-                    budget,
-                    self.memory.list_prefixed(prefix, limit, None),
-                )
-                .await
-                {
-                    Ok(listed) => listed,
-                    Err(_) => {
-                        let elapsed = start.elapsed();
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "recall": "prefix_list",
-                                    "elapsed_ms": elapsed.as_millis() as u64,
-                                    "soft_timeout_ms": budget.as_millis() as u64,
-                                })),
-                            "memory prefix recall exceeded the soft budget; listing abandoned"
-                        );
-                        return Ok(ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!(
-                                "prefix recall exceeded the soft budget ({budget:?}); the full-memory listing was abandoned"
-                            )),
-                        });
-                    }
-                }
-            }
-            None => self.memory.list_prefixed(prefix, limit, None).await,
-        };
+        // The wall-clock belt-and-braces is REMOVED for the serialized
+        // shared-client path (2026-11-14, the guide-delta-scan live run): the
+        // Postgres backend serializes every memory operation on ONE
+        // connection behind a std::sync::Mutex, so the tokio timeout wrapped
+        // the MUTEX WAIT — a prior attempt's own budget hold blocked the
+        // lock, and the belt killed a 0.3 ms indexed query that had not
+        // started. The enforced bound is the SERVER-side
+        // statement_timeout inside `list_prefixed`
+        // (`with_statement_timeout` — cancelled at the soft budget by the
+        // database, freeing the shared connection), and the lock wait is
+        // bounded by the prior attempt's `op_timeout`. Both phases are
+        // bounded by construction; a second, redundant wall clock that
+        // measures the mutex is the defect.
+        //
+        // A consumer needing a hard wall-clock bound on the whole call
+        // (including lock waits) should bound the TURN, not the attempt.
+        let listed = self.memory.list_prefixed(prefix, limit, None).await;
         let entries = listed?;
         // `list_prefixed` pushes the prefix filter and the limit into
         // storage; this re-check is a defensive contract pin so the tool's
@@ -514,33 +496,29 @@ mod tests {
     /// tool past the recall budget's ≈3s contract. The tool owns the bound
     /// for its recall-shaped use of `list`: an over-budget listing fails
     /// bounded (no fake fallback data for an enumeration).
+    /// `recall_soft_timeout_ms`'s prefix-path wall-clock belt was REMOVED
+    /// (2026-11-14, the guide-delta-scan live run): the Postgres backend
+    /// serializes memory operations on ONE shared client behind a mutex, so
+    /// the tokio timeout wrapped the MUTEX WAIT — a prior attempt's own
+    /// budget hold blocked the lock and the belt killed a 0.3 ms indexed
+    /// query that had not started. The enforced bound is the backend's own
+    /// server-side `statement_timeout` (postgres.rs
+    /// `with_statement_timeout`); the tool passes the backend's latency
+    /// through rather than layering a second wall clock that measures the
+    /// mutex.
     #[tokio::test]
-    async fn prefix_recall_listing_exceeding_the_budget_fails_bounded() {
+    async fn prefix_recall_surfaces_backend_latency_without_a_second_belt() {
         let mem = SlowListMemory::new(Duration::from_secs(5));
         let tool = MemoryRecallTool::new_with_excludes_and_budget(
             mem,
             RecallExcludes::default(),
-            100, // recall_soft_timeout_ms
+            100, // recall_soft_timeout_ms — no longer bounds the prefix path
         );
-        let start = Instant::now();
         let result = tool.execute(json!({"prefix": "p:"})).await.unwrap();
-        let elapsed = start.elapsed();
 
         assert!(
-            !result.success,
-            "an over-budget prefix listing must fail bounded"
-        );
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("soft budget")),
-            "the bounded failure must name the soft budget; got {:?}",
-            result.error
-        );
-        assert!(
-            elapsed < Duration::from_millis(2000),
-            "the prefix recall must stay bounded by the soft budget; took {elapsed:?}"
+            result.success,
+            "a slow backend's latency surfaces honestly: no second belt              kills a slow-but-honest call (the backend's own bound governs)"
         );
     }
 
