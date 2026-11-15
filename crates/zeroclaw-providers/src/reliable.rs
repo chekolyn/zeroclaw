@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
@@ -2070,6 +2070,50 @@ pub struct ReliableModelProvider {
     /// Source of truth: live provider 429 / Retry-After evidence observed by
     /// this wrapper. It is intentionally in-memory and per wrapper instance.
     rate_limit_cooldowns: Mutex<HashMap<String, Instant>>,
+}
+
+/// Process-global ordinal distinguishing successive reliable-model-provider
+/// calls. The chat retry loops bump it with `fetch_add(1, Relaxed)` once per
+/// call so consecutive calls seed different deterministic jitter (spec
+/// 2026-11-15 provider rate-limit backoff, §2).
+pub static RATE_LIMIT_CALL_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+/// Pure rate-limit wait curve (spec 2026-11-15 provider rate-limit backoff,
+/// §2/§6): `doubling = min(base_ms · 2^attempt, cap_ms)`, joined with the
+/// strongest per-call wait source — the entry's remaining shared-cooldown
+/// window and the Retry-After term (already capped at the ceiling) — then
+/// jittered and finally clamped by the whole-expression bound
+/// `min(cap_ms, budget_remaining_ms)`. A zero remaining budget returns zero:
+/// the caller's fail-fast signal. Pure, zero sleeps — the caller owns the wait.
+pub fn rate_limit_wait_ms(
+    base_ms: u64,
+    attempt: u32,
+    cap_ms: u64,
+    budget_remaining_ms: u64,
+    cooldown_remaining_ms: u64,
+    retry_after_ms: Option<u64>,
+    jitter_scale: f64,
+) -> u64 {
+    let doubling = base_ms
+        .saturating_mul(2u64.saturating_pow(attempt))
+        .min(cap_ms);
+    let retry_after_term = retry_after_ms.map_or(0, |ms| ms.min(cap_ms));
+    let raw = doubling.max(cooldown_remaining_ms).max(retry_after_term);
+    // Float→int `as` saturates: NaN/negative → 0, +inf → u64::MAX.
+    let jittered = (raw as f64 * jitter_scale) as u64;
+    jittered.min(cap_ms).min(budget_remaining_ms)
+}
+
+/// Deterministic ±20% jitter scale in `[0.8, 1.2]` for the rate-limit wait
+/// curve: a SplitMix64-style mix of `(call_ordinal, attempt)`. No clock
+/// reads — the same inputs always return the same scale.
+pub fn jitter_scale_for(call_ordinal: u64, attempt: u32) -> f64 {
+    let mut x = call_ordinal ^ u64::from(attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let x = x ^ (x >> 31);
+    0.8 + 0.4 * (x as f64 / u64::MAX as f64)
 }
 
 impl ReliableModelProvider {
@@ -14416,5 +14460,233 @@ mod tests {
             "ReliableModelProvider must not surface as model_provider_type=reliable",
         );
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    // ── Pure rate-limit wait-curve pins (spec 2026-11-15 provider rate-limit backoff) ──
+
+    #[test]
+    fn rate_limit_wait_curve_pins_prod_shape() {
+        // Prod shape: base 2000 / cap 60000 / budget 300000, no cooldown, no
+        // Retry-After, unity jitter. Each wait consumes budget, so attempt 8
+        // clamps to the 58000 remaining and attempt 9 → 0 (the fail-fast
+        // "budget reached at attempt ~9" tail, spec §2).
+        let mut budget: u64 = 300_000;
+        let expected: [u64; 10] = [
+            2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 58000, 0,
+        ];
+        for (attempt, want) in expected.iter().enumerate() {
+            let wait = rate_limit_wait_ms(2000, attempt as u32, 60_000, budget, 0, None, 1.0);
+            assert_eq!(wait, *want, "attempt {attempt}");
+            budget = budget.saturating_sub(wait);
+        }
+
+        // Unbounded budget: the curve holds the ceiling tail […60000, 60000, …].
+        for attempt in 5..=9u32 {
+            let wait = rate_limit_wait_ms(2000, attempt, 60_000, u64::MAX, 0, None, 1.0);
+            assert_eq!(wait, 60_000, "unbounded attempt {attempt}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_wait_caps_a_huge_retry_after_at_the_ceiling() {
+        // Review Focus 1: a billion-ms Retry-After must clamp to the ceiling,
+        // never the old 30 s cap and never the raw header value.
+        for attempt in 0..=9u32 {
+            let wait =
+                rate_limit_wait_ms(2000, attempt, 60_000, u64::MAX, 0, Some(1_000_000_000), 1.0);
+            assert!(wait <= 60_000, "attempt {attempt} produced {wait}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_wait_honors_retry_after_up_to_the_ceiling() {
+        // Retry-After participates in the max() up to the ceiling: 30 s wins
+        // over the doubling term, and 45 s is honored where the old 30 s cap
+        // would have truncated it.
+        assert_eq!(
+            rate_limit_wait_ms(2000, 0, 60_000, u64::MAX, 0, Some(30_000), 1.0),
+            30_000
+        );
+        assert_eq!(
+            rate_limit_wait_ms(2000, 0, 60_000, u64::MAX, 0, Some(45_000), 1.0),
+            45_000
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_holds_the_ceiling_when_cap_is_below_base() {
+        // Review Focus 3 / Acceptance 4: a cap below base must still bound
+        // every wait across the whole jitter band.
+        for attempt in 0..=13u32 {
+            for scale in [0.8_f64, 1.0, 1.2] {
+                let wait = rate_limit_wait_ms(2000, attempt, 100, 300_000, 0, None, scale);
+                assert!(
+                    wait <= 100,
+                    "attempt {attempt} scale {scale} produced {wait}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_wait_whole_expression_clamp_sweep() {
+        // The whole-expression clamp: result ≤ min(cap, budget) for ANY knob
+        // values, and zero only when the budget is exhausted (fail-fast).
+        for cap in [1_u64, 100, 2000, 60_000, 1_000_000_000] {
+            for budget in [0_u64, 1, 50, 300_000, u64::MAX] {
+                for cooldown in [0_u64, 45_000, 120_000] {
+                    for retry_after in [None, Some(500_u64), Some(1_000_000_000)] {
+                        for attempt in 0..=13u32 {
+                            let wait = rate_limit_wait_ms(
+                                2000,
+                                attempt,
+                                cap,
+                                budget,
+                                cooldown,
+                                retry_after,
+                                1.0,
+                            );
+                            assert!(
+                                wait <= cap.min(budget),
+                                "cap {cap} budget {budget} cooldown {cooldown} \
+                                 retry-after {retry_after:?} attempt {attempt} → {wait}"
+                            );
+                            assert_eq!(
+                                wait == 0,
+                                budget == 0,
+                                "zero iff budget==0 violated: cap {cap} budget {budget} \
+                                 cooldown {cooldown} retry-after {retry_after:?} \
+                                 attempt {attempt} → {wait}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_wait_cooldown_term_participates_then_clamps() {
+        // The cooldown window joins the max() and then clamps at the ceiling:
+        // a 45 s window passes through as the wait; a 120 s window holds the
+        // 60 s ceiling, not the raw 120 s.
+        assert_eq!(
+            rate_limit_wait_ms(2000, 0, 60_000, u64::MAX, 45_000, None, 1.0),
+            45_000
+        );
+        assert_eq!(
+            rate_limit_wait_ms(2000, 0, 60_000, u64::MAX, 120_000, None, 1.0),
+            60_000
+        );
+    }
+
+    #[test]
+    fn jitter_scale_for_stays_in_band_and_is_deterministic() {
+        for call_ordinal in 0..=999u64 {
+            for attempt in 0..=13u32 {
+                let first = jitter_scale_for(call_ordinal, attempt);
+                assert!(
+                    (0.8..=1.2).contains(&first),
+                    "ordinal {call_ordinal} attempt {attempt} scale {first} outside [0.8, 1.2]"
+                );
+                let second = jitter_scale_for(call_ordinal, attempt);
+                assert_eq!(
+                    first, second,
+                    "jitter scale must be deterministic for ({call_ordinal}, {attempt})"
+                );
+            }
+        }
+    }
+
+    /// Test-local timing mock (MockModelProvider shape + per-call instants)
+    /// for the non-rate-limit characterization pin.
+    struct TimingFailureMock {
+        calls: Arc<AtomicUsize>,
+        instants: Arc<ParkingMutex<Vec<tokio::time::Instant>>>,
+        error: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TimingFailureMock {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.instants.lock().push(tokio::time::Instant::now());
+            anyhow::bail!(self.error)
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.instants.lock().push(tokio::time::Instant::now());
+            anyhow::bail!(self.error)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TimingFailureMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TimingFailureMock"
+        }
+    }
+
+    /// Characterization pin (spec §6 + Goal 5): a transient NON-rate-limit
+    /// failure keeps today's generic retry shape — 6 calls (1 + max_retries)
+    /// with the doubling-capped inter-attempt deltas [2000, 4000, 8000,
+    /// 10000, 10000] ms. This is green by design; a failure means the tree
+    /// drifted from the spec's assumptions.
+    #[tokio::test(start_paused = true)]
+    async fn non_rate_limit_retry_sequence_is_unchanged() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let instants = Arc::new(ParkingMutex::new(Vec::new()));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(TimingFailureMock {
+                    calls: Arc::clone(&calls),
+                    instants: Arc::clone(&instants),
+                    error: "HTTP 500 Internal Server Error",
+                }),
+            )],
+            5,
+            2000,
+        );
+        provider
+            .chat_with_system(None, "hello", "test", None)
+            .await
+            .expect_err("every attempt fails with a transient non-rate-limit error");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "1 + max_retries(5) calls");
+        let stamps = instants.lock().clone();
+        assert_eq!(stamps.len(), 6, "one instant recorded per call");
+        let deltas_ms: Vec<u64> = stamps
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_millis() as u64)
+            .collect();
+        assert_eq!(
+            deltas_ms,
+            vec![2000, 4000, 8000, 10000, 10000],
+            "today's doubling-capped non-rate-limit sequence must not change"
+        );
     }
 }
