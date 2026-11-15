@@ -108,6 +108,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"HeadlessStepScope",
         "min_count": 1,
     },
+    "recall-prefix-list-prefixed-call": {
+        "glob": "crates/zeroclaw-tools/src/memory_recall.rs",
+        "pattern": r"list_prefixed",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
