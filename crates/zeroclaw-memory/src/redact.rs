@@ -87,7 +87,14 @@ static PATTERNS: LazyLock<Vec<RedactionPattern>> = LazyLock::new(|| {
         },
         RedactionPattern {
             category: RedactCategory::Phone,
-            regex: Regex::new(r#"\b(?:\+?\d[\d .()-]{7,}\d)\b"#)
+            // Phones require phone STRUCTURE: an international `+` prefix or an
+            // area-code paren group. Bare digit runs match ISO dates
+            // (`2026-11-16`), epoch-millis ids (`run-1794801736-0001`), and
+            // every other identifier this store exists to cite — the 2026-11-16
+            // false-positive class (26k rows redacted). Local-format phones
+            // (`555-1234`) are deliberately not covered: they are
+            // indistinguishable from hyphen-joined ids by shape alone.
+            regex: Regex::new(r#"(?:\+\d{1,3}[\d .()-]{6,14}\d|\(\d{2,4}\)\s*[\d .()-]{5,12}\d)\b"#)
                 .expect("valid phone redaction regex"),
         },
     ]
@@ -156,5 +163,32 @@ mod tests {
             RedactCategory::from_config(" API_KEY "),
             Some(RedactCategory::ApiKey)
         );
+    }
+
+    #[test]
+    fn does_not_redact_iso_dates_and_run_ids() {
+        // The 2026-11-16 false-positive class: bare ISO dates and epoch-millis
+        // run ids (`run-<19 digits>-<seq>`) are identifiers, not phone numbers.
+        let input = "window 2026-11-16 to 2026-11-17, run-1794801736-0001 at 2026-11-16T04:15:17.420Z";
+        let (redacted, hits) = redact(input, &[RedactCategory::Phone]);
+        assert_eq!(redacted, input, "a bare ISO date or run id is not a phone");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn redacts_structured_phone_numbers() {
+        // The phone class requires phone STRUCTURE: an international `+` prefix
+        // or an area-code paren group. Bare digit runs (ids, dates) stay.
+        for phone in ["+14155551234", "+1 (415) 555-1234", "(415) 555-1234"] {
+            let (redacted, hits) = redact(
+                &format!("call {phone} about the run"),
+                &[RedactCategory::Phone],
+            );
+            assert!(
+                redacted.contains("[REDACTED:phone]"),
+                "{phone} should redact"
+            );
+            assert_eq!(hits.len(), 1, "{phone} should produce one hit");
+        }
     }
 }
