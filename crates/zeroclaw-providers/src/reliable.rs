@@ -2999,14 +2999,6 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                // The cooldown stays recorded exactly as today
-                                // (spec 2026-11-15 provider rate-limit backoff,
-                                // §1) so cross-call skip semantics stay coherent.
-                                // On a shared-key chain the wait curve — not this
-                                // error's own rotation window — paces the retry,
-                                // so the helper is called with a zero remaining
-                                // cooldown (the curve-band pins in the tests).
-                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 if shared_key_chain && attempt < self.max_retries {
                                     match self
                                         .wait_in_place_after_rate_limit(
@@ -3023,10 +3015,35 @@ impl ModelProvider for ReliableModelProvider {
                                         .await
                                     {
                                         RateLimitWaitOutcome::Waited { .. } => {
+                                            // The cooldown record follows the
+                                            // wait instead of preceding it: a
+                                            // concurrently-started sibling call
+                                            // polls its entry gate before this
+                                            // wait completes and must not be
+                                            // gated out of its own first attempt
+                                            // by this call's fresh window — the
+                                            // per-call budget independence the
+                                            // concurrent pins assert. Every
+                                            // arrival after the wait still sees
+                                            // the window, so cross-call skip
+                                            // semantics stay coherent.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             continue;
                                         }
                                         RateLimitWaitOutcome::BudgetExhausted => {
+                                            // No wait preceded this arm, so the
+                                            // record lands at 429-handling time,
+                                            // exactly as today.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             final_cause_provider =
                                                 Some(entry.candidate_name().to_string());
@@ -3034,6 +3051,9 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
+                                // Heterogeneous rotation and the last attempt
+                                // keep today's record timing byte-for-byte.
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3385,14 +3405,6 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                // The cooldown stays recorded exactly as today
-                                // (spec 2026-11-15 provider rate-limit backoff,
-                                // §1) so cross-call skip semantics stay coherent.
-                                // On a shared-key chain the wait curve — not this
-                                // error's own rotation window — paces the retry,
-                                // so the helper is called with a zero remaining
-                                // cooldown (the curve-band pins in the tests).
-                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 if shared_key_chain && attempt < self.max_retries {
                                     match self
                                         .wait_in_place_after_rate_limit(
@@ -3409,10 +3421,35 @@ impl ModelProvider for ReliableModelProvider {
                                         .await
                                     {
                                         RateLimitWaitOutcome::Waited { .. } => {
+                                            // The cooldown record follows the
+                                            // wait instead of preceding it: a
+                                            // concurrently-started sibling call
+                                            // polls its entry gate before this
+                                            // wait completes and must not be
+                                            // gated out of its own first attempt
+                                            // by this call's fresh window — the
+                                            // per-call budget independence the
+                                            // concurrent pins assert. Every
+                                            // arrival after the wait still sees
+                                            // the window, so cross-call skip
+                                            // semantics stay coherent.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             continue;
                                         }
                                         RateLimitWaitOutcome::BudgetExhausted => {
+                                            // No wait preceded this arm, so the
+                                            // record lands at 429-handling time,
+                                            // exactly as today.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             final_cause_provider =
                                                 Some(entry.candidate_name().to_string());
@@ -3420,6 +3457,9 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
+                                // Heterogeneous rotation and the last attempt
+                                // keep today's record timing byte-for-byte.
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3906,14 +3946,6 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                // The cooldown stays recorded exactly as today
-                                // (spec 2026-11-15 provider rate-limit backoff,
-                                // §1) so cross-call skip semantics stay coherent.
-                                // On a shared-key chain the wait curve — not this
-                                // error's own rotation window — paces the retry,
-                                // so the helper is called with a zero remaining
-                                // cooldown (the curve-band pins in the tests).
-                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 if shared_key_chain && attempt < retry_limit {
                                     match self
                                         .wait_in_place_after_rate_limit(
@@ -3930,10 +3962,35 @@ impl ModelProvider for ReliableModelProvider {
                                         .await
                                     {
                                         RateLimitWaitOutcome::Waited { .. } => {
+                                            // The cooldown record follows the
+                                            // wait instead of preceding it: a
+                                            // concurrently-started sibling call
+                                            // polls its entry gate before this
+                                            // wait completes and must not be
+                                            // gated out of its own first attempt
+                                            // by this call's fresh window — the
+                                            // per-call budget independence the
+                                            // concurrent pins assert. Every
+                                            // arrival after the wait still sees
+                                            // the window, so cross-call skip
+                                            // semantics stay coherent.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             continue;
                                         }
                                         RateLimitWaitOutcome::BudgetExhausted => {
+                                            // No wait preceded this arm, so the
+                                            // record lands at 429-handling time,
+                                            // exactly as today.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             final_cause_provider =
                                                 Some(entry.candidate_name().to_string());
@@ -3941,6 +3998,9 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
+                                // Heterogeneous rotation and the last attempt
+                                // keep today's record timing byte-for-byte.
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -4355,14 +4415,6 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                // The cooldown stays recorded exactly as today
-                                // (spec 2026-11-15 provider rate-limit backoff,
-                                // §1) so cross-call skip semantics stay coherent.
-                                // On a shared-key chain the wait curve — not this
-                                // error's own rotation window — paces the retry,
-                                // so the helper is called with a zero remaining
-                                // cooldown (the curve-band pins in the tests).
-                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 if shared_key_chain && attempt < retry_limit {
                                     match self
                                         .wait_in_place_after_rate_limit(
@@ -4379,10 +4431,35 @@ impl ModelProvider for ReliableModelProvider {
                                         .await
                                     {
                                         RateLimitWaitOutcome::Waited { .. } => {
+                                            // The cooldown record follows the
+                                            // wait instead of preceding it: a
+                                            // concurrently-started sibling call
+                                            // polls its entry gate before this
+                                            // wait completes and must not be
+                                            // gated out of its own first attempt
+                                            // by this call's fresh window — the
+                                            // per-call budget independence the
+                                            // concurrent pins assert. Every
+                                            // arrival after the wait still sees
+                                            // the window, so cross-call skip
+                                            // semantics stay coherent.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             continue;
                                         }
                                         RateLimitWaitOutcome::BudgetExhausted => {
+                                            // No wait preceded this arm, so the
+                                            // record lands at 429-handling time,
+                                            // exactly as today.
+                                            self.cool_down_rate_limited_provider(
+                                                entry,
+                                                served_model,
+                                                &e,
+                                            );
                                             final_cause = Some(e);
                                             final_cause_provider =
                                                 Some(entry.candidate_name().to_string());
@@ -4390,6 +4467,9 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
+                                // Heterogeneous rotation and the last attempt
+                                // keep today's record timing byte-for-byte.
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -15691,6 +15771,296 @@ mod tests {
             message.contains("rate_limit_cooldown"),
             "the shared-key siblings must cooldown-skip as today: {message}"
         );
+    }
+
+    /// Acceptance 3: a heterogeneous chain (distinct cooldown keys) keeps
+    /// today's semantics exactly — one 429 cools entry-0 and rotates to
+    /// entry-1 with zero sleep, no wait-in-place.
+    #[tokio::test(start_paused = true)]
+    async fn heterogeneous_chain_rotates_on_rate_limit_today_semantics() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let third_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "HTTP 429 Too Many Requests",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+                (
+                    "third".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&third_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            5,
+            2000,
+        );
+
+        let start = tokio::time::Instant::now();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect(
+                "the heterogeneous chain must rotate past the rate-limited entry exactly as today",
+            );
+        let elapsed = paused_delta_ms(tokio::time::Instant::now(), start);
+
+        assert_eq!(result, "from fallback");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "entry-0 must see exactly one attempt — the 429 rotates immediately, no in-place wait"
+        );
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            1,
+            "entry-1 must serve the very next attempt"
+        );
+        assert_eq!(
+            third_calls.load(Ordering::SeqCst),
+            0,
+            "rotation stops at the first success"
+        );
+        assert_eq!(
+            provider.provider_cooldown_active("primary"),
+            true,
+            "entry-0's cooldown must be recorded exactly as today"
+        );
+        assert_eq!(
+            elapsed, 0,
+            "heterogeneous rotation must not sleep — today's cooldown+rotate semantics carry zero wait"
+        );
+    }
+
+    /// Review Focus 2: two concurrent calls on ONE shared-key instance get
+    /// independent per-call wait budgets and both succeed — a shared ledger
+    /// would starve the second call. The mock 429s the first 6 total calls
+    /// (3 per call) then succeeds; each call saturates its own 10_000ms
+    /// budget exactly (the 8000ms curve term always clamps to the remaining
+    /// budget), so the join completes at 10_000ms.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_calls_get_independent_budgets() {
+        let (calls, script) =
+            timed_rate_limit_script(vec!["HTTP 429 Too Many Requests".to_string(); 6]);
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = Arc::new(
+            ReliableModelProvider::new_pinned_for_test(
+                "family.test",
+                vec![
+                    (
+                        "family.test",
+                        "family.test",
+                        "model-a",
+                        Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                    ),
+                    (
+                        "family.test",
+                        "family.test",
+                        "model-b",
+                        Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                    ),
+                    (
+                        "family.test",
+                        "family.test",
+                        "model-c",
+                        Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                    ),
+                ],
+                12,
+                2000,
+            )
+            .with_provider_rate_limit_budget_ms(10_000),
+        );
+
+        let start = tokio::time::Instant::now();
+        let (result_a, result_b) = tokio::join!(
+            provider.simple_chat("hello", "test", Some(0.0)),
+            provider.simple_chat("hello", "test", Some(0.0)),
+        );
+        let elapsed = paused_delta_ms(tokio::time::Instant::now(), start);
+
+        assert!(
+            result_a.is_ok(),
+            "concurrent call A must recover on its own budget: {:?}",
+            result_a.as_ref().map_err(|e| e.to_string())
+        );
+        assert!(
+            result_b.is_ok(),
+            "concurrent call B must recover on its own budget: {:?}",
+            result_b.as_ref().map_err(|e| e.to_string())
+        );
+        assert!(
+            (9_000..=20_000).contains(&elapsed),
+            "join elapsed {elapsed}ms must sit inside the two-independent-budget envelope"
+        );
+        assert_eq!(
+            timed_call_log(&calls).len(),
+            8,
+            "the 6 rate-limited attempts must split 3+3 across the calls, then each call's 4th attempt succeeds"
+        );
+    }
+
+    /// Review Focus 1 (unparseable): a Retry-After header that parses to no
+    /// number must be ignored — the doubling curve carries the retry.
+    #[tokio::test(start_paused = true)]
+    async fn unparseable_retry_after_falls_back_to_doubling_curve() {
+        let (calls, script) = timed_rate_limit_script(vec![
+            "HTTP 429 Too Many Requests, Retry-After: soon".to_string();
+            2
+        ]);
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(timed_rate_limit_mock(&calls, &script)) as Box<dyn ModelProvider>,
+            )],
+            12,
+            2000,
+        );
+
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the unparseable Retry-After must fall back to the doubling curve and recover");
+
+        assert_eq!(result, "recovered");
+        let timestamps = timed_call_log(&calls);
+        assert_eq!(
+            timestamps.len(),
+            3,
+            "429×2 then success on the single entry"
+        );
+        let d0 = paused_delta_ms(timestamps[1], timestamps[0]);
+        let d1 = paused_delta_ms(timestamps[2], timestamps[1]);
+        assert!(
+            (1600..=2400).contains(&d0),
+            "first wait {d0}ms outside the 2000ms doubling-term band — an unparseable Retry-After must not shape the wait"
+        );
+        assert!(
+            (3200..=4800).contains(&d1),
+            "second wait {d1}ms outside the 4000ms doubling-term band — the curve doubles, it does not retry 'soon' instantly"
+        );
+    }
+
+    /// Review Focus 1 (huge): a Retry-After of 999999s must clamp to the
+    /// configured 60s ceiling — never the legacy 30s cap, never ~11.5 days.
+    #[tokio::test(start_paused = true)]
+    async fn huge_retry_after_is_capped_by_ceiling() {
+        let (calls, script) = timed_rate_limit_script(vec![
+            "HTTP 429 Too Many Requests, Retry-After: 999999".to_string();
+            3
+        ]);
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(timed_rate_limit_mock(&calls, &script)) as Box<dyn ModelProvider>,
+            )],
+            12,
+            2000,
+        );
+
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the huge Retry-After must clamp to the ceiling and recover");
+
+        assert_eq!(result, "recovered");
+        let timestamps = timed_call_log(&calls);
+        assert_eq!(timestamps.len(), 4, "429×3 then success");
+        let deltas: Vec<u64> = timestamps
+            .windows(2)
+            .map(|w| paused_delta_ms(w[1], w[0]))
+            .collect();
+        assert_eq!(deltas.len(), 3);
+        for (index, delta) in deltas.iter().enumerate() {
+            assert!(
+                *delta <= 60_000,
+                "wait {index} = {delta}ms exceeds the 60s ceiling — the huge Retry-After must clamp"
+            );
+            assert!(
+                *delta > 30_000,
+                "wait {index} = {delta}ms sits at or below the legacy 30s cap — the ceiling must be the 60s knob"
+            );
+        }
+    }
+
+    /// Review Focus 3: `provider_max_backoff_ms` below the base still bounds
+    /// every in-place wait (the whole-expression clamp). With cap 100 the
+    /// doubling term itself clamps to 100 before jitter, so every wait is
+    /// jittered within [80, 100] and never exceeds the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn cap_below_base_bounds_every_in_place_wait() {
+        let (calls, script) =
+            timed_rate_limit_script(vec!["HTTP 429 Too Many Requests".to_string(); 3]);
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "family.test",
+            vec![
+                (
+                    "family.test",
+                    "family.test",
+                    "model-a",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-b",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-c",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+            ],
+            12,
+            2000,
+        )
+        .with_provider_max_backoff_ms(100);
+
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the whole-expression clamp must keep the call recoverable with the ceiling below the base");
+
+        assert_eq!(result, "recovered");
+        let timestamps = timed_call_log(&calls);
+        assert_eq!(timestamps.len(), 4, "429×3 then success on the same entry");
+        let deltas: Vec<u64> = timestamps
+            .windows(2)
+            .map(|w| paused_delta_ms(w[1], w[0]))
+            .collect();
+        assert_eq!(deltas.len(), 3);
+        for (index, delta) in deltas.iter().enumerate() {
+            assert!(
+                *delta <= 100,
+                "wait {index} = {delta}ms exceeds the 100ms ceiling — the whole-expression clamp must bound every wait with the ceiling below the base"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
