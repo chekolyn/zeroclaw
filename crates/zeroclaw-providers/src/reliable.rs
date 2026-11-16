@@ -2266,6 +2266,28 @@ impl ReliableModelProvider {
             .count()
     }
 
+    /// Whether every policy-eligible entry shares ONE `cooldown_key` — the
+    /// wait-in-place precondition (spec 2026-11-15 provider rate-limit
+    /// backoff, §1): when all eligible candidates drain a single shared
+    /// cooldown bucket, rotation cannot reach an uncooled provider, so the
+    /// caller waits in place instead of rotating. A single eligible entry
+    /// shares its own key trivially; no eligible entry means there is
+    /// nothing to wait on, so the answer is false.
+    // dead_code until the wave loop consumes it (Task 4 of the spec above) —
+    // drop the allow when the caller lands.
+    #[allow(dead_code)]
+    fn eligible_entries_share_cooldown_key(&self) -> bool {
+        let mut keys = self
+            .model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+            .map(|entry| entry.cooldown_key.as_str());
+        let Some(first) = keys.next() else {
+            return false;
+        };
+        keys.all(|key| key == first)
+    }
+
     fn log_provider_policy_skip(entry: &ReliableModelProviderEntry) {
         ::zeroclaw_log::record!(
             INFO,
@@ -14738,5 +14760,119 @@ mod tests {
             vec![2000, 4000, 8000, 10000, 10000],
             "today's doubling-capped non-rate-limit sequence must not change"
         );
+    }
+
+    // `eligible_entries_share_cooldown_key` decides wait-in-place vs
+    // rotation (spec 2026-11-15 provider rate-limit backoff, §1): only a
+    // chain whose policy-eligible entries all drain ONE cooldown bucket can
+    // wait in place — rotation cannot reach an uncooled provider there.
+
+    /// Predicate-test mock: never dispatched, only identity for entry
+    /// construction.
+    fn share_key_test_mock() -> MockModelProvider {
+        MockModelProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_until_attempt: 0,
+            response: "ok",
+            error: "unused",
+        }
+    }
+
+    #[test]
+    fn eligible_entries_share_cooldown_key_homogeneous() {
+        // The `new_pinned_for_test` shape mirrors `push_pinned_entries`:
+        // every entry shares ONE cooldown_key (the `<family>.<alias>`
+        // reference) and differs only in its pinned model.
+        let arc = Arc::new(share_key_test_mock()) as Arc<dyn ModelProvider>;
+        let arc2 = Arc::new(share_key_test_mock()) as Arc<dyn ModelProvider>;
+        let arc3 = Arc::new(share_key_test_mock()) as Arc<dyn ModelProvider>;
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "alias",
+            vec![
+                ("family.alias", "m1", "primary", arc),
+                ("family.alias", "m2", "fb1", arc2),
+                ("family.alias", "m3", "fb2", arc3),
+            ],
+            2,
+            2000,
+        );
+        assert!(provider.eligible_entries_share_cooldown_key());
+    }
+
+    #[test]
+    fn eligible_entries_share_cooldown_key_heterogeneous() {
+        // `new` derives each entry's cooldown_key from its display_name, so
+        // distinct display names mean distinct cooldown buckets.
+        let provider = ReliableModelProvider::new(
+            "t",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(share_key_test_mock()) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(share_key_test_mock()) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2000,
+        );
+        assert!(!provider.eligible_entries_share_cooldown_key());
+    }
+
+    #[test]
+    fn eligible_entries_share_cooldown_key_single_entry() {
+        let provider = ReliableModelProvider::new(
+            "t",
+            vec![(
+                "primary".into(),
+                Box::new(share_key_test_mock()) as Box<dyn ModelProvider>,
+            )],
+            2,
+            2000,
+        );
+        assert!(provider.eligible_entries_share_cooldown_key());
+    }
+
+    #[tokio::test]
+    async fn eligible_entries_share_cooldown_key_ignores_policy_ineligible_entries() {
+        // Keys {a, a, b} with distinct candidate identities: policy scoping
+        // to the two a-keyed candidates filters the b entry out, and the
+        // surviving entries share one cooldown bucket.
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_with_candidate(
+                    "a one",
+                    "a",
+                    "a.one",
+                    Box::new(share_key_test_mock()),
+                ),
+                ReliableModelProviderEntry::new_with_candidate(
+                    "a two",
+                    "a",
+                    "a.two",
+                    Box::new(share_key_test_mock()),
+                ),
+                ReliableModelProviderEntry::new_with_candidate(
+                    "b one",
+                    "b",
+                    "b.one",
+                    Box::new(share_key_test_mock()),
+                ),
+            ],
+            2,
+            2000,
+        );
+
+        // Unscoped, all three entries are eligible and the keys mismatch.
+        assert!(!provider.eligible_entries_share_cooldown_key());
+
+        let allowed = Arc::new(HashSet::from(["a.one".to_string(), "a.two".to_string()]));
+        scope_provider_attempt_allowlist(Some(allowed), async {
+            assert!(provider.eligible_entries_share_cooldown_key());
+        })
+        .await;
     }
 }
