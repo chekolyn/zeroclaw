@@ -1535,6 +1535,37 @@ fn provider_retry_attrs(
     })
 }
 
+/// Cadence attrs for an in-place rate-limit wait (spec 2026-11-15 provider
+/// rate-limit backoff, §5): the generic retry attrs with `reason` pinned to
+/// `rate_limited`, plus `rate_limit_events` (real 429s so far this call) and
+/// `cooldown_ms` present only when the remaining-cooldown term shaped the
+/// wait (cooldown term ≥ doubling term and ≥ retry-after term and > 0).
+fn rate_limit_retry_attrs(
+    provider_name: &str,
+    model: &str,
+    attempt: u32,
+    wait_ms: u64,
+    error_detail: &str,
+    diagnostic: &ProviderErrorDiagnostic,
+    cooldown_ms: Option<u64>,
+    rate_limit_events: u32,
+) -> serde_json::Value {
+    let mut attrs = provider_retry_attrs(
+        provider_name,
+        model,
+        attempt,
+        wait_ms,
+        "rate_limited",
+        error_detail,
+        diagnostic,
+    );
+    if let Some(cooldown_ms) = cooldown_ms {
+        attrs["cooldown_ms"] = serde_json::json!(cooldown_ms);
+    }
+    attrs["rate_limit_events"] = serde_json::json!(rate_limit_events);
+    attrs
+}
+
 fn provider_exhausted_attrs(
     provider_name: &str,
     model: &str,
@@ -1613,10 +1644,34 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
 const MAX_RETAINED_FAILURE_EVENTS: usize = 8;
 const MAX_FAILURE_AGGREGATE_BYTES: usize = 2_048;
 
+/// Outcome of an in-place rate-limit wait (spec 2026-11-15 provider
+/// rate-limit backoff, §1): either the caller slept `waited_ms` and may
+/// continue the same entry's attempt loop, or the per-call budget is spent
+/// and the caller must fail fast — never sleep zero and spin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RateLimitWaitOutcome {
+    Waited { waited_ms: u64 },
+    BudgetExhausted,
+}
+
+/// Per-call rate-limit wait ledger carried on [`FailureEvents`] (spec
+/// 2026-11-15 provider rate-limit backoff, §2): the remaining total wait
+/// budget, the strongest Retry-After seen among this call's real 429s, and
+/// the count of real 429 events. [`FailureEvents::default`] leaves the
+/// budget at zero — the helper's fail-fast signal — so non-chat consumers
+/// never wait.
+#[derive(Clone, Debug, Default)]
+struct RateLimitWaitLedger {
+    budget_remaining_ms: u64,
+    retry_after_max_ms: Option<u64>,
+    real_rate_limit_events: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 struct FailureEvents {
     total: usize,
     retained: Vec<String>,
+    rate_limit_wait: RateLimitWaitLedger,
 }
 
 impl FailureEvents {
@@ -1630,6 +1685,21 @@ impl FailureEvents {
     fn next_index(&self) -> usize {
         self.total + 1
     }
+
+    /// Construct with a per-call rate-limit wait budget (milliseconds). The
+    /// chat methods pass their configured `provider_rate_limit_budget_ms`;
+    /// [`FailureEvents::default`] keeps the budget at zero instead.
+    fn with_rate_limit_budget(budget_ms: u64) -> Self {
+        Self {
+            total: 0,
+            retained: Vec::new(),
+            rate_limit_wait: RateLimitWaitLedger {
+                budget_remaining_ms: budget_ms,
+                retry_after_max_ms: None,
+                real_rate_limit_events: 0,
+            },
+        }
+    }
 }
 
 fn push_failure(
@@ -1639,6 +1709,15 @@ fn push_failure(
     reason: &'static str,
     diagnostic: Option<&ProviderErrorDiagnostic>,
 ) {
+    // The ONE rate-limit classification point (spec 2026-11-15 provider
+    // rate-limit backoff, §Constraints): the `reason` already carries the
+    // class, so the budget ledger counts real 429s here instead of at every
+    // push site. Cooldown skips (`rate_limit_cooldown`) carry no error
+    // object and business quota (`rate_limited_non_retryable`) is terminal —
+    // neither is a real 429.
+    if reason == "rate_limited" {
+        failures.rate_limit_wait.real_rate_limit_events += 1;
+    }
     // This aggregate can cross into model-visible tool results and durable
     // background results. Keep it to fields controlled by ZeroClaw; the
     // provider response detail is retained in the structured attempt logs.
@@ -2273,9 +2352,6 @@ impl ReliableModelProvider {
     /// caller waits in place instead of rotating. A single eligible entry
     /// shares its own key trivially; no eligible entry means there is
     /// nothing to wait on, so the answer is false.
-    // dead_code until the wave loop consumes it (Task 4 of the spec above) —
-    // drop the allow when the caller lands.
-    #[allow(dead_code)]
     fn eligible_entries_share_cooldown_key(&self) -> bool {
         let mut keys = self
             .model_providers
@@ -2508,6 +2584,83 @@ impl ReliableModelProvider {
         *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
     }
 
+    /// Wait in place after a retryable rate-limit failure (spec 2026-11-15
+    /// provider rate-limit backoff, §1/§2): sleep the joined wait curve —
+    /// the doubling terms joined with this call's strongest Retry-After and
+    /// the caller-supplied remaining cooldown window — jittered and clamped
+    /// by the per-wait ceiling and the per-call budget carried on
+    /// `failures`. The Retry-After parsed from each real 429 folds into the
+    /// per-call max, so it persists across the call's events. Returns
+    /// [`RateLimitWaitOutcome::BudgetExhausted`] when no budget remains
+    /// (before computing a wait) or the computed wait would be zero — the
+    /// caller fails fast instead of sleeping zero and spinning.
+    async fn wait_in_place_after_rate_limit(
+        &self,
+        failures: &mut FailureEvents,
+        entry: &ReliableModelProviderEntry,
+        served_model: &str,
+        attempt: u32,
+        cooldown_remaining: Duration,
+        error_detail: &str,
+        diagnostic: &ProviderErrorDiagnostic,
+        err: &anyhow::Error,
+        call_ordinal: u64,
+    ) -> RateLimitWaitOutcome {
+        let retry_after_ms = parse_retry_after_ms(err);
+        let ledger = &mut failures.rate_limit_wait;
+        ledger.retry_after_max_ms = ledger.retry_after_max_ms.max(retry_after_ms);
+
+        if ledger.budget_remaining_ms == 0 {
+            return RateLimitWaitOutcome::BudgetExhausted;
+        }
+        let budget_remaining_ms = ledger.budget_remaining_ms;
+        let cooldown_term_ms = cooldown_remaining.as_millis() as u64;
+        let wait = rate_limit_wait_ms(
+            self.base_backoff_ms,
+            attempt,
+            self.provider_max_backoff_ms,
+            budget_remaining_ms,
+            cooldown_term_ms,
+            ledger.retry_after_max_ms,
+            jitter_scale_for(call_ordinal, attempt),
+        );
+        if wait == 0 {
+            return RateLimitWaitOutcome::BudgetExhausted;
+        }
+
+        // §5: `cooldown_ms` is emitted only when the cooldown term shaped the
+        // wait — it must exceed zero and dominate both other terms.
+        let doubling_term_ms = self
+            .base_backoff_ms
+            .saturating_mul(2u64.saturating_pow(attempt))
+            .min(self.provider_max_backoff_ms);
+        let retry_after_term_ms = ledger
+            .retry_after_max_ms
+            .map_or(0, |ms| ms.min(self.provider_max_backoff_ms));
+        let cooldown_shaped = cooldown_term_ms > 0
+            && cooldown_term_ms >= doubling_term_ms
+            && cooldown_term_ms >= retry_after_term_ms;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(rate_limit_retry_attrs(
+                    entry.display_name.as_str(),
+                    served_model,
+                    attempt,
+                    wait,
+                    error_detail,
+                    diagnostic,
+                    cooldown_shaped.then_some(cooldown_term_ms),
+                    ledger.real_rate_limit_events,
+                )),
+            "ModelProvider rate-limited; waiting in place before retry"
+        );
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        ledger.budget_remaining_ms -= wait;
+        RateLimitWaitOutcome::Waited { waited_ms: wait }
+    }
+
     /// Record an invalid but HTTP-successful provider response. The retry
     /// loops use this as an ordinary failure so that exhaustion advances to
     /// fallback instead of returning a successful blank turn.
@@ -2616,13 +2769,19 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
-        let mut failures = FailureEvents::default();
+        // §1/§2: one ordinal per call seeds the deterministic jitter, the
+        // per-call ledger carries the wait budget, and the shared-key
+        // precondition is memoized at call entry (builder's choice).
+        let call_ordinal = RATE_LIMIT_CALL_ORDINAL.fetch_add(1, Ordering::Relaxed);
+        let mut failures =
+            FailureEvents::with_rate_limit_budget(self.provider_rate_limit_budget_ms);
         let mut refusal_seen = None;
         let mut rejected_attempt_usage = None;
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
         let mut terminal_provider_keys = HashSet::new();
+        let shared_key_chain = self.eligible_entries_share_cooldown_key();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -2840,13 +2999,79 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
+                                // The cooldown stays recorded exactly as today
+                                // (spec 2026-11-15 provider rate-limit backoff,
+                                // §1) so cross-call skip semantics stay coherent.
+                                // On a shared-key chain the wait curve — not this
+                                // error's own rotation window — paces the retry,
+                                // so the helper is called with a zero remaining
+                                // cooldown (the curve-band pins in the tests).
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                if shared_key_chain && attempt < self.max_retries {
+                                    match self
+                                        .wait_in_place_after_rate_limit(
+                                            &mut failures,
+                                            entry,
+                                            served_model,
+                                            attempt,
+                                            Duration::ZERO,
+                                            &error_detail,
+                                            &diagnostic,
+                                            &e,
+                                            call_ordinal,
+                                        )
+                                        .await
+                                    {
+                                        RateLimitWaitOutcome::Waited { .. } => {
+                                            final_cause = Some(e);
+                                            continue;
+                                        }
+                                        RateLimitWaitOutcome::BudgetExhausted => {
+                                            final_cause = Some(e);
+                                            final_cause_provider =
+                                                Some(entry.candidate_name().to_string());
+                                            break;
+                                        }
+                                    }
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if attempt < self.max_retries {
+                                if rate_limited {
+                                    // A single-entry chain reaches here (the
+                                    // multi-entry branch above handled every
+                                    // len > 1 case; the business-quota class
+                                    // broke at `non_retryable`). Wait on the
+                                    // same curve with no cooldown term.
+                                    match self
+                                        .wait_in_place_after_rate_limit(
+                                            &mut failures,
+                                            entry,
+                                            served_model,
+                                            attempt,
+                                            Duration::ZERO,
+                                            &error_detail,
+                                            &diagnostic,
+                                            &e,
+                                            call_ordinal,
+                                        )
+                                        .await
+                                    {
+                                        RateLimitWaitOutcome::Waited { .. } => {
+                                            final_cause = Some(e);
+                                            continue;
+                                        }
+                                        RateLimitWaitOutcome::BudgetExhausted => {
+                                            final_cause = Some(e);
+                                            final_cause_provider =
+                                                Some(entry.candidate_name().to_string());
+                                            break;
+                                        }
+                                    }
+                                }
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -14874,5 +15099,390 @@ mod tests {
             assert!(provider.eligible_entries_share_cooldown_key());
         })
         .await;
+    }
+
+    #[test]
+    fn push_failure_counts_real_rate_limit_events_only() {
+        let diagnostic = ProviderErrorDiagnostic {
+            kind: "rate_limited",
+            phase: "http_response",
+            hint: "wait, change key/quota, or switch provider",
+            endpoint: None,
+        };
+
+        let mut failures = FailureEvents::with_rate_limit_budget(1000);
+        push_failure(&mut failures, 1, 13, "rate_limited", Some(&diagnostic));
+        assert_eq!(failures.rate_limit_wait.real_rate_limit_events, 1);
+
+        // A cooldown skip carries no error object and is not a real 429.
+        push_failure(
+            &mut failures,
+            0,
+            13,
+            "rate_limit_cooldown",
+            Some(&diagnostic),
+        );
+        assert_eq!(failures.rate_limit_wait.real_rate_limit_events, 1);
+
+        // Business quota is a terminal 429, not a retryable one.
+        push_failure(
+            &mut failures,
+            1,
+            13,
+            "rate_limited_non_retryable",
+            Some(&diagnostic),
+        );
+        assert_eq!(failures.rate_limit_wait.real_rate_limit_events, 1);
+
+        push_failure(&mut failures, 1, 13, "retryable", Some(&diagnostic));
+        assert_eq!(failures.rate_limit_wait.real_rate_limit_events, 1);
+
+        // Non-chat construction keeps the budget at zero (the fail-fast signal).
+        assert_eq!(
+            FailureEvents::default().rate_limit_wait.budget_remaining_ms,
+            0
+        );
+    }
+
+    #[test]
+    fn rate_limit_retry_attrs_shape() {
+        let diagnostic = ProviderErrorDiagnostic {
+            kind: "rate_limited",
+            phase: "http_response",
+            hint: "wait, change key/quota, or switch provider",
+            endpoint: None,
+        };
+
+        let attrs = rate_limit_retry_attrs(
+            "provider-name",
+            "served-model",
+            3,
+            45_000,
+            "HTTP 429 Too Many Requests",
+            &diagnostic,
+            Some(45_000),
+            2,
+        );
+        assert_eq!(attrs["attempt"], serde_json::json!(3));
+        assert_eq!(attrs["backoff_ms"], serde_json::json!(45_000));
+        assert_eq!(attrs["reason"], serde_json::json!("rate_limited"));
+        assert_eq!(attrs["rate_limit_events"], serde_json::json!(2));
+        assert_eq!(attrs["cooldown_ms"], serde_json::json!(45_000));
+
+        let unshaped = rate_limit_retry_attrs(
+            "provider-name",
+            "served-model",
+            3,
+            2000,
+            "HTTP 429 Too Many Requests",
+            &diagnostic,
+            None,
+            2,
+        );
+        assert!(unshaped.get("cooldown_ms").is_none());
+        assert_eq!(unshaped["rate_limit_events"], serde_json::json!(2));
+    }
+
+    /// Test-local mock following `MockModelProvider` that records a
+    /// `tokio::time::Instant` per call (advances under paused time) and
+    /// drains a per-call error script — errors are served front-first until
+    /// the script empties, then every call succeeds. One `Arc` can sit
+    /// behind every entry of a shared-key chain so the call counter and the
+    /// script are shared across entries.
+    struct TimedRateLimitMockProvider {
+        calls: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        errors: Arc<std::sync::Mutex<Vec<String>>>,
+        response: String,
+    }
+
+    impl TimedRateLimitMockProvider {
+        fn next_outcome(&self) -> anyhow::Result<String> {
+            self.calls
+                .lock()
+                .expect("test call log mutex")
+                .push(tokio::time::Instant::now());
+            let error = {
+                let mut script = self.errors.lock().expect("test error script mutex");
+                if script.is_empty() {
+                    None
+                } else {
+                    Some(script.remove(0))
+                }
+            };
+            match error {
+                Some(error) => Err(anyhow::Error::msg(error)),
+                None => Ok(self.response.clone()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TimedRateLimitMockProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.next_outcome()
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.next_outcome()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for TimedRateLimitMockProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TimedRateLimitMockProvider"
+        }
+    }
+
+    type TimedCallLog = Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>;
+    type TimedErrorScript = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn timed_rate_limit_script(errors: Vec<String>) -> (TimedCallLog, TimedErrorScript) {
+        (
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(errors)),
+        )
+    }
+
+    fn timed_rate_limit_mock(
+        calls: &TimedCallLog,
+        errors: &TimedErrorScript,
+    ) -> TimedRateLimitMockProvider {
+        TimedRateLimitMockProvider {
+            calls: Arc::clone(calls),
+            errors: Arc::clone(errors),
+            response: "recovered".to_string(),
+        }
+    }
+
+    fn timed_call_log(calls: &TimedCallLog) -> Vec<tokio::time::Instant> {
+        calls.lock().expect("test call log mutex").clone()
+    }
+
+    fn paused_delta_ms(later: tokio::time::Instant, earlier: tokio::time::Instant) -> u64 {
+        u64::try_from((later - earlier).as_millis()).expect("wait delta fits u64")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_system_waits_in_place_on_shared_key_chain() {
+        let (calls, script) =
+            timed_rate_limit_script(vec!["HTTP 429 Too Many Requests".to_string(); 3]);
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "family.test",
+            vec![
+                (
+                    "family.test",
+                    "family.test",
+                    "model-a",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-b",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-c",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+            ],
+            12,
+            2000,
+        );
+
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the shared-key chain must wait in place and recover");
+
+        assert_eq!(result, "recovered");
+        let timestamps = timed_call_log(&calls);
+        assert_eq!(
+            timestamps.len(),
+            4,
+            "429×3 then success — every attempt on the same entry, no rotation"
+        );
+        // Rotation = zero-wait cooldown skips, so per-wait deltas are the
+        // primary same-entry signal: each delta must sit inside the
+        // deterministic ±20% jitter band of its doubling-curve term.
+        let d0 = paused_delta_ms(timestamps[1], timestamps[0]);
+        let d1 = paused_delta_ms(timestamps[2], timestamps[1]);
+        let d2 = paused_delta_ms(timestamps[3], timestamps[2]);
+        assert!(
+            (1600..=2400).contains(&d0),
+            "first wait {d0}ms outside the 2000ms jitter band"
+        );
+        assert!(
+            (3200..=4800).contains(&d1),
+            "second wait {d1}ms outside the 4000ms jitter band"
+        );
+        assert!(
+            (6400..=9600).contains(&d2),
+            "third wait {d2}ms outside the 8000ms jitter band"
+        );
+        let total = paused_delta_ms(timestamps[3], timestamps[0]);
+        assert!(
+            total <= 300_000,
+            "total wait {total}ms exceeds the default 300s budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_system_rate_limit_waits_honor_budget_exhaustion() {
+        let (calls, script) =
+            timed_rate_limit_script(vec!["HTTP 429 Too Many Requests".to_string(); 12]);
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "family.test",
+            vec![
+                (
+                    "family.test",
+                    "family.test",
+                    "model-a",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-b",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-c",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+            ],
+            12,
+            2000,
+        )
+        .with_provider_rate_limit_budget_ms(5000);
+
+        let error = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("the 5000ms budget must exhaust before the mocked success");
+
+        let timestamps = timed_call_log(&calls);
+        let total = paused_delta_ms(
+            *timestamps.last().expect("at least one attempt"),
+            timestamps[0],
+        );
+        assert_eq!(
+            total, 5000,
+            "the budget is consumed exactly — the remainder clamp ends the wait"
+        );
+        // w0 is the jittered 2000ms doubling term. The next wait clamps to
+        // the exact remaining budget — unless the deterministic jitter draw
+        // lands the jittered 4000ms term below the remainder, in which case
+        // the leftover is consumed as one more strictly-positive wait before
+        // exhaustion (never a zero sleep). Either way the budget is spent
+        // exactly and the next 429 fails fast.
+        assert!(
+            timestamps.len() >= 3 && timestamps.len() <= 4,
+            "attempts must stop right after budget exhaustion, got {}",
+            timestamps.len()
+        );
+        let d0 = paused_delta_ms(timestamps[1], timestamps[0]);
+        assert!(
+            (1600..=2400).contains(&d0),
+            "first wait {d0}ms outside the 2000ms jitter band"
+        );
+        if timestamps.len() == 3 {
+            let d1 = paused_delta_ms(timestamps[2], timestamps[1]);
+            assert_eq!(
+                d1,
+                5000 - d0,
+                "the second wait clamps to the exact budget remainder"
+            );
+        } else {
+            let d1 = paused_delta_ms(timestamps[2], timestamps[1]);
+            let d2 = paused_delta_ms(timestamps[3], timestamps[2]);
+            assert!(
+                (3200..=4800).contains(&d1),
+                "unclamped second wait {d1}ms outside the 4000ms jitter band"
+            );
+            assert_eq!(
+                d1 + d2,
+                5000 - d0,
+                "the leftover budget is consumed before exhaustion"
+            );
+        }
+
+        let message = error.to_string();
+        assert!(
+            message.contains("rate_limited"),
+            "aggregate must carry the real 429 events: {message}"
+        );
+        assert!(
+            message.contains("rate_limit_cooldown"),
+            "the shared-key siblings must cooldown-skip as today: {message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_system_single_entry_rate_limit_uses_the_curve() {
+        let (calls, script) = timed_rate_limit_script(vec![
+            "HTTP 429 Too Many Requests, Retry-After: 45".to_string();
+            2
+        ]);
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(timed_rate_limit_mock(&calls, &script)) as Box<dyn ModelProvider>,
+            )],
+            2,
+            2000,
+        );
+
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the single entry must honor Retry-After up to the 60s ceiling");
+
+        assert_eq!(result, "recovered");
+        let timestamps = timed_call_log(&calls);
+        assert_eq!(timestamps.len(), 3, "429×2 then success");
+        let d0 = paused_delta_ms(timestamps[1], timestamps[0]);
+        let d1 = paused_delta_ms(timestamps[2], timestamps[1]);
+        assert!(
+            (36_000..=54_000).contains(&d0),
+            "first wait {d0}ms outside the 45000ms jitter band (today's code caps at 30000)"
+        );
+        assert!(
+            (36_000..=54_000).contains(&d1),
+            "second wait {d1}ms outside the 45000ms band — the Retry-After max persists across the call's events"
+        );
+        let total = paused_delta_ms(timestamps[2], timestamps[0]);
+        assert!(
+            total <= 300_000,
+            "total wait {total}ms exceeds the default 300s budget"
+        );
     }
 }
