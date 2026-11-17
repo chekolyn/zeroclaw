@@ -127,3 +127,6 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+
+# Image-build staging (build_zeroclaw.sh copies context files here; cleanup on exit)
+.zeroclaw-build/

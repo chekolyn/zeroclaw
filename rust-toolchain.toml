@@ -1,0 +1,7 @@
+# Pinned toolchain: build parity across mac / colima VM / container is a hard
+# requirement for the shared sccache pool and reproducible image builds.
+# Bump this ONLY together with the container (Dockerfile.debian-full FROM
+# rust:<ver>-slim) and a target-dir wipe — see `make rust-cache-status` in
+# debops-cheknet for the drift check. (Pinned 2026-11-16.)
+[toolchain]
+channel = "1.100.0"
