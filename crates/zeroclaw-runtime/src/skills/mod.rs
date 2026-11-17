@@ -1828,7 +1828,7 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
     let mut ordered: Vec<&Skill> = skills.iter().collect();
     ordered.sort_by(|a, b| a.name.cmp(&b.name));
     let mut prompt = match (mode, has_on_demand_skill) {
-SkillsPromptInjectionMode::Full, false) => String::from(
+        (zeroclaw_config::schema::SkillsPromptInjectionMode::Full, false) => String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
@@ -1840,73 +1840,72 @@ SkillsPromptInjectionMode::Full, false) => String::from(
              For a skill marked `<loading>on-demand</loading>`, call `read_skill(name)` with its `<name>` before following its instructions.\n\n\
              <available_skills>\n",
         ),
-        (zeroclaw_config::schema::        (zeroclaw_config::schema::SkillsPromptInjectionMode::Compact, _) => {
-        let mut prompt = String::from(
-            "## Available Skills\n\n\
-             Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` when you need the full skill file.\n\
-             Skills marked `always` include full instructions below even in compact mode.\n\n",
-        );
-        let any_callable = ordered.iter().any(|skill| {
-            skill.tools.iter().any(|t| {
-                skill_tool_is_prompt_callable(t)
-                    && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
-                        &skill.name,
-                        &t.name,
-                    ))
-            })
-        });
-        if any_callable {
-            prompt.push_str(
-                "Tools listed under a skill are registered callable specs — invoke them directly by their prefixed name.\n\n",
+        (zeroclaw_config::schema::SkillsPromptInjectionMode::Compact, _) => {
+            let mut prompt = String::from(
+                "## Available Skills\n\n\
+                 Skill summaries are preloaded below to keep context compact.\n\
+                 Skill instructions are loaded on demand: call `read_skill(name)` when you need the full skill file.\n\
+                 Skills marked `always` include full instructions below even in compact mode.\n\n",
             );
-        }
-        prompt.push_str("<available_skills>\n");
-        for skill in ordered {
-            let _ = writeln!(
-                prompt,
-                "- {}: {}",
-                skill.name,
-                compact_one_line(&skill.description)
-            );
-            // Always-injected skills keep their instructions inline even in
-            // compact mode; other instructions load through `read_skill`.
-            if skill.always && !skill.prompts.is_empty() {
-                for instruction in &skill.prompts {
-                    let _ = writeln!(prompt, "  instructions: {}", compact_one_line(instruction));
-                }
-            }
-            if !skill.tools.is_empty() {
-                for tool in &skill.tools {
-                    let callable = skill_tool_is_prompt_callable(tool)
+            let any_callable = ordered.iter().any(|skill| {
+                skill.tools.iter().any(|t| {
+                    skill_tool_is_prompt_callable(t)
                         && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
                             &skill.name,
-                            &tool.name,
-                        ));
-                    if callable {
-                        let _ = writeln!(
-                            prompt,
-                            "  callable: {} — {}",
-                            crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
-                            compact_one_line(&tool.description)
-                        );
-                    } else {
-                        let _ = writeln!(
-                            prompt,
-                            "  tool ({}): {} — {}",
-                            tool.kind,
-                            tool.name,
-                            compact_one_line(&tool.description)
-                        );
+                            &t.name,
+                        ))
+                })
+            });
+            if any_callable {
+                prompt.push_str(
+                    "Tools listed under a skill are registered callable specs — invoke them directly by their prefixed name.\n\n",
+                );
+            }
+            prompt.push_str("<available_skills>\n");
+            for skill in ordered {
+                let _ = writeln!(
+                    prompt,
+                    "- {}: {}",
+                    skill.name,
+                    compact_one_line(&skill.description)
+                );
+                // Always-injected skills keep their instructions inline even in
+                // compact mode; other instructions load through `read_skill`.
+                if skill.always && !skill.prompts.is_empty() {
+                    for instruction in &skill.prompts {
+                        let _ = writeln!(prompt, "  instructions: {}", compact_one_line(instruction));
+                    }
+                }
+                if !skill.tools.is_empty() {
+                    for tool in &skill.tools {
+                        let callable = skill_tool_is_prompt_callable(tool)
+                            && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                                &skill.name,
+                                &tool.name,
+                            ));
+                        if callable {
+                            let _ = writeln!(
+                                prompt,
+                                "  callable: {} — {}",
+                                crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
+                                compact_one_line(&tool.description)
+                            );
+                        } else {
+                            let _ = writeln!(
+                                prompt,
+                                "  tool ({}): {} — {}",
+                                tool.kind,
+                                tool.name,
+                                compact_one_line(&tool.description)
+                            );
+                        }
                     }
                 }
             }
-        }
-        prompt.push_str("</available_skills>\n");
-        return prompt;
+            prompt.push_str("</available_skills>\n");
+            return prompt;
         }
     };
- (feat(runtime): compact skills index — one-line entries, desc cap 100, drop location tags)
 
     for skill in ordered {
         let loads_on_demand = read_skill_available

@@ -203,6 +203,7 @@ fn quarantine_poison_row(
             // sentinel keeps group-bys honest instead of guessing.
             sop_name: "quarantined".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

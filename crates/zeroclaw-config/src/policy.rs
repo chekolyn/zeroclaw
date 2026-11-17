@@ -4637,7 +4637,11 @@ impl SecurityPolicy {
             // The opt-out skips syntax restrictions, but not a heredoc whose
             // body boundary cannot be proven. The path and risk checks refuse
             // that command for the same reason.
-            return split_unquoted_segments_checked(command, dialect).is_ok();
+            return split_unquoted_segments_checked(command, dialect)
+                .map(|_| ())
+                .map_err(|_| CommandRejection::SyntaxGuard {
+                    construct: "heredoc whose body boundary cannot be proven".into(),
+                });
         }
 
         if command.contains('`') {
@@ -4672,7 +4676,9 @@ impl SecurityPolicy {
             && (contains_unquoted_char(command, '(', dialect)
                 || contains_unquoted_char(command, ')', dialect))
         {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "unquoted grouping parentheses (`(`/`)`)".into(),
+            });
         }
 
         // Block shell redirections that target files. Allow safe forms:
@@ -4716,7 +4722,9 @@ impl SecurityPolicy {
         // An unreadable heredoc yields no segments, which must not read as
         // "every segment is allowed".
         let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
-            return false;
+            return Err(CommandRejection::SyntaxGuard {
+                construct: "heredoc whose body boundary cannot be proven".into(),
+            });
         };
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);

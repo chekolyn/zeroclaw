@@ -1284,6 +1284,9 @@ pub async fn agent_turn(
         turn_id,
         None,
         None,
+        // The plain `agent_turn` wrapper runs hooks-disabled (see the
+        // `hooks` parameter docs on `agent_turn_with_sop_reassembly`).
+        None,
     )
     .await
 }

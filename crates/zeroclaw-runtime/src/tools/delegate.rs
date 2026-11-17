@@ -6255,7 +6255,7 @@ impl DelegateTool {
                 // the inherited instances carried the CALLER's workspace
                 // root, so a relative `file_write` from a coder delegate
                 // landed in the caller's tree.
-                let bounded_base_tools = self.repoint_child_file_tools_to_target_workspace(
+                let mut bounded_base_tools = self.repoint_child_file_tools_to_target_workspace(
                     bounded_base_tools,
                     target_config.or(self.root_config.as_deref()),
                     agent_name,
