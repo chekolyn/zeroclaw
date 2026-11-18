@@ -687,6 +687,82 @@ fn recent_recall_sql_for_agents(
     )
 }
 
+/// The ranked-recall candidate cap: the candidate stage never candidates
+/// fewer than [`crate::RECALL_CANDIDATE_FLOOR`] rows (a tiny result-limit
+/// ask still ranks over a useful window) nor more than
+/// [`crate::POSTGRES_RECALL_CANDIDATE_CAP`] rows (ranked cost is
+/// O(candidates) — measured 6,093 ms at 10,805 unbounded candidates on the
+/// prod primary, 2026-11-18).
+fn recall_candidate_cap(limit: usize) -> usize {
+    limit
+        .max(crate::RECALL_CANDIDATE_FLOOR)
+        .min(crate::POSTGRES_RECALL_CANDIDATE_CAP)
+}
+
+/// The ranked-recall shape shared by the unscoped and agent-scoped paths: a
+/// `MATERIALIZED` candidate stage bounds the ranked cost to
+/// O(candidate_cap) before the rank expression ever runs (measured
+/// 2026-11-18 on the idle prod primary at 86,110 rows: 'circuit breaker' →
+/// 10,805 candidates / 6,093 ms; 'drive_sync' → 6,418 candidates / 6,210 ms
+/// — the per-candidate tsvector recheck makes ranked cost O(candidates)).
+///
+/// The stage carries every candidate-selection predicate — the full-content
+/// FTS match (`to_tsvector('simple', m.key || ' ' || m.content)`, the
+/// deep-match contract: a term match beyond the 4096-char rank prefix still
+/// surfaces the row, ranking by its key arm instead), the session scoping,
+/// the agent-scoped allowlist when present, and the enabled time bounds —
+/// ordered by recency (`m.updated_at DESC`) and closed by the cap LIMIT.
+/// The rank expression, the score ORDER BY and the result LIMIT follow the
+/// candidate join.
+///
+/// Bind layouts (the cap slot binds before the time bounds):
+/// - unscoped: `$1` query / `$2` session / `$3` result limit / `$4` cap /
+///   `$5..` time;
+/// - agent-scoped: `$1` query / `$2` session / `$3` result limit / `$4`
+///   allowlist / `$5` cap / `$6..` time.
+///
+/// `$1` is the query in BOTH the stage filter and the rank expression
+/// ([`recall_rank_expression`] hardcodes it) — the layouts keep that
+/// invariant. The outer query aliases the stage as `m` so the rank
+/// expression's `m.` references hold.
+fn ranked_recall_sql(
+    qualified_table: &str,
+    qualified_agents: &str,
+    agent_scoped: bool,
+    since: bool,
+    until: bool,
+) -> String {
+    let cap_placeholder = if agent_scoped { 5 } else { 4 };
+    let time_filter = recall_time_filter(since, until, cap_placeholder + 1);
+    let allowlist_filter = if agent_scoped {
+        "\n          AND m.agent_id = ANY($4)"
+    } else {
+        ""
+    };
+    format!(
+        "
+        WITH candidates AS MATERIALIZED (
+            SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id,
+                   m.agent_id, m.namespace, m.importance, m.updated_at
+            FROM {qualified_table} m
+            WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+              AND ($2::TEXT IS NULL OR m.session_id = $2){allowlist_filter}
+              {time_filter}
+            ORDER BY m.updated_at DESC
+            LIMIT ${cap_placeholder}
+        )
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
+               ({rank})
+               AS score
+        FROM candidates m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+        ORDER BY score DESC, m.updated_at DESC
+        LIMIT $3
+        ",
+        rank = recall_rank_expression(),
+    )
+}
+
 /// The prefix enumeration: index-assisted, LIMITed in storage.
 ///
 /// `key LIKE $1 || '%'` is served by the boot-time
@@ -851,44 +927,47 @@ impl Memory for PostgresMemory {
         let client = self.client.get().clone();
         let attempt_timeout = self.recall_soft_timeout;
         let op_timeout = self.op_timeout;
+        let cap = recall_candidate_cap(limit);
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
-
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
-                       ({rank})
-                       AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-                rank = recall_rank_expression(),
+            let stmt = ranked_recall_sql(
+                &qualified_table,
+                &qualified_agents,
+                false,
+                since_ref.is_some(),
+                until_ref.is_some(),
             );
 
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
+            #[allow(clippy::cast_possible_wrap)]
+            let cap_i64 = cap as i64;
 
             // Bound THIS attempt server-side at the soft budget so a caller
             // that gives up leaves no orphan holding the shared connection.
             let entries =
                 with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
-                        (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
-                        (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
-                        (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+                        (Some(s), Some(u)) => {
+                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &s, &u])?
+                        }
+                        (Some(s), None) => {
+                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &s])?
+                        }
+                        (None, Some(u)) => {
+                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &u])?
+                        }
+                        (None, None) => {
+                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64])?
+                        }
                     };
-                    rows.iter().map(Self::row_to_entry).collect::<Result<Vec<MemoryEntry>>>()
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
                 })?;
             Ok(entries)
         })
@@ -1282,51 +1361,46 @@ impl Memory for PostgresMemory {
         let client = self.client.get().clone();
         let attempt_timeout = self.recall_soft_timeout;
         let op_timeout = self.op_timeout;
+        let cap = recall_candidate_cap(limit);
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
-
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
-                       ({rank})
-                       AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
-                  AND m.agent_id = ANY($4)
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-                rank = recall_rank_expression(),
+            let stmt = ranked_recall_sql(
+                &qualified_table,
+                &qualified_agents,
+                true,
+                since_ref.is_some(),
+                until_ref.is_some(),
             );
 
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
+            #[allow(clippy::cast_possible_wrap)]
+            let cap_i64 = cap as i64;
 
             // Bound THIS attempt server-side at the soft budget so a caller
             // that gives up leaves no orphan holding the shared connection.
             let entries =
                 with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
-                        }
+                        (Some(s), Some(u)) => client
+                            .query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s, &u])?,
                         (Some(s), None) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s])?
                         }
                         (None, Some(u)) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &u])?
                         }
-                        (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+                        (None, None) => {
+                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64])?
+                        }
                     };
-                    rows.iter().map(Self::row_to_entry).collect::<Result<Vec<MemoryEntry>>>()
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
                 })?;
             Ok(entries)
         })
@@ -1659,6 +1733,210 @@ mod tests {
             sql.matches("left(m.content, 4096)").count(),
             2,
             "the 4096 prefix must bound both the content filter and its rank arm, got: {sql:?}"
+        );
+    }
+
+    /// The ranked recall must bound its candidate set BEFORE ranking: a
+    /// `WITH candidates AS MATERIALIZED` stage carries the full-content FTS
+    /// predicate (the preserved deep-match contract), the session/scope
+    /// predicates, and the recency ORDER BY closed by the cap LIMIT — the
+    /// rank expression, the score ORDER BY and the result LIMIT all follow
+    /// the candidate join. Measured driver (2026-11-18, idle prod primary,
+    /// 86,110 rows): 'circuit breaker' → 10,805 candidates / 6,093 ms —
+    /// ranked cost is O(candidates), so the stage must cap it.
+    #[test]
+    fn ranked_recall_sql_bounds_the_candidate_stage_before_ranking() {
+        // Unscoped shape (since-bound): the cap stage closes before the rank
+        // expression appears.
+        let sql = ranked_recall_sql("mem.memories", "mem.agents", false, true, false);
+        let rank_at = sql
+            .find("* 2.0")
+            .expect("the key-arm rank weight must be present");
+        let stage_at = sql
+            .find("WITH candidates AS MATERIALIZED")
+            .expect("the candidate stage must be a MATERIALIZED CTE");
+        assert!(
+            stage_at < rank_at,
+            "the stage must precede the rank expression"
+        );
+        let fts_at = sql
+            .find(
+                "to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1)",
+            )
+            .expect("the full-content FTS predicate must be present");
+        assert!(
+            fts_at < rank_at,
+            "the full-content FTS predicate must stay INSIDE the candidate stage (the deep-match contract)"
+        );
+        let session_at = sql
+            .find("$2::TEXT IS NULL OR m.session_id = $2")
+            .expect("the session predicate must be present");
+        assert!(
+            session_at < rank_at,
+            "the session predicate rides the stage"
+        );
+        let order_at = sql
+            .find("ORDER BY m.updated_at DESC")
+            .expect("the stage recency ORDER BY must be present");
+        let cap_at = sql
+            .find("LIMIT $4")
+            .expect("the unscoped cap must bind at $4");
+        assert!(
+            order_at < cap_at && cap_at < rank_at,
+            "the cap LIMIT must close the candidate stage — recency ORDER BY first, LIMIT before the rank expression"
+        );
+        let time_at = sql
+            .find("m.created_at >= $5::TIMESTAMPTZ")
+            .expect("the unscoped time bound must shift to $5 (4→5 behind the cap)");
+        assert!(time_at < rank_at, "the time predicate is a stage predicate");
+        assert!(
+            !sql.contains("agent_id = ANY"),
+            "the unscoped shape carries no allowlist predicate, got: {sql}"
+        );
+
+        // The rank arms are unchanged: key arm whole at 2.0 weight, content
+        // arm bounded by the 4096 prefix in both its predicate and its rank.
+        assert!(
+            sql.contains(
+                "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0",
+            ),
+            "key rank arm must stay whole at 2.0 weight, got: {sql}"
+        );
+        assert_eq!(
+            sql.matches("left(m.content, 4096)").count(),
+            2,
+            "the 4096 prefix bounds only the rank expression's two content uses, got: {sql}"
+        );
+
+        // Score ORDER BY and result LIMIT follow the candidate join.
+        let join_at = sql
+            .find("LEFT JOIN mem.agents")
+            .expect("the agent alias join must be present");
+        assert!(
+            join_at > cap_at,
+            "the agent join rides the outer query, after the candidate stage"
+        );
+        let score_at = sql
+            .find("ORDER BY score DESC")
+            .expect("the score ORDER BY must be present");
+        let result_limit_at = sql
+            .find("LIMIT $3")
+            .expect("the result limit must bind at $3");
+        assert!(
+            score_at > rank_at && result_limit_at > score_at,
+            "the score ORDER BY and the result LIMIT follow the candidate join"
+        );
+
+        // The $1=query invariant in BOTH places: the stage FTS filter and
+        // the rank expression bind the same query placeholder.
+        assert_eq!(
+            sql.matches("plainto_tsquery('simple', $1)").count(),
+            5,
+            "$1 must be the query in the stage filter (1) and the rank expression (4), got: {sql}"
+        );
+
+        // Agent-scoped shape (both time bounds): the allowlist predicate
+        // rides INSIDE the stage; the cap and time bounds shift behind it.
+        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true);
+        let scoped_rank_at = scoped
+            .find("* 2.0")
+            .expect("the scoped shape carries the same rank expression");
+        let allow_at = scoped
+            .find("m.agent_id = ANY($4)")
+            .expect("the agent-scoped allowlist predicate must bind at $4");
+        assert!(
+            allow_at < scoped_rank_at,
+            "the allowlist predicate must ride INSIDE the candidate stage"
+        );
+        let scoped_cap_at = scoped
+            .find("LIMIT $5")
+            .expect("the agent-scoped cap must bind at $5");
+        assert!(
+            scoped_cap_at < scoped_rank_at,
+            "the agent-scoped cap LIMIT closes the stage"
+        );
+        assert!(
+            scoped.find("m.created_at >= $6::TIMESTAMPTZ").is_some()
+                && scoped.find("m.created_at <= $7::TIMESTAMPTZ").is_some(),
+            "the agent-scoped time bounds shift to $6/$7 (5→6 behind the allowlist + cap)"
+        );
+        assert!(
+            scoped.find("LIMIT $3").is_some(),
+            "the result limit stays at $3 in the agent-scoped shape"
+        );
+    }
+
+    /// The candidate cap clamps to [500, 2000]: the floor keeps tiny asks
+    /// from over-narrowing the window below a useful recall set, and the
+    /// ceiling must stay >= the largest supported result limit or LIMIT $3
+    /// returns short of a full candidate set.
+    #[test]
+    fn recall_candidate_cap_floor_and_limit_ceiling() {
+        assert_eq!(
+            recall_candidate_cap(10),
+            500,
+            "below the floor clamps up to the floor"
+        );
+        assert_eq!(
+            recall_candidate_cap(500),
+            500,
+            "at the floor stays at the floor"
+        );
+        assert_eq!(
+            recall_candidate_cap(1000),
+            1000,
+            "between floor and ceiling passes through"
+        );
+        assert_eq!(
+            recall_candidate_cap(2001),
+            2000,
+            "above the ceiling clamps to the ceiling"
+        );
+        assert_eq!(
+            recall_candidate_cap(100000),
+            2000,
+            "far above clamps to the ceiling"
+        );
+    }
+
+    /// The bind layouts, pinned numerically: unscoped $1 query / $2 session /
+    /// $3 result limit / $4 cap / $5.. time; agent-scoped $1 query / $2
+    /// session / $3 result limit / $4 allowlist / $5 cap / $6.. time. The
+    /// cap slot binds before the time bounds in both variants.
+    #[test]
+    fn ranked_recall_sql_placeholder_layout_pins_cap_before_time_bounds() {
+        let unscoped = ranked_recall_sql("mem.memories", "mem.agents", false, true, true);
+        assert!(
+            unscoped.contains("LIMIT $4"),
+            "the unscoped candidate cap binds at $4, got: {unscoped}"
+        );
+        assert!(
+            unscoped.contains("m.created_at >= $5::TIMESTAMPTZ")
+                && unscoped.contains("m.created_at <= $6::TIMESTAMPTZ"),
+            "the unscoped time bounds shift 4→5, got: {unscoped}"
+        );
+        assert!(
+            unscoped.contains("LIMIT $3"),
+            "the result limit binds at $3 after the candidate join, got: {unscoped}"
+        );
+
+        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true);
+        assert!(
+            scoped.contains("m.agent_id = ANY($4)"),
+            "the allowlist binds at $4, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("LIMIT $5"),
+            "the agent-scoped cap binds at $5 behind the allowlist, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("m.created_at >= $6::TIMESTAMPTZ")
+                && scoped.contains("m.created_at <= $7::TIMESTAMPTZ"),
+            "the agent-scoped time bounds shift 5→6, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("LIMIT $3"),
+            "the result limit binds at $3 in the scoped shape, got: {scoped}"
         );
     }
 
@@ -2264,6 +2542,156 @@ mod tests {
                     .iter()
                     .map(|e| (e.key.as_str(), e.content.as_str()))
                     .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// The ranked recall must bound its candidate set to the NEWEST matching
+    /// window before ranking (measured 2026-11-18 on the idle prod primary,
+    /// 86,110 rows: 'circuit breaker' → 10,805 candidates / 6,093 ms;
+    /// 'drive_sync' → 6,418 candidates / 6,210 ms — the per-candidate
+    /// tsvector recheck makes ranked cost O(candidates), so an unbounded
+    /// stage burns the recall budget on large stores). RED shape: 800 OLD
+    /// docs rank HIGHER (the term repeated ~200× inside the rank prefix)
+    /// than 500 NEWER docs (single occurrence), and the old shape's unbounded
+    /// stage lets the old high-rank rows outrank into the results.
+    ///
+    /// Blocking admin SQL stays OUTSIDE the Tokio runtime blocks — the
+    /// nested-block_on panic class the pgvector fixture pins.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_ranked_recall_ranks_within_the_newest_candidate_window() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "window");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
+
+            // OLD half: the term repeated ~200× inside the rank prefix →
+            // high content rank.
+            let old_content = "needle ".repeat(200);
+            for i in 0..800 {
+                memory
+                    .store(
+                        &format!("old:needle:{i}"),
+                        &old_content,
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            // NEW half: matches with a single occurrence → low rank, but
+            // NEWER than every old row.
+            let new_content = "filler context needle filler";
+            for i in 0..500 {
+                memory
+                    .store(
+                        &format!("new:needle:{i}"),
+                        new_content,
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            memory
+        });
+
+        // Make the window separation unambiguous: every old row a full day
+        // older than the new half (store timestamps share milliseconds, so
+        // store-order recency alone is not a safe separator at 1300 rows).
+        schema
+            .admin
+            .batch_execute(&format!(
+                "UPDATE {}.memories SET created_at = NOW() - INTERVAL '1 day',
+                 updated_at = NOW() - INTERVAL '1 day' WHERE key LIKE 'old:%'",
+                quote_identifier(&schema.name)
+            ))
+            .expect("shifting the old seed set into the past must succeed");
+
+        runtime.block_on(async {
+            let recalled = memory
+                .recall("needle", 10, None, None, None)
+                .await
+                .expect("the ranked recall must parse and return rows");
+            assert_eq!(recalled.len(), 10, "the result limit must be respected");
+            assert!(
+                recalled.iter().all(|e| e.key.starts_with("new:")),
+                "every result must come from the newest candidate window; got: {:?}",
+                recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// CONTRACT PIN (passes today — labeled a pin, not a RED): the candidate
+    /// stage must keep the FULL-content FTS predicate
+    /// (`to_tsvector('simple', m.key || ' ' || m.content)`). A row whose
+    /// ONLY term match sits beyond the 4096-char rank prefix must still be
+    /// recalled — it ranks by its key arm instead of a deep-position content
+    /// rank. If the two-stage rewrite bounded the stage filter to the rank
+    /// prefix, this row would vanish from recall entirely.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_ranked_recall_deep_body_match_still_recalled() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "deepmatch");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
+
+            // The ONLY match for the query sits at char ~5001 — beyond the
+            // 4096-char rank prefix.
+            let deep_content = format!("{} needle", "z".repeat(5000));
+            memory
+                .store("deep:needle", &deep_content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+
+            let recalled = memory
+                .recall("needle", 10, None, None, None)
+                .await
+                .expect("the ranked recall must parse and return rows");
+            assert!(
+                recalled.iter().any(|e| e.key == "deep:needle"),
+                "a deep-body match beyond the rank prefix must still be recalled; got: {:?}",
+                recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
             );
         });
     }

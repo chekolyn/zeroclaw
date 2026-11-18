@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
-use zeroclaw_memory::{Memory, RecallExcludes};
+use zeroclaw_memory::{Memory, POSTGRES_RECALL_CANDIDATE_CAP, RecallExcludes};
 
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
@@ -236,7 +236,15 @@ impl Tool for MemoryRecallTool {
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
-            .map_or(5, |v| v as usize);
+            .map_or(5, |v| v as usize)
+            // Clamp to the ranked recall's candidate ceiling BEFORE the
+            // backend call: the backend's candidate stage caps at
+            // POSTGRES_RECALL_CANDIDATE_CAP, and the downstream ×2 fetch
+            // widening (recall_filtered) plus AgentScopedMemory's second
+            // doubling multiply whatever passes through here — an unclamped
+            // model-authored `limit: 100000` would reopen the seconds-scale
+            // ranked-recall regression.
+            .min(POSTGRES_RECALL_CANDIDATE_CAP);
 
         // Prefix mode: list all entries whose key starts with the given prefix
         if let Some(prefix) = args.get("prefix").and_then(|v| v.as_str()) {
@@ -763,6 +771,166 @@ mod tests {
             1,
         );
         assert_eq!(*mem.last_prefix_limit.lock().unwrap(), Some(7));
+    }
+
+    /// Fake backend capturing the limit the tool hands the memory stack, so
+    /// the candidate-cap clamp at the parse site is observable without a
+    /// live backend. Overriding `recall_filtered` captures the limit BEFORE
+    /// the trait default's ×2 fetch widening (and AgentScopedMemory's second
+    /// doubling), which multiply whatever passes through here.
+    struct LimitCaptureMemory {
+        last_limit: Mutex<Option<usize>>,
+    }
+
+    impl LimitCaptureMemory {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                last_limit: Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Memory for LimitCaptureMemory {
+        fn name(&self) -> &str {
+            "limit-capture"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_prefixed(
+            &self,
+            _prefix: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_filtered(
+            &self,
+            _query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+            _excludes: &RecallExcludes,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            *self.last_limit.lock().unwrap() = Some(limit);
+            Ok(Vec::new())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for LimitCaptureMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "LimitCaptureMemory"
+        }
+    }
+
+    /// A model-authored `limit` reaching the tool must clamp to the ranked
+    /// recall's candidate ceiling BEFORE the backend call: the backend's
+    /// candidate stage caps at 2000, and the downstream ×2 fetch widening
+    /// (`recall_filtered`) plus AgentScopedMemory's second doubling multiply
+    /// whatever passes through here — an unclamped `limit: 100000` ask would
+    /// reopen the seconds-scale ranked-recall regression.
+    #[tokio::test]
+    async fn memory_recall_limit_is_clamped_to_the_candidate_cap() {
+        let mem = LimitCaptureMemory::new();
+        let tool = MemoryRecallTool::new(mem.clone());
+
+        tool.execute(json!({"query": "needle", "limit": 100000}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *mem.last_limit.lock().unwrap(),
+            Some(POSTGRES_RECALL_CANDIDATE_CAP),
+            "a model-authored limit above the candidate ceiling must clamp before the backend call"
+        );
+
+        tool.execute(json!({"query": "needle", "limit": 7}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *mem.last_limit.lock().unwrap(),
+            Some(7),
+            "a limit within the ceiling passes through unchanged"
+        );
     }
 
     struct QueryEchoMemory {
