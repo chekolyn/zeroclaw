@@ -604,14 +604,20 @@ const RECALL_RANK_CONTENT_PREFIX_CHARS: usize = 4096;
 /// The recall score expression shared by `recall` and `recall_for_agents`.
 /// `$1` is the plainto_tsquery parameter; caller supplies the FROM alias
 /// (`m.`), which both call sites already use.
+///
+/// Built with real newlines, never `\`-newline continuations: a Rust string
+/// continuation strips the newline AND the next line's leading whitespace,
+/// which fused `* 2.0` + `ELSE` into the parse-fatal `2.0ELSE` token
+/// (server-proven 2026-11-18: every non-empty-query ranked recall died at
+/// parse with "trailing junk after numeric literal"). Newlines are valid SQL
+/// whitespace; the leading indentation below is too.
 fn recall_rank_expression() -> String {
     format!(
-        "\
-         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)\
-           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0\
-           ELSE 0.0 END +\
-         CASE WHEN to_tsvector('simple', left(m.content, {prefix})) @@ plainto_tsquery('simple', $1)\
-           THEN ts_rank_cd(to_tsvector('simple', left(m.content, {prefix})), plainto_tsquery('simple', $1))\
+        "CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
+           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+           ELSE 0.0 END +
+         CASE WHEN to_tsvector('simple', left(m.content, {prefix})) @@ plainto_tsquery('simple', $1)
+           THEN ts_rank_cd(to_tsvector('simple', left(m.content, {prefix})), plainto_tsquery('simple', $1))
            ELSE 0.0 END",
         prefix = RECALL_RANK_CONTENT_PREFIX_CHARS,
     )
@@ -1600,6 +1606,62 @@ mod tests {
         assert_eq!(sql.matches("plainto_tsquery('simple', $1)").count(), 4);
     }
 
+    /// The 2026-11-18 `2.0ELSE` class (server-proven: every non-empty-query
+    /// ranked recall died at parse with "trailing junk after numeric
+    /// literal"): a `\`-newline continuation inside a Rust string strips the
+    /// newline AND the next line's leading whitespace, fusing adjacent SQL
+    /// tokens. This pin holds on the RAW built string — no join may fuse two
+    /// tokens — and on the whitespace-normalized form, which must carry the
+    /// intended separations regardless of how the whitespace is spelled.
+    #[test]
+    fn recall_rank_expression_joins_are_whitespace_separated() {
+        let sql = recall_rank_expression();
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The spaced joins (whitespace-normalized form): the intended token
+        // separations across the whole expression.
+        assert!(
+            normalized.contains("$1) THEN"),
+            "CASE WHEN arms must separate the predicate from THEN, got: {sql:?}"
+        );
+        assert!(
+            normalized.contains("* 2.0 ELSE"),
+            "the key-arm weight must be separated from ELSE, got: {sql:?}"
+        );
+        assert!(
+            normalized.contains("END + CASE"),
+            "the two rank arms must separate around the +, got: {sql:?}"
+        );
+        assert!(
+            normalized.contains("$1)) ELSE"),
+            "the content arm's rank must be separated from its ELSE, got: {sql:?}"
+        );
+
+        // The stripped joins (the broken shape) must not exist in the raw
+        // string — `2.0ELSE` is the parse-fatal one; the other two are the
+        // same continuation-stripping class.
+        assert!(
+            !sql.contains("2.0ELSE"),
+            "a fused 2.0ELSE token is parse-fatal (trailing junk after numeric literal), got: {sql:?}"
+        );
+        assert!(!sql.contains(")THEN"), "a fused )THEN join, got: {sql:?}");
+        assert!(!sql.contains("+CASE"), "a fused +CASE join, got: {sql:?}");
+
+        // Token-equivalence: the key arm whole at 2.0 weight (exactly one),
+        // the content arm bounded by the 4096 prefix in BOTH its filter and
+        // its rank arm at implicit 1.0 weight.
+        assert_eq!(
+            sql.matches("* 2.0").count(),
+            1,
+            "only the key arm carries the 2.0 weight, got: {sql:?}"
+        );
+        assert_eq!(
+            sql.matches("left(m.content, 4096)").count(),
+            2,
+            "the 4096 prefix must bound both the content filter and its rank arm, got: {sql:?}"
+        );
+    }
+
     #[test]
     fn recall_time_filter_qualifies_alias_and_preserves_placeholder_order() {
         let cases = [
@@ -2120,6 +2182,88 @@ mod tests {
             assert!(
                 literal.is_empty(),
                 "a % in the prefix must be escaped, not treated as a wildcard"
+            );
+        });
+    }
+
+    /// The FIRST automated execution surface for the ranked-recall SQL (the
+    /// 2026-11-18 `2.0ELSE` class): unit-tier fragment assertions could not
+    /// see a whitespace join fusing tokens INSIDE the emitted expression —
+    /// only executing a NON-EMPTY-query ranked recall parses the built SQL
+    /// server-side. RED baseline: every such recall died at parse
+    /// ("trailing junk after numeric literal") before the whitespace repair.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_ranked_recall_nonempty_query_parses_and_returns_rows() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "rankrecall");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+            )
+            .unwrap();
+
+            memory
+                .store(
+                    "rank:alpha",
+                    "alpha indexed recall probe",
+                    MemoryCategory::Core,
+                    Some("rank_session"),
+                )
+                .await
+                .unwrap();
+            memory
+                .store(
+                    "rank:beta",
+                    "beta also mentions alpha for the rank",
+                    MemoryCategory::Core,
+                    Some("rank_session"),
+                )
+                .await
+                .unwrap();
+            memory
+                .store(
+                    "rank:none",
+                    "unrelated filler content",
+                    MemoryCategory::Core,
+                    Some("rank_session"),
+                )
+                .await
+                .unwrap();
+
+            let recalled = memory
+                .recall("alpha", 10, Some("rank_session"), None, None)
+                .await
+                .expect("a non-empty-query ranked recall must PARSE and return rows");
+            assert!(
+                !recalled.is_empty(),
+                "the seeded matching rows must come back from the ranked recall"
+            );
+            assert!(
+                recalled
+                    .iter()
+                    .all(|e| e.key.contains("alpha") || e.content.contains("alpha")),
+                "every recalled row must match the query, got: {:?}",
+                recalled
+                    .iter()
+                    .map(|e| (e.key.as_str(), e.content.as_str()))
+                    .collect::<Vec<_>>()
             );
         });
     }
