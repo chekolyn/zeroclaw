@@ -362,8 +362,9 @@ impl ConnectionPool {
         self.signal.notify_one();
     }
 
-    /// The pool's connection census (idle + checked out) — boot-degradation
-    /// and test observability.
+    /// The pool's connection census (idle + checked out) — test-only
+    /// observability (the pool tests).
+    #[cfg(test)]
     fn owned_connections(&self) -> usize {
         let state = self.state.lock();
         state.idle.len() + state.live
@@ -3472,7 +3473,9 @@ mod tests {
             .expect("the schema ownership must transfer to the limited role");
 
         // Teardown guard: the role owns the table until the schema
-        // cascades, so the cleanup drops the schema FIRST, then the role.
+        // cascades, so the cleanup drops the schema FIRST. The role's
+        // database-level CREATE grant lingers in pg_database.datacl and
+        // blocks DROP ROLE — DROP OWNED revokes it before the role drops.
         // Best-effort: a failed cleanup cannot poison later tests (the
         // limit is role-local) and the next run's DO block heals it. The
         // guard carries its OWN admin connection (the sync Client cannot
@@ -3484,7 +3487,9 @@ mod tests {
         impl Drop for RoleCleanup {
             fn drop(&mut self) {
                 let _ = self.admin.batch_execute(&format!(
-                    "DROP SCHEMA IF EXISTS {} CASCADE; DROP ROLE IF EXISTS zc_pool_degrade;",
+                    "DROP SCHEMA IF EXISTS {} CASCADE;
+                     DROP OWNED BY zc_pool_degrade CASCADE;
+                     DROP ROLE IF EXISTS zc_pool_degrade;",
                     self.schema_ident
                 ));
             }
