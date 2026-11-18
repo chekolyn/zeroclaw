@@ -6,6 +6,19 @@ pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
 /// Closing delimiter for recalled memory injected into provider context.
 pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
 
+/// The candidate-window floor for the postgres ranked recall: a ranked
+/// recall never candidates fewer than this many newest matching rows, so a
+/// tiny result-limit ask still ranks over a useful window.
+pub const RECALL_CANDIDATE_FLOOR: usize = 500;
+/// The candidate-window ceiling for the postgres ranked recall: the
+/// `MATERIALIZED` candidate stage caps at this many newest matching rows
+/// before ranking, making ranked cost O(ceiling) instead of O(all matches)
+/// (measured 6,093 ms at 10,805 unbounded candidates on the prod primary).
+/// Lives at the crate root — NOT inside the feature-gated `postgres`
+/// module — so the memory_recall tool can import it for its parse-site
+/// limit clamp under the ungated tools build.
+pub const POSTGRES_RECALL_CANDIDATE_CAP: usize = 2000;
+
 pub mod agent_scoped;
 pub mod agent_scoped_markdown;
 pub mod audit;
@@ -113,6 +126,7 @@ fn build_postgres_memory(
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
         Some(recall_soft_timeout_ms),
+        storage.pool_size,
     )?
     .with_category_namespaces(category_namespaces))
 }

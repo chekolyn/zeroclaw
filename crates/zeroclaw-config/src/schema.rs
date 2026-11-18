@@ -12875,6 +12875,11 @@ pub struct PostgresStorageConfig {
     /// backend's connection (server-side `statement_timeout`) and the
     /// client-side await of each memory operation. Unset = 30s.
     pub op_timeout_secs: Option<u64>,
+    /// Connection pool size: the number of PostgreSQL connections this
+    /// backend keeps for concurrent memory operations (each op checks one
+    /// out; a dead connection is discarded and reconnected transparently).
+    /// Unset = 4; clamped to 1..=16.
+    pub pool_size: Option<u64>,
     /// Enable pgvector extension for hybrid vector+keyword recall.
     pub vector_enabled: bool,
     /// Vector dimensions for pgvector embeddings.
@@ -12889,6 +12894,7 @@ impl Default for PostgresStorageConfig {
             table: default_storage_table(),
             connect_timeout_secs: None,
             op_timeout_secs: None,
+            pool_size: None,
             vector_enabled: false,
             vector_dimensions: default_pgvector_dimensions(),
         }
