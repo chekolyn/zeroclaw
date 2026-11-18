@@ -1352,6 +1352,34 @@ fn list_prefixed_sql(qualified_table: &str, qualified_agents: &str) -> String {
     )
 }
 
+/// The shared listing projection behind [`PostgresMemory::list`] and
+/// [`PostgresMemory::list_limited`]: the full row projection including
+/// `content` (the listing pane materializes previews from it), the agent
+/// alias join, the `$1`/`$2` category/session invariants, most-recent-first
+/// ordering. `bounded` appends `LIMIT $3` — the ONLY difference between
+/// the two shapes; `false` is the unbounded export-contract read and must
+/// carry no LIMIT at all.
+fn memories_list_sql(qualified_table: &str, qualified_agents: &str, bounded: bool) -> String {
+    let limit_clause = if bounded { " LIMIT $3" } else { "" };
+    format!(
+        "
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+        FROM {qualified_table} m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+        WHERE ($1::TEXT IS NULL OR m.category = $1)
+          AND ($2::TEXT IS NULL OR m.session_id = $2)
+        ORDER BY m.updated_at DESC{limit_clause}
+        "
+    )
+}
+
+/// The backend-side listing cap: the RPC/gateway layers clamp before
+/// calling, and this repeats the ceiling so a DIRECT caller of
+/// `list_limited` cannot push the read past the listing max.
+fn list_limited_cap(limit: usize) -> usize {
+    limit.min(zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT)
+}
+
 /// Escape a caller-supplied prefix for the LIKE predicate: `%` and `_` are
 /// LIKE wildcards and `\` is the LIKE escape character, so the tool's
 /// literal `starts_with` contract requires escaping all three before the
@@ -1622,20 +1650,49 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             pool.with(|client| {
-                let stmt = format!(
-                    "
-                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
-                    FROM {qualified_table} m
-                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                    WHERE ($1::TEXT IS NULL OR m.category = $1)
-                      AND ($2::TEXT IS NULL OR m.session_id = $2)
-                    ORDER BY m.updated_at DESC
-                    "
-                );
+                // UNBOUNDED by contract: the GDPR export rides this read; the
+                // bounded listing is `list_limited`. The shared projection with
+                // `bounded = false` carries no LIMIT clause at all.
+                let stmt = memories_list_sql(&qualified_table, &qualified_agents, false);
 
                 let category_ref = category.as_deref();
                 let session_ref = sid.as_deref();
                 let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
+        })
+        .await
+    }
+
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        // The backend repeats the RPC/gateway-layer clamp: a direct caller
+        // cannot push the listing read past the listing max.
+        let limit = list_limited_cap(limit);
+        let pool = self.pool.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let category = category.map(Self::category_to_str);
+        let sid = session_id.map(str::to_string);
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            pool.with(|client| {
+                // The bound is IN STORAGE: `LIMIT $3` rides the
+                // idx_memories_updated_at backward scan, so a large store never
+                // materializes the unbounded projection to truncate it.
+                let stmt = memories_list_sql(&qualified_table, &qualified_agents, true);
+
+                let category_ref = category.as_deref();
+                let session_ref = sid.as_deref();
+                let rows = client.query(&stmt, &[&category_ref, &session_ref, &limit_i64])?;
                 rows.iter()
                     .map(Self::row_to_entry)
                     .collect::<Result<Vec<MemoryEntry>>>()
@@ -2205,6 +2262,200 @@ mod tests {
         assert!(
             sql.contains("LEFT JOIN mem.agents"),
             "agent alias join kept"
+        );
+    }
+
+    // V3 LIST-BOUND: the listing surface gets a bounded read while the
+    // plain `list` read stays unbounded (the GDPR export contract rides it).
+
+    /// THE UNBOUNDED-EXPORT PIN — the regression guard this program exists
+    /// to protect: the plain `list` read carries NO LIMIT. The listing bound
+    /// (`list_limited`) must never leak into it, and the extraction of the
+    /// shared listing projection must not disturb the export path's shape.
+    #[test]
+    fn memory_list_trait_list_stays_unbounded() {
+        let sql = memories_list_sql("mem.memories", "mem.agents", false);
+        assert!(
+            !sql.contains("LIMIT"),
+            "Memory::list stays unbounded — the export contract rides it, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY m.updated_at DESC"),
+            "recency ordering rides the updated_at index"
+        );
+        assert!(
+            sql.contains("LEFT JOIN mem.agents"),
+            "agent alias join kept"
+        );
+        assert!(
+            sql.contains("($1::TEXT IS NULL OR m.category = $1)"),
+            "the category placeholder invariant matches list, got: {sql}"
+        );
+        assert!(
+            sql.contains("($2::TEXT IS NULL OR m.session_id = $2)"),
+            "the session placeholder invariant matches list, got: {sql}"
+        );
+    }
+
+    /// The listing read pushes the bound into storage: `LIMIT $3` binds the
+    /// clamped cap (the backend repeats the RPC-layer clamp so a direct
+    /// caller cannot exceed the listing max), every other shape identical
+    /// to `list`.
+    #[test]
+    fn list_limited_sql_pushes_the_limit_into_storage() {
+        assert_eq!(
+            list_limited_cap(50),
+            50,
+            "a limit within the max passes through"
+        );
+        assert_eq!(
+            list_limited_cap(100_000),
+            zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT,
+            "a direct caller cannot exceed the listing max"
+        );
+        let sql = memories_list_sql("mem.memories", "mem.agents", true);
+        assert!(
+            sql.contains("LIMIT $3"),
+            "the LIMIT binds the clamped cap as $3, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY m.updated_at DESC"),
+            "recency ordering rides the updated_at index"
+        );
+        assert!(
+            sql.contains("LEFT JOIN mem.agents"),
+            "agent alias join kept"
+        );
+        assert!(
+            sql.contains("($1::TEXT IS NULL OR m.category = $1)"),
+            "the category placeholder invariant matches list, got: {sql}"
+        );
+        assert!(
+            sql.contains("($2::TEXT IS NULL OR m.session_id = $2)"),
+            "the session placeholder invariant matches list, got: {sql}"
+        );
+    }
+
+    /// Live: the listing read respects the LIMIT in storage (newest-first)
+    /// and the plan serves it from `idx_memories_updated_at` (the backward
+    /// scan) — the same live-test shape as the prefix-bound pins.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_list_limited_respects_the_limit_and_serves_the_updated_at_index() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "listbound");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Constructs the table AND the recall indexes (boot DDL), including
+        // idx_memories_updated_at. Production shape: the pgvector column
+        // setup adds the namespace/importance columns the SELECT reads.
+        runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+        drop(runtime);
+
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        let qualified_agents = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("agents")
+        );
+        // 25 target rows staggered one second apart (g=1 is newest) plus
+        // 20K noise rows all older than every target: the newest-10 window
+        // is exactly the targets, and the planner cannot serve LIMIT 10
+        // from a seq scan cheaper than the updated_at index walk.
+        schema
+            .admin
+            .batch_execute(&format!(
+                "INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'tgt_' || g, 'listbound:' || g, 'target ' || g, 'daily',
+                        NOW() - make_interval(secs => g), NOW() - make_interval(secs => g),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 25) g;
+                 INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'noise_' || g, 'noise:' || g, repeat(md5(g::text), 16), 'daily',
+                        NOW() - make_interval(secs => 100000 + g), NOW() - make_interval(secs => 100000 + g),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 20000) g;
+                 ANALYZE {qualified_table};",
+            ))
+            .expect("seeding the listing-bound fixture must succeed");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let page = memory
+                .list_limited(None, None, 10)
+                .await
+                .expect("the bounded listing read");
+            assert_eq!(
+                page.len(),
+                10,
+                "the LIMIT must be respected in storage, not truncated client-side"
+            );
+            let keys: Vec<String> = page.iter().map(|e| e.key.clone()).collect();
+            let expected: Vec<String> = (1..=10).map(|g| format!("listbound:{g}")).collect();
+            assert_eq!(
+                keys, expected,
+                "newest-first: the newest `limit` rows in updated_at DESC order"
+            );
+        });
+        drop(runtime);
+
+        let sql = memories_list_sql(&qualified_table, &qualified_agents, true);
+        let explain = schema
+            .admin
+            .query(
+                &format!("EXPLAIN {sql}"),
+                &[&None::<String>, &None::<String>, &10i64],
+            )
+            .expect("EXPLAIN on the listing query must succeed");
+        let plan: String = explain
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_memories_updated_at"),
+            "the listing read must be served by the updated_at index, got plan:\n{plan}"
         );
     }
 

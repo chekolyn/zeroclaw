@@ -9552,6 +9552,11 @@ impl RpcDispatcher {
         let (mem, agent) = self
             .memory_for_request(Method::MemoryList, req.agent.as_deref(), plane.is_some())
             .await?;
+        // V3 LIST-BOUND: the listing surface is bounded. The shared plane's
+        // read pushes the resolved limit into storage (`list_limited`); the
+        // private-plane read keeps its own per-principal contract and is
+        // bounded by nothing here — disclosed in the manifest row.
+        let limit = req.resolved_limit();
         let entries = match plane {
             Some(scope) => mem
                 .list_for_principal(
@@ -9562,13 +9567,21 @@ impl RpcDispatcher {
                 .await
                 .map_err(|e| Self::map_private_memory_err(&e))?,
             None => mem
-                .list(category.as_ref(), req.session_id.as_deref())
+                .list_limited(category.as_ref(), req.session_id.as_deref(), limit)
                 .await
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?,
         };
+        // `count` is the RETURNED-entries count (not the store total — the
+        // semantic change is disclosed in the manifest row); a full page
+        // carries `has_more`.
+        let has_more = entries.len() == limit;
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
-        to_result(MemoryListResult { entries, count })
+        to_result(MemoryListResult {
+            entries,
+            count,
+            has_more,
+        })
     }
 
     async fn handle_memory_search(&self, params: &Value) -> RpcResult {
@@ -27530,6 +27543,77 @@ mod tests {
             .await
             .expect_err("an unconfigured agent is refused");
         assert_eq!(unknown.code, INVALID_PARAMS, "{}", unknown.message);
+    }
+
+    /// The listing result's `count` is the RETURNED-entries count — bounded
+    /// by the resolved listing limit — not the store total, and a full page
+    /// carries `has_more`. The semantic change from the unbounded listing is
+    /// disclosed in the manifest row (V3 LIST-BOUND).
+    #[tokio::test]
+    async fn memory_list_result_count_is_returned_entries_and_has_more() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _sessions, _memory) = memory_isolation_ctx(&tmp);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+
+        for i in 0..7 {
+            operator
+                .handle_memory_store(&json!({
+                    "key": format!("bound:list:{i}"),
+                    "content": format!("entry {i}"),
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("seed store {i}: {}", e.message));
+        }
+
+        // A full page: count is what came back, `has_more` marks the cut.
+        let page = operator
+            .handle_memory_list(&json!({"limit": 5, "plane": "shared"}))
+            .await
+            .expect("a bounded page lists");
+        assert_eq!(page["count"], 5, "count is the RETURNED-entries count");
+        assert_eq!(page["has_more"], true, "a full page marks has_more");
+        assert_eq!(
+            page["entries"].as_array().expect("entries array").len(),
+            5,
+            "the page carries exactly the bounded rows"
+        );
+
+        // Under the default limit the whole store fits: has_more is false.
+        let all = operator
+            .handle_memory_list(&json!({"plane": "shared"}))
+            .await
+            .expect("the default page lists");
+        assert_eq!(all["count"], 7, "the whole store fits the default limit");
+        assert_eq!(all["has_more"], false, "a short page has no more");
+        assert_eq!(all["entries"].as_array().expect("entries array").len(), 7);
+    }
+
+    /// The listing limit parses from the wire and resolves to the bounded
+    /// read's value: absent → the 200-entry listing default; an explicit
+    /// value passes through; above the listing max it clamps to the max.
+    #[tokio::test]
+    async fn memory_list_params_limit_parses_and_clamps() {
+        let absent: MemoryListParams =
+            serde_json::from_value(json!({})).expect("params without limit parse");
+        assert_eq!(
+            absent.resolved_limit(),
+            zeroclaw_api::memory_traits::MEMORY_LIST_DEFAULT_LIMIT,
+            "no limit means the listing default"
+        );
+
+        let explicit: MemoryListParams =
+            serde_json::from_value(json!({"limit": 50})).expect("explicit limit parses");
+        assert_eq!(explicit.resolved_limit(), 50, "a sane limit passes through");
+
+        let huge: MemoryListParams =
+            serde_json::from_value(json!({"limit": 100_000})).expect("huge limit parses");
+        assert_eq!(
+            huge.resolved_limit(),
+            zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT,
+            "a caller cannot push the listing past the max"
+        );
     }
 
     #[test]

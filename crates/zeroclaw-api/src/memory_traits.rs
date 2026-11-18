@@ -321,6 +321,19 @@ pub enum MemoryPolicyDecision {
     Deny { reason: String },
 }
 
+/// The default row bound for the bounded listing surfaces
+/// ([`Memory::list_limited`], the `memory/list` RPC, the gateway
+/// `GET /api/memory`): the newest 200 rows, most-recent first. The bound
+/// exists because the unbounded listing measured 15.76s on the prod
+/// leader's store under the operator TUI's no-category poll (the 06:09Z
+/// cron-wave cascade cancelled it at the 30s op_timeout).
+pub const MEMORY_LIST_DEFAULT_LIMIT: usize = 200;
+
+/// The ceiling any caller may push the bounded listing to. The listing is
+/// a preview-pane read; bulk enumeration is the export path's contract
+/// ([`Memory::list`], unbounded by design).
+pub const MEMORY_LIST_MAX_LIMIT: usize = 2000;
+
 /// Core memory trait — implement for any persistence backend
 ///
 /// Some wrappers forward every method to another `Memory`, such as the
@@ -430,6 +443,34 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
             .filter(|e| e.key.starts_with(prefix))
             .take(limit)
             .collect())
+    }
+
+    /// List the newest `limit` entries, optionally filtered by category
+    /// and/or session — the BOUNDED listing surface (the `memory/list` RPC
+    /// and the gateway `GET /api/memory` ride it).
+    ///
+    /// Unlike [`Memory::list`] — the unbounded full-store listing the
+    /// GDPR export contract rides by design — this method exists so a
+    /// listing pane cannot hold the whole store hostage: measured 15.76s
+    /// for a no-category read on the prod leader's store (the operator
+    /// TUI's 5s serial poll), with the 06:09Z cron-wave cascade cancelling
+    /// it at the 30s op_timeout. Implementations push the bound down to
+    /// the store so the call is fast AND bounded on large stores.
+    ///
+    /// Default: compose [`Memory::list`] with a truncation (correct for
+    /// the small sqlite backend) — the RESULT is bounded by `limit` but
+    /// the SCAN is the backend's full list. Backends with a
+    /// recency-servable index (postgres `idx_memories_updated_at`)
+    /// override this with a native bounded query.
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let mut entries = self.list(category, session_id).await?;
+        entries.truncate(limit);
+        Ok(entries)
     }
 
     /// Remove a memory by key. Deletes every row matching `key`, regardless

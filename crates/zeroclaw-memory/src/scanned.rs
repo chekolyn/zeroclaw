@@ -531,6 +531,20 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.filter_recalled(entries)
     }
 
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the bound must reach the
+        // backend's SQL (a compose here would ride the unbounded `list`
+        // and truncate client-side, leaving the scan cost unbounded). The
+        // read-wall scan still sees every row the caller gets back.
+        let entries = self.inner.list_limited(category, session_id, limit).await?;
+        self.filter_recalled(entries)
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.inner.forget(key).await
     }
@@ -1244,5 +1258,148 @@ mod tests {
         assert_eq!(limits.lock().unwrap().as_slice(), &[READ_REFILL_MULTIPLIER]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].key, "safe");
+    }
+
+    /// A backend whose limited read is native: `list_limited` records the
+    /// limit and returns rows, while the unbounded `list` must never be
+    /// reached on the listing path.
+    struct LimitedProbe {
+        entries: Vec<MemoryEntry>,
+        limits: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for LimitedProbe {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "limited-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for LimitedProbe {
+        fn name(&self) -> &str {
+            "limited-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            panic!("the limited listing must not ride the unbounded list")
+        }
+
+        async fn list_limited(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.limits.lock().unwrap().push(limit);
+            Ok(self.entries.iter().take(limit).cloned().collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The limited listing must FORWARD to the backend's `list_limited` —
+    /// the SQL-side bound survives the wrapper — and the read-wall scan
+    /// must still see every row the caller gets back.
+    #[tokio::test]
+    async fn list_limited_scans_the_limited_read() {
+        let limits = Arc::new(Mutex::new(Vec::new()));
+        let inner = LimitedProbe {
+            entries: vec![test_entry("probe:1", "one"), test_entry("probe:2", "two")],
+            limits: limits.clone(),
+        };
+        // An off policy keeps the scan a passthrough; the pin is the ROUTING
+        // (the unbounded list is never reached, the limit is carried), and
+        // the scan-withholding itself is pinned by the recall tests above.
+        let mem = ScannedMemory::new(inner, &policy("off", "block-on-read"));
+
+        let page = mem
+            .list_limited(None, None, 7)
+            .await
+            .expect("the limited read");
+
+        assert_eq!(
+            limits.lock().unwrap().as_slice(),
+            &[7],
+            "the limit must reach the backend's list_limited"
+        );
+        assert_eq!(
+            page.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["probe:1", "probe:2"],
+            "the scanned limited read returns the backend's page"
+        );
     }
 }

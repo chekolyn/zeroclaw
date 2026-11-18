@@ -516,6 +516,12 @@ rpc_type! {
         /// with the admin bypass, audited).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plane: Option<String>,
+        /// The bounded listing's row ceiling: the newest `limit` rows,
+        /// most-recent first. Absent means the listing default; the server
+        /// clamps any value above the listing max. The bulk-read contract
+        /// is the export path, not this listing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit: Option<u64>,
     }
 }
 
@@ -523,7 +529,33 @@ rpc_type! {
     pub struct MemoryListResult {
         #[cfg_attr(feature = "schema-export", schemars(with = "Vec<serde_json::Value>"))]
         pub entries: Vec<MemoryEntry>,
+        /// The number of entries RETURNED in this response — the bounded
+        /// listing's page size, not the store total (the semantic change
+        /// from the unbounded listing is disclosed in the manifest row,
+        /// V3 LIST-BOUND). A client that needs the store total asks the
+        /// export path.
         pub count: usize,
+        /// `true` when the returned page is full (`entries.len()` reached
+        /// the resolved limit), so more entries may exist beyond it. The
+        /// private-plane listing carries the same boundary heuristic.
+        #[serde(default)]
+        pub has_more: bool,
+    }
+}
+
+impl MemoryListParams {
+    /// The listing limit this request resolves to: `limit` clamped to
+    /// [`zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT`], or
+    /// [`zeroclaw_api::memory_traits::MEMORY_LIST_DEFAULT_LIMIT`] when
+    /// absent. Both the RPC handler and the gateway route call this, so
+    /// every listing surface shares one default and one ceiling.
+    pub fn resolved_limit(&self) -> usize {
+        let requested = self
+            .limit
+            .unwrap_or(zeroclaw_api::memory_traits::MEMORY_LIST_DEFAULT_LIMIT as u64);
+        usize::try_from(requested)
+            .unwrap_or(usize::MAX)
+            .min(zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT)
     }
 }
 
