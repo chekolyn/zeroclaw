@@ -20169,6 +20169,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -20195,6 +20196,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 max_turn_prompt_tokens: None,
                 context_limits_resolver: None,

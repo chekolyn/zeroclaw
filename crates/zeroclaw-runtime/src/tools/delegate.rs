@@ -9706,6 +9706,8 @@ mod tests {
                 &[kind],
                 Arc::clone(&middle_memory),
                 Arc::clone(&middle_policy),
+                RecallExcludes::default(),
+                0,
             );
             assert!(
                 first
@@ -9727,6 +9729,8 @@ mod tests {
             &[kind],
             Arc::clone(&target_memory),
             Arc::clone(&target_policy),
+            RecallExcludes::default(),
+            0,
         );
         let tool = &actual[&kind];
         assert!(owner.parent_tools.origins.prove(tool).is_some());
@@ -9883,6 +9887,8 @@ mod tests {
                 &[Store, Forget, Purge],
                 Arc::clone(&memory),
                 Arc::clone(&target_policy),
+                RecallExcludes::default(),
+                0,
             );
             let before = used(&root_policy);
             assert_eq!(before, 0);
@@ -10060,6 +10066,8 @@ mod tests {
                 &selected,
                 Arc::clone(&memory),
                 Arc::clone(&security),
+                RecallExcludes::default(),
+                0,
             );
             let mut unique = Vec::new();
             for kind in selected {
@@ -13745,9 +13753,16 @@ mod tests {
             ..Default::default()
         };
         let security = Arc::new(SecurityPolicy::default());
-        let tools = DelegateTool::memory_tools_for_target(memory, security, excludes, 0);
+        let delegate = DelegateTool::new(HashMap::new(), None, Arc::clone(&security));
+        let (tools, _) = delegate.memory_tools_for_target(
+            &[crate::tools::NativeMemoryKind::Recall],
+            memory,
+            security,
+            excludes,
+            0,
+        );
         let recall = tools
-            .iter()
+            .values()
             .find(|t| t.name() == "memory_recall")
             .expect("memory_recall tool present in target memory tools");
         let result = recall.execute(json!({})).await.unwrap();
