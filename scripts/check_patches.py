@@ -118,6 +118,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"\* 2\.0\n",
         "min_count": 1,
     },
+    "recall-candidate-cap": {
+        "glob": "crates/zeroclaw-memory/src/postgres.rs",
+        "pattern": r"RECALL_CANDIDATE_FLOOR",
+        "min_count": 2,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
