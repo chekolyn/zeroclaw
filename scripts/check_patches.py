@@ -123,6 +123,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"RECALL_CANDIDATE_FLOOR",
         "min_count": 2,
     },
+    "memory-pg-pool": {
+        "glob": "crates/zeroclaw-memory/src/postgres.rs",
+        "pattern": r"ConnectionPool",
+        "min_count": 10,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
