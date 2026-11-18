@@ -4,9 +4,10 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
-use postgres::{Client, NoTls, Row};
+use parking_lot::{Condvar, Mutex};
+use postgres::{Client, Error, NoTls, Row};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -16,11 +17,67 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// Default connect timeout (seconds) when the config sets no
+/// `connect_timeout_secs`. The deployed `[storage.postgres]` sets NEITHER
+/// `connect_timeout_secs` NOR `op_timeout_secs`, so the shared connect home
+/// carries its own bound instead of hanging a reconnect on a half-open TCP
+/// connect.
+const POSTGRES_CONNECT_TIMEOUT_DEFAULT_SECS: u64 = 5;
+
 /// Default per-operation timeout (seconds) bounding each memory query.
 const DEFAULT_OP_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum allowed per-operation timeout (seconds).
 const POSTGRES_OP_TIMEOUT_CAP_SECS: u64 = 300;
+
+/// Default pool size when `[storage.postgres] pool_size` is unset: four
+/// connections serve concurrent memory operations without pinning the
+/// server's connection slots. Unset means the default fires with NO debops
+/// config change.
+const POSTGRES_POOL_DEFAULT: u64 = 4;
+
+/// Hard ceiling for the pool size: every zeroclaw backend shares the
+/// primary's connection budget, so one backend never holds more than 16.
+const POSTGRES_POOL_CAP: u64 = 16;
+
+/// Resolve the configured pool size: `None` takes the default (4), 0 clamps
+/// UP to 1 (a zero-sized pool would deadlock every operation), and values
+/// above [`POSTGRES_POOL_CAP`] clamp down to the cap.
+fn resolve_pool_size(pool_size: Option<u64>) -> usize {
+    match pool_size {
+        None => POSTGRES_POOL_DEFAULT as usize,
+        Some(size) => size.clamp(1, POSTGRES_POOL_CAP) as usize,
+    }
+}
+
+/// Drop `value` on a freshly spawned plain OS thread.
+///
+/// `postgres::Client::drop` calls `Runtime::block_on` internally, which
+/// panics on a Tokio runtime thread — every Client drop in this module MUST
+/// ride this helper. The one home for that law (extracted from
+/// `DropOnThread`'s Drop body so mid-flight pool discards ride it too).
+fn drop_on_thread<T: Send + 'static>(value: T) {
+    // Wrap in ManuallyDrop so the value is NOT dropped on the current
+    // thread if spawn fails — ManuallyDrop's own Drop is a no-op.
+    let slot = std::mem::ManuallyDrop::new(value);
+    if std::thread::Builder::new()
+        .name("postgres-client-drop".to_string())
+        .spawn(move || drop(std::mem::ManuallyDrop::into_inner(slot)))
+        .is_err()
+    {
+        // The OS refused to spawn a thread. Intentionally leak the value
+        // rather than drop it here: postgres::Client::drop calls
+        // Runtime::block_on, which panics on a Tokio runtime thread.
+        // A controlled leak is preferable to an unrecoverable panic.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "postgres-client-drop thread spawn failed; leaking client to avoid nested-runtime panic"
+        );
+        // `slot` is ManuallyDrop — T is intentionally not dropped.
+    }
+}
 
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
@@ -36,26 +93,7 @@ impl<T: Send + 'static> DropOnThread<T> {
 impl<T: Send + 'static> Drop for DropOnThread<T> {
     fn drop(&mut self) {
         let Some(value) = self.0.take() else { return };
-        // Wrap in ManuallyDrop so the value is NOT dropped on the current
-        // thread if spawn fails — ManuallyDrop's own Drop is a no-op.
-        let slot = std::mem::ManuallyDrop::new(value);
-        if std::thread::Builder::new()
-            .name("postgres-client-drop".to_string())
-            .spawn(move || drop(std::mem::ManuallyDrop::into_inner(slot)))
-            .is_err()
-        {
-            // The OS refused to spawn a thread. Intentionally leak the value
-            // rather than drop it here: postgres::Client::drop calls
-            // Runtime::block_on, which panics on a Tokio runtime thread.
-            // A controlled leak is preferable to an unrecoverable panic.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "postgres-client-drop thread spawn failed; leaking client to avoid nested-runtime panic"
-            );
-            // `slot` is ManuallyDrop — T is intentionally not dropped.
-        }
+        drop_on_thread(value);
     }
 }
 
@@ -72,9 +110,432 @@ impl DdlExecutor for Client {
     }
 }
 
+/// The pool's guarded state: parked connections and the count of
+/// connections currently checked out. ONE mutex guards both; the condvar
+/// pairs with it.
+struct PoolState {
+    idle: Vec<Client>,
+    live: usize,
+}
+
+/// The failure classes of a pooled operation, decided by
+/// [`classify_failure`].
+enum FailureClass {
+    /// The server answered a complete error response — the protocol is
+    /// intact and the connection healthy. Release + propagate. NO retry: a
+    /// statement-timeout cancel (the recall soft budget) must surface fast
+    /// to the recall-budget fallback, and SQL errors are not transient.
+    Sql,
+    /// The connection is dead or untrustworthy: discard it, attempt ONE
+    /// reconnect, retry the operation ONCE on the fresh connection.
+    ConnectionLoss,
+    /// Everything else — protocol desync without a closed marker
+    /// (tokio-postgres 0.7.18's `Kind::UnexpectedMessage` has no public
+    /// discriminator), client-side conversion errors, application errors.
+    /// Discard + surface: post-desync state is untrustworthy, and an
+    /// operation that failed mid-flight may leave the connection carrying
+    /// state (e.g. an uncommitted transaction) that the next operation must
+    /// not inherit.
+    Unclassified,
+}
+
+/// Find the `postgres::Error` in an operation's failure chain: `?`-converted
+/// errors downcast directly; `.context()`-wrapped ones surface in the chain
+/// walk (anyhow's `chain()` starts with the error itself).
+fn failure_pg_error(err: &anyhow::Error) -> Option<&Error> {
+    err.chain().find_map(|cause| cause.downcast_ref::<Error>())
+}
+
+/// Classify an operation failure against the connection it ran on.
+fn classify_failure(err: &anyhow::Error, client: &Client) -> FailureClass {
+    let Some(pg) = failure_pg_error(err) else {
+        return FailureClass::Unclassified;
+    };
+    // CONNECTION-LOSS FIRST: a FATAL server error (e.g. SQLSTATE 57P01,
+    // `pg_terminate_backend` / a patroni shutdown) arrives as a perfectly
+    // well-formed DbError, but the session behind it is DEAD — the server
+    // sends the ErrorResponse and closes the socket. The closed-state
+    // primary below catches exactly that (the connection task's terminal
+    // poll closes the channel before the error reaches the caller). A
+    // healthy ERROR-severity DbError (statement_timeout cancel, constraint
+    // violation) leaves the client open and falls through to the SQL class.
+    if is_connection_loss(pg, client) {
+        return FailureClass::ConnectionLoss;
+    }
+    if pg.as_db_error().is_some() {
+        return FailureClass::Sql;
+    }
+    FailureClass::Unclassified
+}
+
+/// The PRIMARY connection-loss signal: the closed disjunction.
+/// `Error::is_closed()` is true for the synthetic `Error::closed()` a server
+/// EOF surfaces (patroni restart, `pg_terminate_backend` — tokio-postgres
+/// connection.rs:104); `Client::is_closed()` is set on ANY connection-task
+/// death (the connection task closes its request channel on its terminal
+/// poll, before the error reaches the caller).
+fn connection_loss_disjunction(err_is_closed: bool, client_is_closed: bool) -> bool {
+    err_is_closed || client_is_closed
+}
+
+/// Is the underlying connection dead (or untrustworthy) enough to warrant
+/// discard + reconnect + one retry?
+///
+/// PRIMARY: the closed disjunction ([`connection_loss_disjunction`]).
+/// BELT: the trait `Error::source()` io-downcast — an `Error::io()` carries
+/// the underlying `io::Error` as its cause, and a read/write failure means
+/// the socket state is unknown. `into_source()` is NOT used — it consumes
+/// the error. The tokio-postgres `Kind` enum is PRIVATE in 0.7.18 (no
+/// public `kind()`): NOTHING may depend on it; the unclassifiable middle is
+/// handled by exclusion ([`FailureClass::Unclassified`]).
+fn is_connection_loss(e: &Error, client: &Client) -> bool {
+    connection_loss_disjunction(e.is_closed(), client.is_closed())
+        || std::error::Error::source(e)
+            .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some())
+}
+
+/// A bounded pool of PostgreSQL clients for ONE memory backend.
+///
+/// Replaces the single `Mutex<Client>`: a dead connection (server restart,
+/// `pg_terminate_backend`, network loss) is DISCARDED and reconnected on the
+/// next failed operation instead of poisoning every later operation — the
+/// 2026-11-17/18 fleet-death class (tokio-postgres has no auto-reconnect;
+/// every webhook turn failed instantly until a manual pod roll).
+///
+/// Behind an [`Arc`], wrapped in the existing `DropOnThread` (the pool's
+/// idle `Client`s drop on a plain OS thread via [`drop_on_thread`]).
+struct ConnectionPool {
+    state: Mutex<PoolState>,
+    /// Wakes acquire-waiters on a release or a discard (a freed slot).
+    signal: Condvar,
+    /// The ceiling on owned connections (idle + checked out). The RESOLVED
+    /// pool size — a boot that degraded below it keeps the ceiling so the
+    /// pool can expand at runtime when connects succeed again.
+    max: usize,
+    db_url: String,
+    connect_timeout_secs: Option<u64>,
+    op_timeout: Duration,
+}
+
+impl ConnectionPool {
+    fn new(
+        primary: Client,
+        extras: Vec<Client>,
+        max: usize,
+        db_url: String,
+        connect_timeout_secs: Option<u64>,
+        op_timeout: Duration,
+    ) -> Self {
+        let mut idle = Vec::with_capacity(1 + extras.len());
+        idle.push(primary);
+        idle.extend(extras);
+        Self {
+            state: Mutex::new(PoolState { idle, live: 0 }),
+            signal: Condvar::new(),
+            max,
+            db_url,
+            connect_timeout_secs,
+            op_timeout,
+        }
+    }
+
+    /// The shared connect-input home (boot + reconnect): parse the URL,
+    /// bound the connect timeout (the config value or the ~5s default,
+    /// always capped), and set the TCP keepalives — idle 15s, retries 3,
+    /// and INTERVAL 15s. The interval was unset before (OS default ~75s
+    /// probes): the end-to-end dead-connection detection window was ~240s;
+    /// the explicit interval bounds it near ~60s.
+    fn connect_config(db_url: &str, connect_timeout_secs: Option<u64>) -> Result<postgres::Config> {
+        let mut config: postgres::Config = db_url
+            .parse()
+            .context("invalid PostgreSQL connection URL")?;
+        let bounded = connect_timeout_secs
+            .unwrap_or(POSTGRES_CONNECT_TIMEOUT_DEFAULT_SECS)
+            .min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
+        config.connect_timeout(Duration::from_secs(bounded));
+        config.keepalives(true);
+        config.keepalives_idle(Duration::from_secs(15));
+        config.keepalives_retries(3);
+        config.keepalives_interval(Duration::from_secs(15));
+        Ok(config)
+    }
+
+    /// The reconnect factory (and the boot's extra connects): ONE fresh
+    /// connection carrying the bounded session. NO boot DDL, NO pgvector
+    /// setup — a wiped-DB scenario surfaces an honest SQL error and the
+    /// next boot rebuilds the schema.
+    fn connect_one(
+        db_url: &str,
+        connect_timeout_secs: Option<u64>,
+        op_timeout: Duration,
+    ) -> Result<Client> {
+        let mut client = Self::connect_config(db_url, connect_timeout_secs)?
+            .connect(NoTls)
+            .context("failed to connect to PostgreSQL memory backend")?;
+        client
+            .batch_execute(&PostgresMemory::bounded_session_sql(op_timeout))
+            .context("failed to apply PostgreSQL session timeouts")?;
+        Ok(client)
+    }
+
+    /// Check a connection out: pop the idle set; if empty and the pool can
+    /// still grow, connect one now; otherwise wait on the condvar for a
+    /// release or a discard. The slot is RESERVED before the lock is
+    /// dropped for the connect, so concurrent expansions cannot exceed
+    /// `max`; a failed expansion connect frees the reservation and falls
+    /// back to waiting (a degraded pool keeps SERVING instead of failing
+    /// the overflow outright).
+    fn acquire(self: Arc<Self>) -> Result<PooledConn> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(client) = state.idle.pop() {
+                state.live += 1;
+                // Drop the state lock BEFORE moving the pool Arc into the
+                // guard: the client is already out of the idle set and its
+                // slot accounted, so the unlocked window is race-free.
+                drop(state);
+                return Ok(PooledConn {
+                    client: Some(client),
+                    pool: self,
+                });
+            }
+            if state.live < self.max {
+                // Reserve the slot BEFORE releasing the lock for the
+                // connect: concurrent expansions stay inside `max`, and a
+                // ~5s connect never blocks a release behind the state lock.
+                state.live += 1;
+                drop(state);
+                match Self::connect_one(&self.db_url, self.connect_timeout_secs, self.op_timeout) {
+                    Ok(client) => {
+                        return Ok(PooledConn {
+                            client: Some(client),
+                            pool: self,
+                        });
+                    }
+                    Err(err) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "max": self.max,
+                                "error": err.to_string(),
+                            })),
+                            "PostgreSQL pool expansion connect failed; waiting for a released \
+                             connection instead of failing the operation"
+                        );
+                        {
+                            let mut reservation = self.state.lock();
+                            reservation.live -= 1;
+                        }
+                        self.signal.notify_one();
+                        state = self.state.lock();
+                    }
+                }
+            }
+            // No idle connection and no expansion slot: park until a release
+            // or a discard frees one (each notifies).
+            self.signal.wait(&mut state);
+        }
+    }
+
+    /// Return a healthy connection to the idle set.
+    fn release_conn(&self, client: Client) {
+        let mut state = self.state.lock();
+        state.live -= 1;
+        state.idle.push(client);
+        drop(state);
+        self.signal.notify_one();
+    }
+
+    /// Discard a dead (or untrusted) connection: the client drops on a
+    /// plain OS thread ([`drop_on_thread`] — the drop calls
+    /// `Runtime::block_on` internally), and the freed slot wakes waiters.
+    fn discard_conn(&self, client: Client) {
+        drop_on_thread(client);
+        let mut state = self.state.lock();
+        state.live -= 1;
+        drop(state);
+        self.signal.notify_one();
+    }
+
+    /// The pool's connection census (idle + checked out) — boot-degradation
+    /// and test observability.
+    fn owned_connections(&self) -> usize {
+        let state = self.state.lock();
+        state.idle.len() + state.live
+    }
+
+    /// THE one pooled-operation seam: check a connection out, run `op`,
+    /// classify the outcome.
+    ///
+    /// - `Ok` → the connection returns to the idle set.
+    /// - Connection loss ([`is_connection_loss`]) → the dead connection is
+    ///   DISCARDED (the drop rides [`drop_on_thread`]), ONE reconnect is
+    ///   attempted (bounded by the ~5s default connect timeout), and the
+    ///   operation runs ONCE on the fresh connection; any further failure
+    ///   surfaces. Disclosed duplicate-effect edge: a retried write may
+    ///   re-execute (the upsert path is idempotent by key; an ambiguous
+    ///   retry's `created_at` shift is benign — `updated_at` is the
+    ///   ordering key).
+    /// - SQL-class ([`FailureClass::Sql`]) → release + propagate, no retry.
+    /// - Anything else ([`FailureClass::Unclassified`]) → the connection is
+    ///   DISCARDED and the error surfaces: post-desync state is
+    ///   untrustworthy, and a failed operation may have left uncommitted
+    ///   transaction state the next operation must not inherit.
+    /// - A panic unwinds through the [`PooledConn`] Drop, which discards.
+    ///
+    /// Disclosed aggregate: `run_on_os_thread` DETACHES the operation
+    /// thread, so N concurrent timed-out operations park up to
+    /// min(N, max) pool slots until the server-side statement timeout (or
+    /// the TCP keepalive) kills the query. The bounded condvar wait on
+    /// acquire is the hardening if evidence demands it.
+    fn with<T>(self: Arc<Self>, op: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
+        let mut guard = self.clone().acquire()?;
+        match op(&mut guard) {
+            Ok(value) => {
+                guard.release();
+                Ok(value)
+            }
+            Err(err) => {
+                let class = classify_failure(&err, &guard);
+                match class {
+                    FailureClass::Sql => {
+                        guard.release();
+                        Err(err)
+                    }
+                    FailureClass::Unclassified => {
+                        guard.discard();
+                        Err(err)
+                    }
+                    FailureClass::ConnectionLoss => {
+                        guard.discard();
+                        match Self::connect_one(
+                            &self.db_url,
+                            self.connect_timeout_secs,
+                            self.op_timeout,
+                        ) {
+                            Ok(client) => {
+                                {
+                                    let mut state = self.state.lock();
+                                    state.live += 1;
+                                }
+                                let mut fresh = PooledConn {
+                                    client: Some(client),
+                                    pool: self,
+                                };
+                                match op(&mut fresh) {
+                                    Ok(value) => {
+                                        fresh.release();
+                                        Ok(value)
+                                    }
+                                    Err(retry_err) => {
+                                        let retry_class = classify_failure(&retry_err, &fresh);
+                                        match retry_class {
+                                            FailureClass::Sql => fresh.release(),
+                                            _ => fresh.discard(),
+                                        }
+                                        Err(retry_err)
+                                    }
+                                }
+                            }
+                            Err(connect_err) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "original": err.to_string(),
+                                        })
+                                    ),
+                                    "PostgreSQL pool reconnect after connection loss failed; \
+                                     the next operation will retry the reconnect"
+                                );
+                                Err(connect_err.context(
+                                    "postgres memory pool reconnect after connection loss failed",
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        // The pool outlives its operations (every op thread holds a pool
+        // Arc), so `&mut self` here implies no connection is checked out.
+        // The idle clients drop on a plain OS thread — never on a Tokio
+        // runtime thread.
+        let state = self.state.get_mut();
+        let idle = std::mem::take(&mut state.idle);
+        if !idle.is_empty() {
+            drop_on_thread(idle);
+        }
+    }
+}
+
+/// RAII guard for one checked-out pool connection.
+///
+/// Drop = DISCARD (never an idle return): a guard that reaches Drop outside
+/// the explicit release path sits on a failure or unwind path where the
+/// connection's state is untrusted — returning it to idle would launder the
+/// poison into the next operation.
+struct PooledConn {
+    client: Option<Client>,
+    pool: Arc<ConnectionPool>,
+}
+
+impl PooledConn {
+    /// Release a healthy connection back to the idle set.
+    fn release(mut self) {
+        if let Some(client) = self.client.take() {
+            self.pool.release_conn(client);
+        }
+    }
+
+    /// Discard the connection (dead or untrusted): rides the pool's
+    /// discard path.
+    fn discard(self) {
+        // `client` stays Some — the Drop impl runs the discard.
+        drop(self);
+    }
+}
+
+impl Drop for PooledConn {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.pool.discard_conn(client);
+        }
+    }
+}
+
+impl Deref for PooledConn {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("PooledConn already released")
+    }
+}
+
+impl DerefMut for PooledConn {
+    fn deref_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("PooledConn already released")
+    }
+}
+
 pub struct PostgresMemory {
     alias: String,
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    pool: DropOnThread<Arc<ConnectionPool>>,
     qualified_table: String,
     qualified_agents: String,
     /// Category → namespace map applied at write time (`memory.category_namespaces`).
@@ -86,7 +547,7 @@ pub struct PostgresMemory {
     /// Soft wall-clock budget for the RANKED recall attempts. When set (and
     /// below `op_timeout`), each ranked recall runs with a per-attempt
     /// server-side `statement_timeout` so an over-budget attempt is cancelled
-    /// by the server, freeing the shared connection for the recall budget's
+    /// by the server, freeing the pooled connection for the recall budget's
     /// recent-entries fallback instead of holding it until `op_timeout`.
     /// The empty-query recall path is exempt: it is the indexed recent
     /// fallback itself.
@@ -104,6 +565,7 @@ impl PostgresMemory {
         pgvector_enabled: Option<bool>,
         pgvector_dimensions: Option<usize>,
         recall_soft_timeout_ms: Option<u64>,
+        pool_size: Option<u64>,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -131,13 +593,14 @@ impl PostgresMemory {
             .map(Duration::from_millis)
             .filter(|soft| *soft < op_timeout);
 
-        let (client, pgvector_ok) = Self::initialize_client(
+        let (pool, pgvector_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             op_timeout,
             schema_ident.clone(),
             qualified_table.clone(),
             pgvector,
+            resolve_pool_size(pool_size),
         )?;
 
         if !pgvector_ok {
@@ -151,7 +614,7 @@ impl PostgresMemory {
 
         Ok(Self {
             alias: alias.to_string(),
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            pool: DropOnThread::new(pool),
             qualified_table,
             qualified_agents,
             category_namespaces: HashMap::new(),
@@ -178,24 +641,14 @@ impl PostgresMemory {
         schema_ident: String,
         qualified_table: String,
         pgvector: Option<usize>,
-    ) -> Result<(Client, bool)> {
+        pool_size: usize,
+    ) -> Result<(Arc<ConnectionPool>, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<(Client, bool)> {
-                let mut config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL")?;
-
-                if let Some(timeout_secs) = connect_timeout_secs {
-                    let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
-                    config.connect_timeout(Duration::from_secs(bounded));
-                }
-
-                config.keepalives(true);
-                config.keepalives_idle(Duration::from_secs(15));
-                config.keepalives_retries(3);
-
-                let mut client = config
+            .spawn(move || -> Result<(Arc<ConnectionPool>, bool)> {
+                // Connection #1: the shared connect home + the FULL boot
+                // migration path (schema DDL, V3 migration, pgvector).
+                let mut client = ConnectionPool::connect_config(&db_url, connect_timeout_secs)?
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
@@ -238,7 +691,46 @@ impl PostgresMemory {
                     .batch_execute(&Self::bounded_session_sql(op_timeout))
                     .context("failed to apply PostgreSQL session timeouts")?;
 
-                Ok((client, pgvector_ok))
+                // The remaining pool_size - 1 connections connect
+                // SEQUENTIALLY in this SAME init thread — boot stays
+                // single-threaded (the v0.9.0 startup-deadlock surface is
+                // not widened). A failed extra connection is a LOUD WARN and
+                // CONTINUES: a degraded pool still serves operations, and
+                // the pool keeps its ceiling so it can expand at runtime
+                // when connects succeed again.
+                let mut extras = Vec::new();
+                for slot in 1..pool_size {
+                    match ConnectionPool::connect_one(&db_url, connect_timeout_secs, op_timeout) {
+                        Ok(client) => extras.push(client),
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "slot": slot,
+                                    "pool_size": pool_size,
+                                    "error": err.to_string(),
+                                })),
+                                "PostgreSQL pool connect failed at boot; continuing with a \
+                                 smaller pool — the degraded pool still serves operations"
+                            );
+                        }
+                    }
+                }
+
+                let pool = ConnectionPool::new(
+                    client,
+                    extras,
+                    pool_size,
+                    db_url,
+                    connect_timeout_secs,
+                    op_timeout,
+                );
+                Ok((Arc::new(pool), pgvector_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
@@ -799,9 +1291,11 @@ fn escape_like_prefix(prefix: &str) -> String {
 
 /// Bound ONE ranked recall attempt: sets `statement_timeout` to the soft
 /// recall budget, runs `run`, then restores the session default
-/// (`op_timeout`). The whole SET → query → restore sequence runs inside the
-/// shared client's mutex critical section, so it cannot interleave with
-/// another operation. Best-effort restore: a failed restore only leaves the
+/// (`op_timeout`). The whole SET → query → restore sequence runs inside ONE
+/// EXCLUSIVE per-connection checkout — the pooled connection is held for
+/// the entire sequence, so it cannot interleave with another operation (a
+/// strictly stronger isolation than the former shared-mutex critical
+/// section). Best-effort restore: a failed restore only leaves the
 /// tighter bound in place for subsequent statements until the next guarded
 /// attempt resets it. `soft == None` runs the query with no per-attempt
 /// re-bound (the session-level `op_timeout` already applies).
@@ -886,7 +1380,7 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
@@ -898,59 +1392,59 @@ impl Memory for PostgresMemory {
         // indexed recency read, not a full-text scan.
         if query.is_empty() {
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-                let mut client = client.lock();
+                pool.with(|client| {
+                    let since_ref = since_owned.as_deref();
+                    let until_ref = until_owned.as_deref();
+                    let stmt = recent_recall_sql(
+                        &qualified_table,
+                        &qualified_agents,
+                        since_ref.is_some(),
+                        until_ref.is_some(),
+                    );
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    let limit_i64 = limit as i64;
+
+                    let rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => client.query(&stmt, &[&sid, &s, &u, &limit_i64])?,
+                        (Some(s), None) => client.query(&stmt, &[&sid, &s, &limit_i64])?,
+                        (None, Some(u)) => client.query(&stmt, &[&sid, &u, &limit_i64])?,
+                        (None, None) => client.query(&stmt, &[&sid, &limit_i64])?,
+                    };
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
+                })
+            })
+            .await;
+        }
+
+        let pool = self.pool.get().clone();
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+        let cap = recall_candidate_cap(limit);
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            pool.with(|client| {
                 let since_ref = since_owned.as_deref();
                 let until_ref = until_owned.as_deref();
-                let stmt = recent_recall_sql(
+
+                let stmt = ranked_recall_sql(
                     &qualified_table,
                     &qualified_agents,
+                    false,
                     since_ref.is_some(),
                     until_ref.is_some(),
                 );
 
                 #[allow(clippy::cast_possible_wrap)]
                 let limit_i64 = limit as i64;
+                #[allow(clippy::cast_possible_wrap)]
+                let cap_i64 = cap as i64;
 
-                let rows = match (since_ref, until_ref) {
-                    (Some(s), Some(u)) => client.query(&stmt, &[&sid, &s, &u, &limit_i64])?,
-                    (Some(s), None) => client.query(&stmt, &[&sid, &s, &limit_i64])?,
-                    (None, Some(u)) => client.query(&stmt, &[&sid, &u, &limit_i64])?,
-                    (None, None) => client.query(&stmt, &[&sid, &limit_i64])?,
-                };
-                rows.iter()
-                    .map(Self::row_to_entry)
-                    .collect::<Result<Vec<MemoryEntry>>>()
-            })
-            .await;
-        }
-
-        let client = self.client.get().clone();
-        let attempt_timeout = self.recall_soft_timeout;
-        let op_timeout = self.op_timeout;
-        let cap = recall_candidate_cap(limit);
-
-        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
-            let stmt = ranked_recall_sql(
-                &qualified_table,
-                &qualified_agents,
-                false,
-                since_ref.is_some(),
-                until_ref.is_some(),
-            );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-            #[allow(clippy::cast_possible_wrap)]
-            let cap_i64 = cap as i64;
-
-            // Bound THIS attempt server-side at the soft budget so a caller
-            // that gives up leaves no orphan holding the shared connection.
-            let entries =
-                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                // Bound THIS attempt server-side at the soft budget so a caller
+                // that gives up leaves no orphan holding the pooled connection.
+                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
                         (Some(s), Some(u)) => {
                             client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &s, &u])?
@@ -968,57 +1462,59 @@ impl Memory for PostgresMemory {
                     rows.iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
-                })?;
-            Ok(entries)
+                })
+            })
         })
         .await
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE m.key = $1
-                LIMIT 1
-                "
-            );
+            pool.with(|client| {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    WHERE m.key = $1
+                    LIMIT 1
+                    "
+                );
 
-            let row = client.query_opt(&stmt, &[&key])?;
-            row.as_ref().map(Self::row_to_entry).transpose()
+                let row = client.query_opt(&stmt, &[&key])?;
+                row.as_ref().map(Self::row_to_entry).transpose()
+            })
         })
         .await
     }
 
     async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE m.key = $1 AND m.agent_id = $2
-                LIMIT 1
-                "
-            );
+            pool.with(|client| {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    WHERE m.key = $1 AND m.agent_id = $2
+                    LIMIT 1
+                    "
+                );
 
-            let row = client.query_opt(&stmt, &[&key, &agent_id])?;
-            row.as_ref().map(Self::row_to_entry).transpose()
+                let row = client.query_opt(&stmt, &[&key, &agent_id])?;
+                row.as_ref().map(Self::row_to_entry).transpose()
+            })
         })
         .await
     }
@@ -1028,31 +1524,32 @@ impl Memory for PostgresMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let category = category.map(Self::category_to_str);
         let sid = session_id.map(str::to_string);
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE ($1::TEXT IS NULL OR m.category = $1)
-                  AND ($2::TEXT IS NULL OR m.session_id = $2)
-                ORDER BY m.updated_at DESC
-                "
-            );
+            pool.with(|client| {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    WHERE ($1::TEXT IS NULL OR m.category = $1)
+                      AND ($2::TEXT IS NULL OR m.session_id = $2)
+                    ORDER BY m.updated_at DESC
+                    "
+                );
 
-            let category_ref = category.as_deref();
-            let session_ref = sid.as_deref();
-            let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+                let category_ref = category.as_deref();
+                let session_ref = sid.as_deref();
+                let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
         })
         .await
     }
@@ -1066,7 +1563,7 @@ impl Memory for PostgresMemory {
         if prefix.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let prefix = escape_like_prefix(prefix);
@@ -1075,190 +1572,213 @@ impl Memory for PostgresMemory {
         let op_timeout = self.op_timeout;
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = list_prefixed_sql(&qualified_table, &qualified_agents);
+            pool.with(|client| {
+                let stmt = list_prefixed_sql(&qualified_table, &qualified_agents);
 
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-            let session_ref = sid.as_deref();
+                #[allow(clippy::cast_possible_wrap)]
+                let limit_i64 = limit as i64;
+                let session_ref = sid.as_deref();
 
-            // Bound THIS attempt server-side at the soft recall budget — the
-            // same per-attempt cancel shape the ranked recall gets — so an
-            // over-budget enumeration is cancelled by the server and frees
-            // the shared connection instead of holding it until `op_timeout`.
-            let entries =
-                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                // Bound THIS attempt server-side at the soft recall budget — the
+                // same per-attempt cancel shape the ranked recall gets — so an
+                // over-budget enumeration is cancelled by the server and frees
+                // the pooled connection instead of holding it until `op_timeout`.
+                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
                     let rows = client.query(&stmt, &[&prefix, &session_ref, &limit_i64])?;
                     rows.iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
-                })?;
-            Ok(entries)
+                })
+            })
         })
         .await
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<bool> {
-            let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
-            let deleted = client.execute(&stmt, &[&key])?;
-            Ok(deleted > 0)
+            pool.with(|client| {
+                let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
+                let deleted = client.execute(&stmt, &[&key])?;
+                Ok(deleted > 0)
+            })
         })
         .await
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<bool> {
-            let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
-            let deleted = client.execute(&stmt, &[&key, &agent_id])?;
-            Ok(deleted > 0)
+            pool.with(|client| {
+                let stmt =
+                    format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
+                let deleted = client.execute(&stmt, &[&key, &agent_id])?;
+                Ok(deleted > 0)
+            })
         })
         .await
     }
 
     async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt =
-                format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
-            let deleted = client.execute(&stmt, &[&session_id, &agent_id])?;
-            usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+            pool.with(|client| {
+                let stmt = format!(
+                    "DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2"
+                );
+                let deleted = client.execute(&stmt, &[&session_id, &agent_id])?;
+                usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+            })
         })
         .await
     }
 
     async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
-            );
-            let deleted = client.execute(&stmt, &[&alias])?;
-            usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+            pool.with(|client| {
+                let stmt = format!(
+                    "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                );
+                let deleted = client.execute(&stmt, &[&alias])?;
+                usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+            })
         })
         .await
     }
 
     async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
-                ORDER BY m.created_at ASC
-                "
-            );
-            let rows = client.query(&stmt, &[&alias])?;
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+            pool.with(|client| {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
+                    ORDER BY m.created_at ASC
+                    "
+                );
+                let rows = client.query(&stmt, &[&alias])?;
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
         })
         .await
     }
 
     async fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let qualified_table = self.qualified_table.clone();
         let from = from.to_string();
         let to = to.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<usize> {
-            let mut client = client.lock();
-            let mut tx = client.transaction()?;
-            let to_rows: i64 = tx
-                .query_one(
-                    &format!(
-                        "SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
-                    ),
+            pool.with(|client| {
+                let mut tx = client.transaction()?;
+                let to_rows: i64 = tx
+                    .query_one(
+                        &format!(
+                            "SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                        ),
+                        &[&to],
+                    )?
+                    .get(0);
+                if to_rows > 0 {
+                    anyhow::bail!(
+                        "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                    );
+                }
+                tx.execute(
+                    &format!("DELETE FROM {qualified_agents} WHERE alias = $1"),
                     &[&to],
-                )?
-                .get(0);
-            if to_rows > 0 {
-                anyhow::bail!(
-                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
-                );
-            }
-            tx.execute(
-                &format!("DELETE FROM {qualified_agents} WHERE alias = $1"),
-                &[&to],
-            )?;
-            let updated = tx.execute(
-                &format!("UPDATE {qualified_agents} SET alias = $2 WHERE alias = $1"),
-                &[&from, &to],
-            )?;
-            tx.commit()?;
-            usize::try_from(updated).context("PostgreSQL returned an oversized update count")
+                )?;
+                let updated = tx.execute(
+                    &format!("UPDATE {qualified_agents} SET alias = $2 WHERE alias = $1"),
+                    &[&from, &to],
+                )?;
+                tx.commit()?;
+                usize::try_from(updated).context("PostgreSQL returned an oversized update count")
+            })
         })
         .await
     }
 
     async fn count_agent(&self, agent_alias: &str) -> Result<usize> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = agent_alias.to_string();
 
         run_on_os_thread(self.op_timeout, move || -> Result<usize> {
-            let mut client = client.lock();
-            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
-            // residue is the presence of that alias row (0 or 1), NOT the memory-
-            // row count (which would miss an agents-row-only lag).
-            let stmt = format!("SELECT COUNT(*) FROM {qualified_agents} WHERE alias = $1");
-            let row = client.query_one(&stmt, &[&alias])?;
-            let count: i64 = row.get(0);
-            usize::try_from(count).context("PostgreSQL returned an oversized agent count")
+            pool.with(|client| {
+                // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
+                // residue is the presence of that alias row (0 or 1), NOT the memory-
+                // row count (which would miss an agents-row-only lag).
+                let stmt = format!("SELECT COUNT(*) FROM {qualified_agents} WHERE alias = $1");
+                let row = client.query_one(&stmt, &[&alias])?;
+                let count: i64 = row.get(0);
+                usize::try_from(count).context("PostgreSQL returned an oversized agent count")
+            })
         })
         .await
     }
 
     async fn count(&self) -> Result<usize> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(self.op_timeout, move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
-            let count: i64 = client.query_one(&stmt, &[])?.get(0);
-            let count =
-                usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
-            Ok(count)
+            pool.with(|client| {
+                let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
+                let count: i64 = client.query_one(&stmt, &[])?.get(0);
+                let count = usize::try_from(count)
+                    .context("PostgreSQL returned a negative memory count")?;
+                Ok(count)
+            })
         })
         .await
     }
 
     async fn health_check(&self) -> bool {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         run_on_os_thread(self.op_timeout, move || {
-            Ok(client.lock().simple_query("SELECT 1").is_ok())
+            // The error PROPAGATES out of the closure so the pool classifies
+            // it: a dead connection is discarded, ONE reconnect is attempted,
+            // and the probe runs once on the fresh connection. DECIDED
+            // semantics — the healing pool reports TRUE (heal in place): a
+            // false-while-healing would turn every patroni restart into a
+            // readiness CrashLoop, recreating the manual-roll regime. False
+            // only when the reconnect also fails (or the probe thread times
+            // out). The observable claim is the NEXT MEMORY OP succeeds, not
+            // the first webhook turn.
+            pool.with(|client| {
+                client
+                    .simple_query("SELECT 1")
+                    .map(|_| true)
+                    .map_err(Into::into)
+            })
         })
         .await
         .unwrap_or(false)
@@ -1274,7 +1794,7 @@ impl Memory for PostgresMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -1289,17 +1809,18 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(self.op_timeout, move || -> Result<()> {
             let now = Utc::now();
-            let mut client = client.lock();
-            let stmt = store_insert_sql(&qualified_table, &qualified_agents);
+            pool.with(|client| {
+                let stmt = store_insert_sql(&qualified_table, &qualified_agents);
 
-            let id = Uuid::new_v4().to_string();
-            client.execute(
-                &stmt,
-                &[
-                    &id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp,
-                ],
-            )?;
-            Ok(())
+                let id = Uuid::new_v4().to_string();
+                client.execute(
+                    &stmt,
+                    &[
+                        &id, &key, &content, &category, &now, &now, &sid, &aid, &ns, &imp,
+                    ],
+                )?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1320,7 +1841,7 @@ impl Memory for PostgresMemory {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let q = normalize_recent_recall_query(query).trim().to_string();
@@ -1332,59 +1853,61 @@ impl Memory for PostgresMemory {
         // Empty-query fast path: indexed recency within the agent allowlist.
         if q.is_empty() {
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-                let mut client = client.lock();
+                pool.with(|client| {
+                    let since_ref = since_owned.as_deref();
+                    let until_ref = until_owned.as_deref();
+                    let stmt = recent_recall_sql_for_agents(
+                        &qualified_table,
+                        &qualified_agents,
+                        since_ref.is_some(),
+                        until_ref.is_some(),
+                    );
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    let limit_i64 = limit as i64;
+
+                    let rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => {
+                            client.query(&stmt, &[&allowed, &s, &u, &limit_i64])?
+                        }
+                        (Some(s), None) => client.query(&stmt, &[&allowed, &s, &limit_i64])?,
+                        (None, Some(u)) => client.query(&stmt, &[&allowed, &u, &limit_i64])?,
+                        (None, None) => client.query(&stmt, &[&allowed, &limit_i64])?,
+                    };
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
+                })
+            })
+            .await;
+        }
+
+        let pool = self.pool.get().clone();
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+        let cap = recall_candidate_cap(limit);
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            pool.with(|client| {
                 let since_ref = since_owned.as_deref();
                 let until_ref = until_owned.as_deref();
-                let stmt = recent_recall_sql_for_agents(
+
+                let stmt = ranked_recall_sql(
                     &qualified_table,
                     &qualified_agents,
+                    true,
                     since_ref.is_some(),
                     until_ref.is_some(),
                 );
 
                 #[allow(clippy::cast_possible_wrap)]
                 let limit_i64 = limit as i64;
+                #[allow(clippy::cast_possible_wrap)]
+                let cap_i64 = cap as i64;
 
-                let rows = match (since_ref, until_ref) {
-                    (Some(s), Some(u)) => client.query(&stmt, &[&allowed, &s, &u, &limit_i64])?,
-                    (Some(s), None) => client.query(&stmt, &[&allowed, &s, &limit_i64])?,
-                    (None, Some(u)) => client.query(&stmt, &[&allowed, &u, &limit_i64])?,
-                    (None, None) => client.query(&stmt, &[&allowed, &limit_i64])?,
-                };
-                rows.iter()
-                    .map(Self::row_to_entry)
-                    .collect::<Result<Vec<MemoryEntry>>>()
-            })
-            .await;
-        }
-
-        let client = self.client.get().clone();
-        let attempt_timeout = self.recall_soft_timeout;
-        let op_timeout = self.op_timeout;
-        let cap = recall_candidate_cap(limit);
-
-        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
-            let stmt = ranked_recall_sql(
-                &qualified_table,
-                &qualified_agents,
-                true,
-                since_ref.is_some(),
-                until_ref.is_some(),
-            );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-            #[allow(clippy::cast_possible_wrap)]
-            let cap_i64 = cap as i64;
-
-            // Bound THIS attempt server-side at the soft budget so a caller
-            // that gives up leaves no orphan holding the shared connection.
-            let entries =
-                with_statement_timeout(&mut client, attempt_timeout, op_timeout, |client| {
+                // Bound THIS attempt server-side at the soft budget so a caller
+                // that gives up leaves no orphan holding the pooled connection.
+                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
                         (Some(s), Some(u)) => client
                             .query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s, &u])?,
@@ -1401,34 +1924,35 @@ impl Memory for PostgresMemory {
                     rows.iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
-                })?;
-            Ok(entries)
+                })
+            })
         })
         .await
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
-        let client = self.client.get().clone();
+        let pool = self.pool.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
         run_on_os_thread(self.op_timeout, move || -> Result<String> {
-            let mut client = client.lock();
-            let candidate = Uuid::new_v4().to_string();
-            client.execute(
-                &format!(
-                    "INSERT INTO {qualified_agents} (id, alias, created_at)
-                     VALUES ($1, $2, NOW())
-                     ON CONFLICT (alias) DO NOTHING"
-                ),
-                &[&candidate, &alias],
-            )?;
-            let row: String = client
-                .query_one(
-                    &format!("SELECT id FROM {qualified_agents} WHERE alias = $1 LIMIT 1"),
-                    &[&alias],
-                )?
-                .get(0);
-            Ok(row)
+            pool.with(|client| {
+                let candidate = Uuid::new_v4().to_string();
+                client.execute(
+                    &format!(
+                        "INSERT INTO {qualified_agents} (id, alias, created_at)
+                         VALUES ($1, $2, NOW())
+                         ON CONFLICT (alias) DO NOTHING"
+                    ),
+                    &[&candidate, &alias],
+                )?;
+                let row: String = client
+                    .query_one(
+                        &format!("SELECT id FROM {qualified_agents} WHERE alias = $1 LIMIT 1"),
+                        &[&alias],
+                    )?
+                    .get(0);
+                Ok(row)
+            })
         })
         .await
     }
@@ -2061,6 +2585,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
         });
 
@@ -2083,6 +2608,7 @@ mod tests {
                 None,
                 Some(true),
                 Some(4),
+                None,
                 None,
             )
         });
@@ -2156,6 +2682,7 @@ mod tests {
                 Some(true),
                 Some(4),
                 None,
+                None,
             )
         });
 
@@ -2185,6 +2712,7 @@ mod tests {
                 Some(5),
                 None,
                 Some(false),
+                None,
                 None,
                 None,
             )
@@ -2256,6 +2784,7 @@ mod tests {
             Some(5),
             Some(1), // op_timeout 1 s — far below the seeded index build time
             Some(false),
+            None,
             None,
             None,
         )
@@ -2345,6 +2874,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                None,
             )
             .unwrap();
         });
@@ -2426,6 +2956,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2492,6 +3023,7 @@ mod tests {
                 // Production shape: the namespace/importance columns ride the
                 // pgvector column setup, so the fixture needs it enabled.
                 Some(true),
+                None,
                 None,
                 None,
             )
@@ -2580,6 +3112,7 @@ mod tests {
                 // Production shape: the namespace/importance columns ride the
                 // pgvector column setup, so the fixture needs it enabled.
                 Some(true),
+                None,
                 None,
                 None,
             )
@@ -2673,6 +3206,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2694,6 +3228,476 @@ mod tests {
                 recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
             );
         });
+    }
+
+    /// The 2026-11-17/18 fleet-death class, automated: server-side backends
+    /// terminated under the memory backend (a patroni restart is the prod
+    /// shape) must NOT poison the backend. RED in the single-client world:
+    /// the one dead client never heals — every later operation fails until
+    /// the process restarts (the SOP/cron fleet stopped at 2026-11-17
+    /// 23:40Z until manual pod rolls; tokio-postgres has no auto-reconnect).
+    ///
+    /// The memory connections tag themselves via the URL's
+    /// `application_name` so the schema admin can enumerate the pool's
+    /// backends server-side. Admin SQL stays OUTSIDE the Tokio runtime
+    /// blocks (the nested-block_on panic class the pgvector fixture pins).
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_pool_replaces_a_terminated_connection_transparently() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "poolterm");
+        let pool_url = format!("{database_url}?application_name=zc_mem_poolterm");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = PostgresMemory::new(
+            "ci",
+            &pool_url,
+            &schema.name,
+            "memories",
+            Some(5),
+            None,
+            // Production shape: the namespace/importance columns ride the
+            // pgvector column setup, so the fixture needs it enabled.
+            Some(true),
+            None,
+            None,
+            Some(2),
+        )
+        .unwrap();
+
+        let pool_pids = |admin: &mut Client| -> Vec<i32> {
+            admin
+                .query(
+                    "SELECT pid FROM pg_stat_activity WHERE application_name = 'zc_mem_poolterm'",
+                    &[],
+                )
+                .expect("pg_stat_activity enumeration must succeed")
+                .iter()
+                .map(|row| row.get::<_, i32>(0))
+                .collect()
+        };
+
+        let before = pool_pids(&mut schema.admin);
+        assert!(!before.is_empty(), "the boot must hold its connections");
+
+        // Terminate EVERY backend serving the pool — the patroni-restart
+        // shape (the admin's own session carries no application_name, so it
+        // is not matched).
+        schema
+            .admin
+            .batch_execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                 WHERE application_name = 'zc_mem_poolterm'",
+            )
+            .expect("the terminate sweep must succeed");
+
+        runtime.block_on(async {
+            // The NEXT memory operation must succeed: dead connections are
+            // discarded, one reconnect is attempted, and the operation runs
+            // once on the fresh connection — transparently to the caller.
+            memory
+                .store(
+                    "term:probe",
+                    "survives the terminate",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .expect("the first operation after a backend terminate must succeed");
+            let got = memory
+                .get("term:probe")
+                .await
+                .expect("the read after the terminate must succeed")
+                .expect("the stored row must be readable");
+            assert_eq!(got.content, "survives the terminate");
+            let recalled = memory
+                .recall("survives", 5, None, None, None)
+                .await
+                .expect("a ranked recall after the terminate must also succeed");
+            assert!(
+                recalled.iter().any(|e| e.key == "term:probe"),
+                "the ranked recall must surface the stored row, got: {:?}",
+                recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+        });
+
+        // No later op ever runs on the terminated pids: they are gone
+        // server-side, and the backends now serving the pool are fresh.
+        let after = pool_pids(&mut schema.admin);
+        assert!(
+            !after.iter().any(|pid| before.contains(pid)),
+            "the terminated pids must be gone; before: {before:?}, after: {after:?}"
+        );
+    }
+
+    /// The pool hands out DISTINCT connections: three simultaneous
+    /// acquisitions carry three different server backends
+    /// (`pg_backend_pid()`), and a released connection is REUSED from the
+    /// idle set — the re-acquired pid repeats instead of paying a new
+    /// backend. RED: the acquire surface does not exist pre-change
+    /// (compile-RED, the fork precedent).
+    ///
+    /// The acquisitions run on the PLAIN test thread: the synchronous
+    /// client's internal `block_on` must never meet an active Tokio runtime
+    /// (the nested-runtime panic class).
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_pool_hands_out_distinct_connections() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "poolpids");
+        let memory = PostgresMemory::new(
+            "ci",
+            &database_url,
+            &schema.name,
+            "memories",
+            Some(5),
+            None,
+            // Production shape: the namespace/importance columns ride the
+            // pgvector column setup, so the fixture needs it enabled.
+            Some(true),
+            None,
+            None,
+            Some(3),
+        )
+        .unwrap();
+        let pool = memory.pool.get().clone();
+
+        let mut pids = Vec::new();
+        let mut guards = Vec::new();
+        for _ in 0..3 {
+            let mut guard = pool
+                .clone()
+                .acquire()
+                .expect("the warmed pool must hand out a connection");
+            let pid: i32 = guard
+                .query_one("SELECT pg_backend_pid()", &[])
+                .expect("pg_backend_pid must answer")
+                .get(0);
+            pids.push(pid);
+            guards.push(guard);
+        }
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                assert_ne!(
+                    pids[i], pids[j],
+                    "each simultaneous acquisition must carry a distinct backend"
+                );
+            }
+        }
+
+        // Release all three; the pool's idle set holds them (no connection
+        // is created or dropped by a release).
+        for guard in guards {
+            guard.release();
+        }
+        assert_eq!(
+            pool.owned_connections(),
+            3,
+            "a release must not change the pool's connection census"
+        );
+
+        let mut again = pool
+            .clone()
+            .acquire()
+            .expect("the released connections must be acquirable");
+        let pid_again: i32 = again
+            .query_one("SELECT pg_backend_pid()", &[])
+            .expect("pg_backend_pid must answer")
+            .get(0);
+        assert!(
+            pids.contains(&pid_again),
+            "the re-acquired connection must be an idle REUSE of a released backend, got {pid_again}, seen {pids:?}"
+        );
+        again.release();
+        assert_eq!(pool.owned_connections(), 3);
+    }
+
+    /// The boot degradation guard: when extra pool connections cannot be
+    /// established, the boot still SUCCEEDS with a smaller pool and the
+    /// degraded pool serves operations.
+    ///
+    /// The limit rides a DEDICATED non-superuser role: role CONNECTION
+    /// LIMITS are NOT enforced for superusers (verified against the fixture:
+    /// a superuser's second connect ignores the limit, an ordinary role's
+    /// second connect dies with `FATAL: too many connections for role`). The
+    /// shared `zeroclaw_test` role is the container superuser, so it cannot
+    /// carry the limit without breaking the whole suite. The dedicated role
+    /// owns the test schema (the boot DDL runs as it) and its CONNECTION
+    /// LIMIT 1 leaves exactly ONE slot for the pool: the primary connects,
+    /// every extra connect is refused, and the pool degrades to one
+    /// connection.
+    ///
+    /// `pgvector` stays OFF for this fixture (the limited role cannot CREATE
+    /// EXTENSION); the admin adds the `namespace`/`importance` columns AFTER
+    /// the boot so the store/get statements resolve. The role + schema are
+    /// dropped in teardown, so later serial-tier tests are not poisoned even
+    /// on a mid-test panic.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_pool_degrades_when_extra_connections_fail() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "pooldegrade");
+        let schema_ident = quote_identifier(&schema.name);
+        schema
+            .admin
+            .batch_execute(
+                r#"DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zc_pool_degrade') THEN
+                        DROP OWNED BY zc_pool_degrade CASCADE;
+                        DROP ROLE zc_pool_degrade;
+                    END IF;
+                END $$;
+                CREATE ROLE zc_pool_degrade LOGIN PASSWORD 'pool-degrade-pw';
+                ALTER ROLE zc_pool_degrade CONNECTION LIMIT 1;"#,
+            )
+            .expect("the dedicated limit role must be creatable");
+        schema
+            .admin
+            .batch_execute(
+                // The boot's `CREATE SCHEMA IF NOT EXISTS` pays the
+                // database-level CREATE privilege check even when the schema
+                // already exists (and the role owns it).
+                "GRANT CREATE ON DATABASE zeroclaw_test TO zc_pool_degrade;",
+            )
+            .expect("the database CREATE grant must succeed");
+        schema
+            .admin
+            .batch_execute(&format!(
+                "ALTER SCHEMA {schema_ident} OWNER TO zc_pool_degrade;"
+            ))
+            .expect("the schema ownership must transfer to the limited role");
+
+        // Teardown guard: the role owns the table until the schema
+        // cascades, so the cleanup drops the schema FIRST, then the role.
+        // Best-effort: a failed cleanup cannot poison later tests (the
+        // limit is role-local) and the next run's DO block heals it. The
+        // guard carries its OWN admin connection (the sync Client cannot
+        // be cloned).
+        struct RoleCleanup {
+            admin: Client,
+            schema_ident: String,
+        }
+        impl Drop for RoleCleanup {
+            fn drop(&mut self) {
+                let _ = self.admin.batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {} CASCADE; DROP ROLE IF EXISTS zc_pool_degrade;",
+                    self.schema_ident
+                ));
+            }
+        }
+        let cleanup = RoleCleanup {
+            admin: Client::connect(&database_url, NoTls)
+                .expect("the teardown admin connection must open"),
+            schema_ident: schema_ident.clone(),
+        };
+
+        let role_url = "postgres://zc_pool_degrade:pool-degrade-pw@127.0.0.1:5432/zeroclaw_test";
+        let memory = PostgresMemory::new(
+            "ci",
+            role_url,
+            &schema.name,
+            "memories",
+            Some(5),
+            None,
+            Some(false), // pgvector OFF: the limited role cannot CREATE EXTENSION
+            None,
+            None,
+            Some(4),
+        )
+        .expect("the boot must succeed with a degraded pool");
+
+        // The boot created the table as the limited role; the admin then
+        // adds the columns the store/get statements reference.
+        let qualified_table = format!("{schema_ident}.memories");
+        schema
+            .admin
+            .batch_execute(&format!(
+                "ALTER TABLE {qualified_table} ADD COLUMN namespace TEXT DEFAULT 'default';
+                 ALTER TABLE {qualified_table} ADD COLUMN importance REAL;"
+            ))
+            .expect("the admin column additions must succeed");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            memory
+                .store(
+                    "degrade:key",
+                    "degraded pool serves",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .expect("the degraded pool must serve stores");
+            let got = memory
+                .get("degrade:key")
+                .await
+                .expect("the degraded pool must serve reads")
+                .expect("the stored row must be readable");
+            assert_eq!(got.content, "degraded pool serves");
+            assert!(
+                memory.health_check().await,
+                "health_check on the degraded pool reports TRUE (heal-in-place semantics)"
+            );
+        });
+
+        // The failed extra connects degraded the pool to exactly ONE
+        // connection (the failed boot connects are NOT retried into the
+        // census; the pool can still expand at runtime if the limit lifts).
+        assert_eq!(
+            memory.pool.get().owned_connections(),
+            1,
+            "the pool must carry exactly the one connection that survived the boot limit"
+        );
+
+        drop(memory);
+        drop(runtime);
+        drop(cleanup); // DROP SCHEMA CASCADE + DROP ROLE (TestSchema's Drop no-ops after)
+    }
+
+    /// REGRESSION PIN (not RED — labeled as such): 8 concurrent store+recall
+    /// futures on a pool of 4 all succeed with the correct rows. The pool's
+    /// condvar parks the overflow waiters and hands out each released
+    /// connection, instead of serializing every operation behind one mutex
+    /// or failing the overflow outright.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_pool_serves_concurrent_memory_ops() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "poolconc");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = Arc::new(
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride
+                // the pgvector column setup, so the fixture needs it
+                // enabled.
+                Some(true),
+                None,
+                None,
+                Some(4),
+            )
+            .unwrap(),
+        );
+
+        runtime.block_on(async {
+            let mut handles = Vec::new();
+            for i in 0..8 {
+                let memory = Arc::clone(&memory);
+                handles.push(tokio::spawn(async move {
+                    let key = format!("pool:conc:{i}");
+                    let content = format!("concurrent payload {i}");
+                    memory
+                        .store(&key, &content, MemoryCategory::Core, None)
+                        .await?;
+                    let got = memory
+                        .get(&key)
+                        .await?
+                        .expect("the stored row must be readable");
+                    assert_eq!(got.content, content, "row {key} must round-trip");
+                    // The empty-query recall is the indexed recent path: at
+                    // most 9 rows exist in the fixture, so a LIMIT 20 recall
+                    // returns every row regardless of recency ties.
+                    let recalled = memory.recall("", 20, None, None, None).await?;
+                    assert!(
+                        recalled.iter().any(|e| e.key == key),
+                        "the recent recall must surface {key}, got: {:?}",
+                        recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+                    );
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .expect("the concurrent task must not panic")
+                    .expect("each concurrent store+recall must succeed");
+            }
+        });
+    }
+
+    /// The pool-size resolver clamps to [1, POSTGRES_POOL_CAP]; `None` takes
+    /// the default. The knob is `Option<u64>` END TO END (the
+    /// `recall_soft_timeout_ms` precedent) — `None` means the default with
+    /// NO debops config change.
+    #[test]
+    fn resolve_pool_size_clamps_to_bounds() {
+        assert_eq!(
+            resolve_pool_size(None),
+            4,
+            "None takes POSTGRES_POOL_DEFAULT"
+        );
+        assert_eq!(
+            resolve_pool_size(None),
+            POSTGRES_POOL_DEFAULT as usize,
+            "None resolves to the const, not a magic number"
+        );
+        assert_eq!(
+            resolve_pool_size(Some(0)),
+            1,
+            "0 clamps UP to 1 — a zero-sized pool would deadlock every operation"
+        );
+        assert_eq!(resolve_pool_size(Some(1)), 1);
+        assert_eq!(resolve_pool_size(Some(4)), 4);
+        assert_eq!(
+            resolve_pool_size(Some(17)),
+            16,
+            "above POSTGRES_POOL_CAP clamps down"
+        );
+        assert_eq!(
+            resolve_pool_size(Some(64)),
+            16,
+            "far above POSTGRES_POOL_CAP clamps down"
+        );
+        assert_eq!(
+            resolve_pool_size(Some(POSTGRES_POOL_CAP)),
+            16,
+            "the cap itself passes through"
+        );
+    }
+
+    /// The PRIMARY connection-loss signal is the OR of the two closed
+    /// markers; only (false, false) is not a connection loss. The io-source
+    /// belt and the full classify-then-retry flow pin at the LIVE tier (the
+    /// terminate test) — no public constructor yields a connection-loss
+    /// `postgres::Error` (`io()` and `closed()` are pub(crate) in
+    /// tokio-postgres 0.7.18; the `Kind` enum is private). Constructor
+    /// visibility is NOT hacked to make this unit-testable.
+    #[test]
+    fn connection_loss_predicate_is_the_closed_disjunction() {
+        assert!(
+            !connection_loss_disjunction(false, false),
+            "(false, false) is not a connection loss"
+        );
+        assert!(
+            connection_loss_disjunction(true, false),
+            "err closed → loss"
+        );
+        assert!(
+            connection_loss_disjunction(false, true),
+            "client closed → loss"
+        );
+        assert!(
+            connection_loss_disjunction(true, true),
+            "both closed → loss"
+        );
     }
 
     #[test]

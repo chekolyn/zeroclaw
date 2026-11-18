@@ -126,6 +126,7 @@ fn build_postgres_memory(
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
         Some(recall_soft_timeout_ms),
+        storage.pool_size,
     )?
     .with_category_namespaces(category_namespaces))
 }
