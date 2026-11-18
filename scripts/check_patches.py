@@ -113,6 +113,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"list_prefixed",
         "min_count": 1,
     },
+    "recall-rank-ws": {
+        "glob": "crates/zeroclaw-memory/src/postgres.rs",
+        "pattern": r"\* 2\.0\n",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
