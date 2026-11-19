@@ -133,6 +133,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"durable_global_category_names",
         "min_count": 4,
     },
+    "recall-time-bound": {
+        "glob": "crates/zeroclaw-memory/src/postgres.rs",
+        "pattern": r"parse_rfc3339_bound",
+        "min_count": 12,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt

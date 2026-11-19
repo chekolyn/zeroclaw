@@ -1116,6 +1116,21 @@ fn recall_rank_expression() -> String {
     )
 }
 
+/// Parse an RFC 3339 recall time bound into a `TIMESTAMPTZ` instant. The
+/// bound is VALIDATED and compared as an instant, never as a string: a text
+/// bind cannot serialize into the server-inferred timestamptz parameter —
+/// the server assigns an untyped `$n::TIMESTAMPTZ` parameter the cast
+/// target's type, and postgres-types 0.2.14's `&str::accepts` covers only
+/// the text-ish types — and an unparseable bound fails LOUDLY here with the
+/// bound named, never silently dropping the window (a bounded recall that
+/// degrades into an unbounded one is the silent-recall hazard class; the
+/// same shape proven live on the export path, 2026-11-19).
+fn parse_rfc3339_bound(bound: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(bound)
+        .map(|dt| dt.with_timezone(&Utc))
+        .with_context(|| format!("invalid RFC 3339 time bound: {bound:?}"))
+}
+
 fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
     match (since, until) {
         (true, true) => format!(
@@ -1444,8 +1459,14 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
-        let since_owned = since.map(str::to_string);
-        let until_owned = until.map(str::to_string);
+        // The time bounds parse to instants CLIENT-side and bind as
+        // timestamptz: a text bind cannot serialize into the
+        // server-inferred timestamptz parameter (postgres-types 0.2.14's
+        // `&str::accepts` excludes TIMESTAMPTZ), and an unparseable bound
+        // fails LOUDLY here instead of silently recalling unbounded
+        // ([`parse_rfc3339_bound`]).
+        let since = since.map(parse_rfc3339_bound).transpose()?;
+        let until = until.map(parse_rfc3339_bound).transpose()?;
 
         // Empty-query fast path: the bare `*` / omitted-query contract is an
         // indexed recency read, not a full-text scan.
@@ -1453,8 +1474,8 @@ impl Memory for PostgresMemory {
             let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
                 pool.with(|client| {
-                    let since_ref = since_owned.as_deref();
-                    let until_ref = until_owned.as_deref();
+                    let since_ref = since.as_ref();
+                    let until_ref = until.as_ref();
                     let stmt = recent_recall_sql(
                         &qualified_table,
                         &qualified_agents,
@@ -1493,8 +1514,8 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             pool.with(|client| {
-                let since_ref = since_owned.as_deref();
-                let until_ref = until_owned.as_deref();
+                let since_ref = since.as_ref();
+                let until_ref = until.as_ref();
 
                 let stmt = ranked_recall_sql(
                     &qualified_table,
@@ -1915,8 +1936,16 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let q = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
-        let since_owned = since.map(str::to_string);
-        let until_owned = until.map(str::to_string);
+        // The time bounds parse to instants CLIENT-side and bind as
+        // timestamptz: a text bind cannot serialize into the
+        // server-inferred timestamptz parameter (postgres-types 0.2.14's
+        // `&str::accepts` excludes TIMESTAMPTZ), and an unparseable bound
+        // fails LOUDLY here instead of silently recalling unbounded
+        // ([`parse_rfc3339_bound`]). Below the empty-allowlist early
+        // return, which delegates with the unparsed bounds for `recall` to
+        // parse at its own seam.
+        let since = since.map(parse_rfc3339_bound).transpose()?;
+        let until = until.map(parse_rfc3339_bound).transpose()?;
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
         // Empty-query fast path: indexed recency within the agent allowlist.
@@ -1927,8 +1956,8 @@ impl Memory for PostgresMemory {
             let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
                 pool.with(|client| {
-                    let since_ref = since_owned.as_deref();
-                    let until_ref = until_owned.as_deref();
+                    let since_ref = since.as_ref();
+                    let until_ref = until.as_ref();
                     let stmt = recent_recall_sql_for_agents(
                         &qualified_table,
                         &qualified_agents,
@@ -1967,8 +1996,8 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             pool.with(|client| {
-                let since_ref = since_owned.as_deref();
-                let until_ref = until_owned.as_deref();
+                let since_ref = since.as_ref();
+                let until_ref = until.as_ref();
 
                 let stmt = ranked_recall_sql(
                     &qualified_table,
@@ -2650,6 +2679,46 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// The RECALL-TIME-BOUND bind-type seam, pinned at the unit tier: the
+    /// bounds the recall paths bind MUST be `DateTime<Utc>` instants (the
+    /// helper's return type — a text bind cannot serialize into the
+    /// server-inferred `timestamptz` parameter, postgres-types 0.2.14's
+    /// `&str::accepts` excludes TIMESTAMPTZ), and a malformed bound fails
+    /// LOUDLY naming the bound, never silently dropping the window.
+    #[test]
+    fn parse_rfc3339_bound_parses_to_an_instant_and_fails_loudly_on_malformed() {
+        // A Z-spelled bound parses to its instant.
+        let parsed =
+            parse_rfc3339_bound("2026-01-01T00:00:00Z").expect("a valid Z-spelled bound parses");
+        assert_eq!(
+            parsed.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00",
+            "the bound parses to the instant it spells"
+        );
+        // A mixed-offset spelling NORMALIZES to the same instant — the
+        // ordering defect the string-compare class shipped.
+        let mixed = parse_rfc3339_bound("2026-01-01T01:00:00+02:00")
+            .expect("an offset-spelled bound parses");
+        let equivalent =
+            parse_rfc3339_bound("2025-12-31T23:00:00Z").expect("the equivalent Z spelling parses");
+        assert_eq!(
+            mixed, equivalent,
+            "offset spellings normalize to the same instant"
+        );
+
+        // A malformed bound fails LOUDLY, naming the defect AND the bound.
+        let err = parse_rfc3339_bound("not-a-timestamp").expect_err("a malformed bound must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid RFC 3339 time bound"),
+            "the error must name the defect class; got: {msg}"
+        );
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "the error must name the offending bound; got: {msg}"
+        );
     }
 
     #[test]
@@ -3566,6 +3635,294 @@ mod tests {
                 recalled.iter().all(|e| e.key.starts_with("new:")),
                 "every result must come from the newest candidate window; got: {:?}",
                 recalled.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// Live proof for the RECALL-TIME-BOUND wire fix: a recall with since/until
+    /// binds TIMESTAMPTZ instants and returns ONLY the in-window rows. RED
+    /// (2026-11-19): the recall paths bound the bounds as `&str` against the
+    /// `$n::TIMESTAMPTZ` casts — postgres-types 0.2.14's `&str::accepts`
+    /// covers only text-ish types, the server assigns an untyped `$n`
+    /// parameter the cast target's type, and every time-bound recall failed
+    /// at the wire ("cannot convert between the Rust type `Option<&str>` and
+    /// the Postgres type `timestamptz`") — with NO automated coverage (the
+    /// V3 Task-1 review finding 6 exposure).
+    ///
+    /// Covers all four affected bind sites: the unscoped recency + ranked
+    /// paths and both agent-scoped paths (`recall_for_agents`).
+    ///
+    /// Time separation is set by the schema-admin UPDATE (the Task-1 window
+    /// precedent — store timestamps share milliseconds, so store-order
+    /// recency alone is not a safe separator), and the since/until bounds
+    /// derive from the DATABASE's own post-shift timestamps, so membership
+    /// never depends on client/server clock skew.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_recall_with_time_bounds_returns_windowed_rows() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "timewin");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (memory, agent) = runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            // Three same-term unscoped groups; the admin shift separates
+            // them by whole days/hours, not store-order recency.
+            for i in 0..12 {
+                memory
+                    .store(
+                        &format!("win:old:{i}"),
+                        "timewin marker term",
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            for i in 0..12 {
+                memory
+                    .store(
+                        &format!("win:in:{i}"),
+                        "timewin marker term",
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            for i in 0..12 {
+                memory
+                    .store(
+                        &format!("win:future:{i}"),
+                        "timewin marker term",
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            // The agent-bound pair for the recall_for_agents legs.
+            let agent = memory.ensure_agent_uuid("timewin_agent").await.unwrap();
+            memory
+                .store_with_agent(
+                    "win:agent:in",
+                    "timewin marker term",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(&agent),
+                )
+                .await
+                .unwrap();
+            memory
+                .store_with_agent(
+                    "win:agent:old",
+                    "timewin marker term",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(&agent),
+                )
+                .await
+                .unwrap();
+            (memory, agent)
+        });
+
+        schema
+            .admin
+            .batch_execute(&format!(
+                "UPDATE {}.memories SET created_at = NOW() - INTERVAL '1 day',
+                 updated_at = NOW() - INTERVAL '1 day'
+                 WHERE key LIKE 'win:old:%' OR key = 'win:agent:old';
+                UPDATE {}.memories SET created_at = NOW() + INTERVAL '2 hours',
+                 updated_at = NOW() + INTERVAL '2 hours' WHERE key LIKE 'win:future:%';
+                UPDATE {}.memories SET created_at = NOW(), updated_at = NOW()
+                 WHERE key LIKE 'win:in:%' OR key = 'win:agent:in';",
+                quote_identifier(&schema.name),
+                quote_identifier(&schema.name),
+                quote_identifier(&schema.name)
+            ))
+            .expect("shifting the seed groups must succeed");
+
+        // The bounds derive from the DATABASE's own in-window timestamps:
+        // since = min - 1s (excludes the day-old group), until = max + 1s
+        // (excludes the +2h group).
+        let (since, until) = {
+            let row = schema
+                .admin
+                .query_one(
+                    &format!(
+                        "SELECT min(created_at), max(created_at) FROM {}.memories
+                         WHERE key LIKE 'win:in:%' OR key = 'win:agent:in'",
+                        quote_identifier(&schema.name)
+                    ),
+                    &[],
+                )
+                .expect("reading the in-window bounds must succeed");
+            let min: chrono::DateTime<chrono::Utc> = row.get(0);
+            let max: chrono::DateTime<chrono::Utc> = row.get(1);
+            (
+                (min - chrono::Duration::seconds(1)).to_rfc3339(),
+                (max + chrono::Duration::seconds(1)).to_rfc3339(),
+            )
+        };
+
+        runtime.block_on(async {
+            // The ranked path (non-empty query → ranked_recall_sql, $5/$6).
+            let ranked = memory
+                .recall("timewin marker term", 50, None, Some(&since), Some(&until))
+                .await
+                .expect("the time-bound ranked recall must bind and return rows");
+            let mut ranked_keys: Vec<&str> = ranked.iter().map(|e| e.key.as_str()).collect();
+            ranked_keys.sort();
+            // The 12 in-window unscoped rows PLUS the in-window agent-bound
+            // row: the unscoped paths carry no agent predicate, so the
+            // agent-bound row belongs here too (it returns in every leg).
+            let mut expected_in: Vec<String> = (0..12).map(|i| format!("win:in:{i}")).collect();
+            expected_in.push("win:agent:in".to_string());
+            expected_in.sort();
+            assert_eq!(
+                ranked_keys, expected_in,
+                "the ranked recall must return ONLY the in-window rows"
+            );
+
+            // The recency path (empty query → recent_recall_sql, $2/$3).
+            let recency = memory
+                .recall("*", 50, None, Some(&since), Some(&until))
+                .await
+                .expect("the time-bound recency recall must bind and return rows");
+            let recency_keys: Vec<&str> = recency.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                recency_keys.len(),
+                13,
+                "the 12 in-window + the in-window agent row"
+            );
+            assert!(
+                recency_keys
+                    .iter()
+                    .all(|k| *k == "win:agent:in" || k.starts_with("win:in:")),
+                "the recency recall must return ONLY the in-window rows; got: {recency_keys:?}"
+            );
+
+            // The agent-scoped ranked path (ranked_recall_sql agent_scoped,
+            // $6/$7) and recency path (recent_recall_sql_for_agents, $2/$3).
+            let agent_ranked = memory
+                .recall_for_agents(
+                    &[&agent],
+                    "timewin marker term",
+                    50,
+                    None,
+                    Some(&since),
+                    Some(&until),
+                )
+                .await
+                .expect("the time-bound agent-scoped ranked recall must bind and return rows");
+            let agent_ranked_keys: Vec<&str> =
+                agent_ranked.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                agent_ranked_keys,
+                vec!["win:agent:in"],
+                "the agent-scoped ranked recall must return ONLY the in-window agent row"
+            );
+
+            let agent_recency = memory
+                .recall_for_agents(&[&agent], "*", 50, None, Some(&since), Some(&until))
+                .await
+                .expect("the time-bound agent-scoped recency recall must bind and return rows");
+            let agent_recency_keys: Vec<&str> =
+                agent_recency.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                agent_recency_keys,
+                vec!["win:agent:in"],
+                "the agent-scoped recency recall must return ONLY the in-window agent row"
+            );
+        });
+    }
+
+    /// Live companion to the window test: a MALFORMED time bound fails
+    /// LOUDLY with an error naming the bound — never a silent drop of the
+    /// window (the T2 export precedent: the old string-compare silently
+    /// produced an empty export; an unparseable bound must not degrade a
+    /// bounded recall into an unbounded one either).
+    ///
+    /// RED (2026-11-19): the pre-fix failure was the wire-bind error
+    /// ("cannot convert between the Rust type `Option<&str>` and the
+    /// Postgres type `timestamptz`") — an Err of the WRONG class, naming no
+    /// bound; the assertions below pin the parse-error class.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_recall_malformed_since_fails_loudly() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "badbound");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+
+        runtime.block_on(async {
+            // The ranked path: the parse guard sits at the recall() seam,
+            // shared by both paths.
+            let err = memory
+                .recall("anything", 5, None, Some("not-a-timestamp"), None)
+                .await
+                .expect_err("a malformed since bound must fail loudly");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("invalid RFC 3339 time bound"),
+                "the error must name the defect class; got: {msg}"
+            );
+            assert!(
+                msg.contains("not-a-timestamp"),
+                "the error must name the offending bound; got: {msg}"
+            );
+
+            // The recency path: a malformed until fails the same way.
+            let err = memory
+                .recall("*", 5, None, None, Some("2026-13-45T99:99:99Z"))
+                .await
+                .expect_err("a malformed until bound must fail loudly");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("invalid RFC 3339 time bound"),
+                "the recency path must fail loudly too; got: {msg}"
             );
         });
     }
