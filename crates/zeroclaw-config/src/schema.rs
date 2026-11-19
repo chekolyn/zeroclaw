@@ -15831,6 +15831,12 @@ pub struct ReliabilityConfig {
     /// Base backoff (ms) for model_provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
+    /// Per-wait ceiling (ms) for rate-limit-class waits.
+    #[serde(default = "default_provider_max_backoff_ms")]
+    pub provider_max_backoff_ms: u64,
+    /// Per-call total rate-limit wait budget (ms).
+    #[serde(default = "default_provider_rate_limit_budget_ms")]
+    pub provider_rate_limit_budget_ms: u64,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -15860,6 +15866,14 @@ fn default_provider_backoff_ms() -> u64 {
     500
 }
 
+fn default_provider_max_backoff_ms() -> u64 {
+    60_000
+}
+
+fn default_provider_rate_limit_budget_ms() -> u64 {
+    300_000
+}
+
 fn default_channel_backoff_secs() -> u64 {
     2
 }
@@ -15881,6 +15895,8 @@ impl Default for ReliabilityConfig {
         Self {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
+            provider_max_backoff_ms: default_provider_max_backoff_ms(),
+            provider_rate_limit_budget_ms: default_provider_rate_limit_budget_ms(),
             api_keys: Vec::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
@@ -29682,6 +29698,42 @@ mod tests {
                 .unwrap()
                 .is_null()
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn reliability_defaults_the_provider_backoff_knobs() {
+        let reliability = ReliabilityConfig::default();
+        assert_eq!(reliability.provider_max_backoff_ms, 60_000);
+        assert_eq!(reliability.provider_rate_limit_budget_ms, 300_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn reliability_parses_the_provider_backoff_knobs() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [reliability]
+            provider_max_backoff_ms = 1234
+            provider_rate_limit_budget_ms = 5678
+            "#,
+        )
+        .expect("config with the provider backoff knobs should parse");
+        assert_eq!(config.reliability.provider_max_backoff_ms, 1234);
+        assert_eq!(config.reliability.provider_rate_limit_budget_ms, 5678);
+    }
+
+    #[::core::prelude::v1::test]
+    fn reliability_omitted_knobs_fall_back_to_defaults() {
+        // A `[reliability]` section without the two knobs must land on the
+        // same defaults a wholly-absent section produces.
+        let config: super::Config = toml::from_str(
+            r#"
+            [reliability]
+            provider_retries = 5
+            "#,
+        )
+        .expect("config with a [reliability] section should parse");
+        assert_eq!(config.reliability.provider_max_backoff_ms, 60_000);
+        assert_eq!(config.reliability.provider_rate_limit_budget_ms, 300_000);
     }
 
     #[::core::prelude::v1::test]
