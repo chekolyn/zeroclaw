@@ -499,6 +499,13 @@ ci-all = [
 incremental = true
 opt-level = 0
 
+# Dependencies: line tables only (backtraces keep file/line info, no variable/
+# type info). Slashes dep rlib size ~2-4x and speeds compiles; workspace
+# members keep full debuginfo. Keep identical on mac + Linux VM — this is part
+# of the sccache cache key. Added 2026-11-16.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "fat"          # Maximum cross-crate optimization for smaller binaries
