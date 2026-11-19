@@ -159,6 +159,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
+        name: "memory_get",
+        tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "memory_forget",
         tier: ToolTier::Core,
         compilation: BuiltinToolCompilation::Always,
@@ -733,6 +738,7 @@ mod tests {
             "git_operations",
             "memory_store",
             "memory_recall",
+            "memory_get",
             "memory_forget",
             "web_fetch",
         ]);

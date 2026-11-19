@@ -118,6 +118,7 @@ pub use zeroclaw_tools::mcp_resources_tool::McpResourcesTool;
 pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
 pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
+pub use zeroclaw_tools::memory_get::MemoryGetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 pub use zeroclaw_tools::memory_recall::MemoryRecallTool;
 pub use zeroclaw_tools::memory_store::MemoryStoreTool;
@@ -2582,6 +2583,7 @@ fn all_tools_with_runtime_on_thread(
             root_config.memory.recall_soft_timeout_ms,
         ))
     );
+    register_tool!("memory_get", Arc::new(MemoryGetTool::new(memory.clone())));
     register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
     register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
     register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
@@ -4526,7 +4528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn minimal_assembly_exposes_eleven_and_does_not_open_optional_database() {
+    async fn minimal_assembly_exposes_the_core_set_and_does_not_open_optional_database() {
         use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
@@ -4611,7 +4613,7 @@ mod tests {
             .collect();
         core.sort();
         assert_eq!(names, core);
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     fn test_config(tmp: &TempDir) -> Config {

@@ -82,6 +82,7 @@ pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_export;
 pub mod memory_forget;
+pub mod memory_get;
 pub mod memory_purge;
 pub mod memory_recall;
 pub mod memory_store;
@@ -133,6 +134,7 @@ mod coding_agent_budget_tests;
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_store",
     "memory_recall",
+    "memory_get",
     "memory_forget",
     "memory_export",
     "memory_purge",
@@ -196,6 +198,7 @@ mod memory_tool_names_guard {
                 security.clone(),
             )),
             Box::new(memory_recall::MemoryRecallTool::new(memory.clone())),
+            Box::new(memory_get::MemoryGetTool::new(memory.clone())),
             Box::new(memory_forget::MemoryForgetTool::new(
                 memory.clone(),
                 security.clone(),

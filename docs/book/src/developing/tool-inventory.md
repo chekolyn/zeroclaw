@@ -192,6 +192,7 @@ installed.
 | `git_operations` | Repository work through the runtime's Git command boundary, which wraps the same shared sandbox. |
 | `memory_store` | The write path of long-term memory, a first-party runtime contract. |
 | `memory_recall` | The read path of long-term memory. |
+| `memory_get` | The exact-key fetch of one memory's full content — the read-side companion to `memory_recall` (recall returns preview lines; get returns one key's full entry and metadata). Added 2026-11-19 beyond the FND-001 D5 baseline. |
 | `memory_forget` | The delete path, so wrong or unwanted memories can be removed. |
 | `web_fetch` | The minimal network capability: one page, returned as plain text. |
 
