@@ -117,7 +117,7 @@ fn names(assembled: &ScopedAssembled) -> BTreeSet<String> {
 }
 
 #[tokio::test]
-async fn minimal_model_catalog_is_eleven_before_optional_store_preparation() {
+async fn minimal_model_catalog_matches_the_core_const_before_optional_store_preparation() {
     let tmp = TempDir::new().unwrap();
     let mut config = fixture(&tmp);
     config.tools.optional = Vec::new();
@@ -243,6 +243,7 @@ fn full_chat_fixture_names() -> BTreeSet<String> {
         "llm_task",
         "memory_export",
         "memory_forget",
+        "memory_get",
         "memory_purge",
         "memory_recall",
         "memory_store",

@@ -12,6 +12,7 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "glob_search",
     "content_search",
     "memory_recall",
+    "memory_get",
     "memory_store",
     "memory_forget",
     "web_fetch",

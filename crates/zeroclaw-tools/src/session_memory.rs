@@ -74,8 +74,8 @@ pub fn memory_tool_over(
 ) -> Option<Arc<dyn Tool>> {
     use crate::{
         memory_export::MemoryExportTool, memory_forget::MemoryForgetTool,
-        memory_purge::MemoryPurgeTool, memory_recall::MemoryRecallTool,
-        memory_store::MemoryStoreTool,
+        memory_get::MemoryGetTool, memory_purge::MemoryPurgeTool,
+        memory_recall::MemoryRecallTool, memory_store::MemoryStoreTool,
     };
     let tool: Arc<dyn Tool> = match name {
         "memory_store" => Arc::new(MemoryStoreTool::new(
@@ -83,6 +83,7 @@ pub fn memory_tool_over(
             Arc::clone(security),
         )),
         "memory_recall" => Arc::new(MemoryRecallTool::new(Arc::clone(memory))),
+        "memory_get" => Arc::new(MemoryGetTool::new(Arc::clone(memory))),
         "memory_forget" => Arc::new(MemoryForgetTool::new(
             Arc::clone(memory),
             Arc::clone(security),
@@ -142,6 +143,7 @@ mod tests {
         for name in [
             "memory_store",
             "memory_recall",
+            "memory_get",
             "memory_forget",
             "memory_export",
             "memory_purge",

@@ -524,7 +524,11 @@ mod tests {
     fn supervised_config() -> RiskProfileConfig {
         RiskProfileConfig {
             level: AutonomyLevel::Supervised,
-            auto_approve: vec!["file_read".into(), "memory_recall".into()],
+            auto_approve: vec![
+                "file_read".into(),
+                "memory_recall".into(),
+                "memory_get".into(),
+            ],
             always_ask: vec!["shell".into()],
             ..RiskProfileConfig::default()
         }
@@ -623,6 +627,7 @@ mod tests {
         let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
+        assert!(!mgr.needs_approval("memory_get"));
     }
 
     #[test]
@@ -911,9 +916,10 @@ mod tests {
     #[test]
     fn non_interactive_auto_approve_tools_skip_approval() {
         let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        // auto_approve tools (file_read, memory_recall) should not need approval.
+        // auto_approve tools (file_read, memory_recall, memory_get) should not need approval.
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
+        assert!(!mgr.needs_approval("memory_get"));
     }
 
     #[test]

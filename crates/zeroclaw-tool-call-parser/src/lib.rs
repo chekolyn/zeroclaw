@@ -1626,6 +1626,7 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
         "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
+        "memoryget" | "memory_get" | "memget" => "memory_get",
         // HTTP variations
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
         _ => tool_name,
@@ -5475,6 +5476,7 @@ Let me check the result."#;
         assert_eq!(map_tool_name_alias("filelist"), "file_list");
         assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
         assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
+        assert_eq!(map_tool_name_alias("memoryget"), "memory_get");
         assert_eq!(map_tool_name_alias("http"), "http_request");
         assert_eq!(
             map_tool_name_alias("totally_unknown_tool"),

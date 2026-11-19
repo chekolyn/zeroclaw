@@ -8590,6 +8590,7 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
     (&["sessions_send"], &[]),
     (&["memory_store"], &["category"]),
     (&["memory_recall"], &["query", "limit"]),
+    (&["memory_get"], &["key"]),
     (&["memory_forget"], &[]),
     (
         &["memory_export"],
@@ -29866,7 +29867,7 @@ BTC is currently around $65,000 based on latest tool output."#
     /// would silently strip memory tools from every channel agent, undetected by
     /// the allow/deny-only tests. Feeds one of every canonical memory tool name
     /// (`zeroclaw_tools::MEMORY_TOOL_NAMES`) through the real assembly path and
-    /// asserts all five survive.
+    /// asserts all of them survive.
     #[tokio::test]
     async fn assemble_channel_agent_tools_keeps_memory_tools() {
         let config = Config::default();

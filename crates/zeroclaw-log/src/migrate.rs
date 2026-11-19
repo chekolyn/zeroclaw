@@ -318,7 +318,7 @@ fn category_for_action(action: &str) -> &'static str {
         "tool_call" | "tool_call_start" | "tool_call_result" => "tool",
         "channel_message_inbound" | "channel_send" => "channel",
         "cron_run" => "cron",
-        "memory_store" | "memory_recall" | "memory_forget" => "memory",
+        "memory_store" | "memory_recall" | "memory_get" | "memory_forget" => "memory",
         "session_open" | "session_close" => "session",
         "error" => "system",
         "gateway_ws_turn" => "session",
