@@ -138,6 +138,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"parse_rfc3339_bound",
         "min_count": 12,
     },
+    "memory-listing-bound": {
+        "glob": "crates/zeroclaw-api/src/memory_traits.rs",
+        "pattern": r"MEMORY_LIST_DEFAULT_LIMIT",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
