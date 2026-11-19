@@ -1132,6 +1132,37 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
     }
 }
 
+/// The session-scope predicate shared by every recall path — the
+/// durable-global carve-out, the sqlite contract ported to postgres
+/// (fusion verdict 2026-11-18, 3/3 seats; sqlite held it since 2026-07-09
+/// in `vector_search`/FTS and the hybrid stage). The caller's session
+/// binds at `session_placeholder`; rows from that session pass, and
+/// session-NULL `core`/`daily` rows — durable global knowledge, the set
+/// from [`crate::durable_global_category_names`] bound as a text array at
+/// `categories_placeholder` — are admitted from any session. Other
+/// sessions' rows (INCLUDING their session-bound `core` rows) and
+/// session-NULL rows of every other category stay excluded.
+///
+/// The `$N::TEXT IS NULL` escape keeps the session-less call shape
+/// (`session_id = None`) admitting everything, exactly as the strict
+/// predicate it replaces did — with no session asked for, the carve-out
+/// arm is subsumed. `session_id` is a conversation-scope axis, never a
+/// visibility gate.
+///
+/// Single line by construction — no `\`-newline continuations (the
+/// RECALL-RANK-WS law: Rust strips the continuation plus the next line's
+/// leading whitespace and silently fuses SQL tokens).
+fn recall_session_scope_predicate(
+    session_placeholder: usize,
+    categories_placeholder: usize,
+) -> String {
+    format!(
+        "(${session}::TEXT IS NULL OR m.session_id = ${session} OR (m.session_id IS NULL AND m.category = ANY(${categories})))",
+        session = session_placeholder,
+        categories = categories_placeholder,
+    )
+}
+
 /// The recent-entries recall: indexed recency (`idx_memories_updated_at`),
 /// NO full-text scoring. The empty-query contract (bare `*` / omitted query
 /// returns recent entries) must not pay the per-row tsvector cost of the
@@ -1140,16 +1171,28 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
 /// expressions still computed `to_tsvector` per row. This is also the
 /// degraded shape the recall budget's fallback lands on.
 ///
-/// Placeholders: `$1` session_id, `$2..` the enabled time bounds, LIMIT last.
-fn recent_recall_sql(qualified_table: &str, qualified_agents: &str, since: bool, until: bool) -> String {
+/// Carries the durable-global carve-out (see
+/// [`recall_session_scope_predicate`]): the session-scoped fallback still
+/// surfaces session-NULL `core`/`daily` knowledge.
+///
+/// Placeholders: `$1` session_id, `$2..` the enabled time bounds, then the
+/// carve-out category array, LIMIT last.
+fn recent_recall_sql(
+    qualified_table: &str,
+    qualified_agents: &str,
+    since: bool,
+    until: bool,
+) -> String {
     let time_filter = recall_time_filter(since, until, 2);
-    let limit_placeholder = 2 + usize::from(since) + usize::from(until);
+    let categories_placeholder = 2 + usize::from(since) + usize::from(until);
+    let limit_placeholder = categories_placeholder + 1;
+    let session_filter = recall_session_scope_predicate(1, categories_placeholder);
     format!(
         "
         SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
         FROM {qualified_table} m
         LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-        WHERE ($1::TEXT IS NULL OR m.session_id = $1)
+        WHERE {session_filter}
           {time_filter}
         ORDER BY m.updated_at DESC
         LIMIT ${limit_placeholder}
@@ -1157,22 +1200,31 @@ fn recent_recall_sql(qualified_table: &str, qualified_agents: &str, since: bool,
     )
 }
 
-/// The agent-scoped variant of [`recent_recall_sql`]. Placeholders: `$1` the
-/// agent allowlist, `$2..` the enabled time bounds, LIMIT last.
+/// The agent-scoped variant of [`recent_recall_sql`]. Carries the same
+/// durable-global carve-out — this is the recall budget's fallback shape for
+/// agent-scoped recalls, and the pre-fix shape DROPPED the session filter
+/// entirely here (a session-scoped recall that tripped the budget fell back
+/// to ALL sessions' rows — the budget-fallback bleed the fusion report
+/// flagged). Placeholders: `$1` the agent allowlist, `$2` session_id,
+/// `$3..` the enabled time bounds, then the carve-out category array,
+/// LIMIT last.
 fn recent_recall_sql_for_agents(
     qualified_table: &str,
     qualified_agents: &str,
     since: bool,
     until: bool,
 ) -> String {
-    let time_filter = recall_time_filter(since, until, 2);
-    let limit_placeholder = 2 + usize::from(since) + usize::from(until);
+    let time_filter = recall_time_filter(since, until, 3);
+    let categories_placeholder = 3 + usize::from(since) + usize::from(until);
+    let limit_placeholder = categories_placeholder + 1;
+    let session_filter = recall_session_scope_predicate(2, categories_placeholder);
     format!(
         "
         SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
         FROM {qualified_table} m
         LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
         WHERE m.agent_id = ANY($1)
+          AND {session_filter}
           {time_filter}
         ORDER BY m.updated_at DESC
         LIMIT ${limit_placeholder}
@@ -1202,17 +1254,20 @@ fn recall_candidate_cap(limit: usize) -> usize {
 /// The stage carries every candidate-selection predicate — the full-content
 /// FTS match (`to_tsvector('simple', m.key || ' ' || m.content)`, the
 /// deep-match contract: a term match beyond the 4096-char rank prefix still
-/// surfaces the row, ranking by its key arm instead), the session scoping,
-/// the agent-scoped allowlist when present, and the enabled time bounds —
-/// ordered by recency (`m.updated_at DESC`) and closed by the cap LIMIT.
-/// The rank expression, the score ORDER BY and the result LIMIT follow the
-/// candidate join.
+/// surfaces the row, ranking by its key arm instead), the session scoping
+/// with the durable-global carve-out
+/// ([`recall_session_scope_predicate`] — session-NULL `core`/`daily` rows
+/// are recallable from any session), the agent-scoped allowlist when
+/// present, and the enabled time bounds — ordered by recency
+/// (`m.updated_at DESC`) and closed by the cap LIMIT. The rank expression,
+/// the score ORDER BY and the result LIMIT follow the candidate join.
 ///
-/// Bind layouts (the cap slot binds before the time bounds):
+/// Bind layouts (the cap slot binds before the time bounds; the carve-out
+/// category array binds after them, LIMIT stays the outer `$3`):
 /// - unscoped: `$1` query / `$2` session / `$3` result limit / `$4` cap /
-///   `$5..` time;
+///   `$5..` time / categories last;
 /// - agent-scoped: `$1` query / `$2` session / `$3` result limit / `$4`
-///   allowlist / `$5` cap / `$6..` time.
+///   allowlist / `$5` cap / `$6..` time / categories last.
 ///
 /// `$1` is the query in BOTH the stage filter and the rank expression
 /// ([`recall_rank_expression`] hardcodes it) — the layouts keep that
@@ -1226,7 +1281,10 @@ fn ranked_recall_sql(
     until: bool,
 ) -> String {
     let cap_placeholder = if agent_scoped { 5 } else { 4 };
-    let time_filter = recall_time_filter(since, until, cap_placeholder + 1);
+    let first_time_placeholder = cap_placeholder + 1;
+    let time_filter = recall_time_filter(since, until, first_time_placeholder);
+    let categories_placeholder = first_time_placeholder + usize::from(since) + usize::from(until);
+    let session_filter = recall_session_scope_predicate(2, categories_placeholder);
     let allowlist_filter = if agent_scoped {
         "\n          AND m.agent_id = ANY($4)"
     } else {
@@ -1239,7 +1297,7 @@ fn ranked_recall_sql(
                    m.agent_id, m.namespace, m.importance, m.updated_at
             FROM {qualified_table} m
             WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
-              AND ($2::TEXT IS NULL OR m.session_id = $2){allowlist_filter}
+              AND {session_filter}{allowlist_filter}
               {time_filter}
             ORDER BY m.updated_at DESC
             LIMIT ${cap_placeholder}
@@ -1392,6 +1450,7 @@ impl Memory for PostgresMemory {
         // Empty-query fast path: the bare `*` / omitted-query contract is an
         // indexed recency read, not a full-text scan.
         if query.is_empty() {
+            let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
                 pool.with(|client| {
                     let since_ref = since_owned.as_deref();
@@ -1407,10 +1466,16 @@ impl Memory for PostgresMemory {
                     let limit_i64 = limit as i64;
 
                     let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(&stmt, &[&sid, &s, &u, &limit_i64])?,
-                        (Some(s), None) => client.query(&stmt, &[&sid, &s, &limit_i64])?,
-                        (None, Some(u)) => client.query(&stmt, &[&sid, &u, &limit_i64])?,
-                        (None, None) => client.query(&stmt, &[&sid, &limit_i64])?,
+                        (Some(s), Some(u)) => {
+                            client.query(&stmt, &[&sid, &s, &u, &categories, &limit_i64])?
+                        }
+                        (Some(s), None) => {
+                            client.query(&stmt, &[&sid, &s, &categories, &limit_i64])?
+                        }
+                        (None, Some(u)) => {
+                            client.query(&stmt, &[&sid, &u, &categories, &limit_i64])?
+                        }
+                        (None, None) => client.query(&stmt, &[&sid, &categories, &limit_i64])?,
                     };
                     rows.iter()
                         .map(Self::row_to_entry)
@@ -1424,6 +1489,7 @@ impl Memory for PostgresMemory {
         let attempt_timeout = self.recall_soft_timeout;
         let op_timeout = self.op_timeout;
         let cap = recall_candidate_cap(limit);
+        let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             pool.with(|client| {
@@ -1447,18 +1513,20 @@ impl Memory for PostgresMemory {
                 // that gives up leaves no orphan holding the pooled connection.
                 with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => {
-                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &s, &u])?
-                        }
-                        (Some(s), None) => {
-                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &s])?
-                        }
-                        (None, Some(u)) => {
-                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &u])?
-                        }
-                        (None, None) => {
-                            client.query(&stmt, &[&query, &sid, &limit_i64, &cap_i64])?
-                        }
+                        (Some(s), Some(u)) => client.query(
+                            &stmt,
+                            &[&query, &sid, &limit_i64, &cap_i64, &s, &u, &categories],
+                        )?,
+                        (Some(s), None) => client.query(
+                            &stmt,
+                            &[&query, &sid, &limit_i64, &cap_i64, &s, &categories],
+                        )?,
+                        (None, Some(u)) => client.query(
+                            &stmt,
+                            &[&query, &sid, &limit_i64, &cap_i64, &u, &categories],
+                        )?,
+                        (None, None) => client
+                            .query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &categories])?,
                     };
                     rows.iter()
                         .map(Self::row_to_entry)
@@ -1852,7 +1920,11 @@ impl Memory for PostgresMemory {
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
         // Empty-query fast path: indexed recency within the agent allowlist.
+        // Carries the caller's session + the durable-global carve-out — the
+        // budget-fallback bleed fix (the pre-fix shape dropped the session
+        // filter entirely on this path).
         if q.is_empty() {
+            let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
             return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
                 pool.with(|client| {
                     let since_ref = since_owned.as_deref();
@@ -1867,14 +1939,18 @@ impl Memory for PostgresMemory {
                     #[allow(clippy::cast_possible_wrap)]
                     let limit_i64 = limit as i64;
 
-                    let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => {
-                            client.query(&stmt, &[&allowed, &s, &u, &limit_i64])?
-                        }
-                        (Some(s), None) => client.query(&stmt, &[&allowed, &s, &limit_i64])?,
-                        (None, Some(u)) => client.query(&stmt, &[&allowed, &u, &limit_i64])?,
-                        (None, None) => client.query(&stmt, &[&allowed, &limit_i64])?,
-                    };
+                    let rows =
+                        match (since_ref, until_ref) {
+                            (Some(s), Some(u)) => client
+                                .query(&stmt, &[&allowed, &sid, &s, &u, &categories, &limit_i64])?,
+                            (Some(s), None) => client
+                                .query(&stmt, &[&allowed, &sid, &s, &categories, &limit_i64])?,
+                            (None, Some(u)) => client
+                                .query(&stmt, &[&allowed, &sid, &u, &categories, &limit_i64])?,
+                            (None, None) => {
+                                client.query(&stmt, &[&allowed, &sid, &categories, &limit_i64])?
+                            }
+                        };
                     rows.iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
@@ -1887,6 +1963,7 @@ impl Memory for PostgresMemory {
         let attempt_timeout = self.recall_soft_timeout;
         let op_timeout = self.op_timeout;
         let cap = recall_candidate_cap(limit);
+        let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
 
         run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
             pool.with(|client| {
@@ -1910,17 +1987,31 @@ impl Memory for PostgresMemory {
                 // that gives up leaves no orphan holding the pooled connection.
                 with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
                     let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client
-                            .query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s, &u])?,
-                        (Some(s), None) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s])?
-                        }
-                        (None, Some(u)) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64, &u])?
-                        }
-                        (None, None) => {
-                            client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &cap_i64])?
-                        }
+                        (Some(s), Some(u)) => client.query(
+                            &stmt,
+                            &[
+                                &q,
+                                &sid,
+                                &limit_i64,
+                                &allowed,
+                                &cap_i64,
+                                &s,
+                                &u,
+                                &categories,
+                            ],
+                        )?,
+                        (Some(s), None) => client.query(
+                            &stmt,
+                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s, &categories],
+                        )?,
+                        (None, Some(u)) => client.query(
+                            &stmt,
+                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &u, &categories],
+                        )?,
+                        (None, None) => client.query(
+                            &stmt,
+                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &categories],
+                        )?,
                     };
                     rows.iter()
                         .map(Self::row_to_entry)
@@ -1991,10 +2082,21 @@ mod tests {
             sql.contains("ORDER BY m.updated_at DESC"),
             "recency ordering rides the updated_at index"
         );
-        assert!(sql.contains("LEFT JOIN mem.agents"), "agent alias join kept");
-        assert!(sql.contains("$1::TEXT IS NULL OR m.session_id = $1"));
+        assert!(
+            sql.contains("LEFT JOIN mem.agents"),
+            "agent alias join kept"
+        );
+        assert!(
+            sql.contains(
+                "($1::TEXT IS NULL OR m.session_id = $1 OR (m.session_id IS NULL AND m.category = ANY($3)))",
+            ),
+            "the session predicate carries the durable-global carve-out (session-NULL core/daily admitted), got: {sql}"
+        );
         assert!(sql.contains("m.created_at >= $2::TIMESTAMPTZ"));
-        assert!(sql.contains("LIMIT $3"), "since bound → limit at $3, got: {sql}");
+        assert!(
+            sql.contains("LIMIT $4"),
+            "since bound → categories at $3, limit at $4, got: {sql}"
+        );
     }
 
     #[test]
@@ -2002,9 +2104,51 @@ mod tests {
         let sql = recent_recall_sql_for_agents("mem.memories", "mem.agents", true, true);
         assert!(!sql.contains("to_tsvector"));
         assert!(sql.contains("m.agent_id = ANY($1)"));
-        assert!(sql.contains("m.created_at >= $2::TIMESTAMPTZ"));
-        assert!(sql.contains("m.created_at <= $3::TIMESTAMPTZ"));
-        assert!(sql.contains("LIMIT $4"), "both time bounds → limit at $4, got: {sql}");
+        assert!(
+            sql.contains("(m.session_id IS NULL AND m.category = ANY($5))"),
+            "the agent-scoped recency path carries the durable-global carve-out with the categories array at $5, got: {sql}"
+        );
+        assert!(sql.contains("m.created_at >= $3::TIMESTAMPTZ"));
+        assert!(sql.contains("m.created_at <= $4::TIMESTAMPTZ"));
+        assert!(
+            sql.contains("LIMIT $6"),
+            "both time bounds → limit at $6, got: {sql}"
+        );
+    }
+
+    /// The budget-fallback bleed pin (the fusion verdict 2026-11-18): the
+    /// agent-scoped recency path is the recall budget's fallback shape —
+    /// `BudgetedMemory::recall_for_agents` degrades to
+    /// `recall_for_agents(.., "", ..)` carrying the caller's session — so it
+    /// MUST carry the same session-scope predicate as every other recall
+    /// path: the caller's session plus the durable-global carve-out
+    /// (session-NULL `core`/`daily`). The pre-fix shape dropped the session
+    /// filter entirely — a session-scoped recall that tripped the budget
+    /// fell back to ALL sessions' rows (the bleed).
+    #[test]
+    fn recent_recall_for_agents_carries_the_durable_global_predicate() {
+        let sql = recent_recall_sql_for_agents("mem.memories", "mem.agents", true, true);
+        assert!(
+            sql.contains("m.agent_id = ANY($1)"),
+            "the allowlist stays at $1, got: {sql}"
+        );
+        assert!(
+            sql.contains("m.session_id = $2"),
+            "the budget fallback must keep the caller's session scope, got: {sql}"
+        );
+        assert!(
+            sql.contains("(m.session_id IS NULL AND m.category = ANY("),
+            "the durable-global carve-out must ride the agent-scoped recency path, got: {sql}"
+        );
+        assert!(
+            sql.contains("m.created_at >= $3::TIMESTAMPTZ")
+                && sql.contains("m.created_at <= $4::TIMESTAMPTZ"),
+            "the session bind shifts the time bounds to $3/$4, got: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT $6"),
+            "allowlist + session + both bounds → limit at $6, got: {sql}"
+        );
     }
 
     // Tuning cycle 5: the prefix enumeration must be an index-assisted,
@@ -2294,8 +2438,10 @@ mod tests {
             "the full-content FTS predicate must stay INSIDE the candidate stage (the deep-match contract)"
         );
         let session_at = sql
-            .find("$2::TEXT IS NULL OR m.session_id = $2")
-            .expect("the session predicate must be present");
+            .find(
+                "($2::TEXT IS NULL OR m.session_id = $2 OR (m.session_id IS NULL AND m.category = ANY($6)))",
+            )
+            .expect("the session predicate must be present with the durable-global carve-out");
         assert!(
             session_at < rank_at,
             "the session predicate rides the stage"
@@ -2425,9 +2571,11 @@ mod tests {
     }
 
     /// The bind layouts, pinned numerically: unscoped $1 query / $2 session /
-    /// $3 result limit / $4 cap / $5.. time; agent-scoped $1 query / $2
-    /// session / $3 result limit / $4 allowlist / $5 cap / $6.. time. The
-    /// cap slot binds before the time bounds in both variants.
+    /// $3 result limit / $4 cap / $5.. time / categories last; agent-scoped
+    /// $1 query / $2 session / $3 result limit / $4 allowlist / $5 cap /
+    /// $6.. time / categories last. The cap slot binds before the time
+    /// bounds in both variants, and the durable-global carve-out category
+    /// array binds after them (the LIMIT stays the outer $3).
     #[test]
     fn ranked_recall_sql_placeholder_layout_pins_cap_before_time_bounds() {
         let unscoped = ranked_recall_sql("mem.memories", "mem.agents", false, true, true);
@@ -2439,6 +2587,10 @@ mod tests {
             unscoped.contains("m.created_at >= $5::TIMESTAMPTZ")
                 && unscoped.contains("m.created_at <= $6::TIMESTAMPTZ"),
             "the unscoped time bounds shift 4→5, got: {unscoped}"
+        );
+        assert!(
+            unscoped.contains("(m.session_id IS NULL AND m.category = ANY($7))"),
+            "the unscoped carve-out category array binds at $7 (after both time bounds), got: {unscoped}"
         );
         assert!(
             unscoped.contains("LIMIT $3"),
@@ -2458,6 +2610,10 @@ mod tests {
             scoped.contains("m.created_at >= $6::TIMESTAMPTZ")
                 && scoped.contains("m.created_at <= $7::TIMESTAMPTZ"),
             "the agent-scoped time bounds shift 5→6, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("(m.session_id IS NULL AND m.category = ANY($8))"),
+            "the agent-scoped carve-out category array binds at $8, got: {scoped}"
         );
         assert!(
             scoped.contains("LIMIT $3"),
@@ -3075,6 +3231,244 @@ mod tests {
                     .iter()
                     .map(|e| (e.key.as_str(), e.content.as_str()))
                     .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// The durable-global carve-out, ported to postgres (the sqlite contract,
+    /// fusion verdict 2026-11-18, 3/3 seats): a session-scoped recall admits
+    /// session-NULL `core`/`daily` rows — durable global knowledge — while
+    /// session-NULL rows of every other category and other sessions' rows
+    /// (INCLUDING their `core` rows: a session-bound core row is NOT
+    /// durable-global) stay excluded; a session-less recall (`session_id =
+    /// None`) admits everything. Both recall builders carry the predicate:
+    /// the ranked path (a non-empty query) and the recent path (the empty
+    /// query — the recall budget's fallback shape).
+    ///
+    /// RED baseline: the strict session predicate excluded every
+    /// session-NULL row, so the global core/daily rows never came back.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_session_scoped_recall_includes_durable_global_rows() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "durglob");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let seeds: [(&str, &str, MemoryCategory, Option<&str>); 6] = [
+                ("glob:core", "orbital telemetry from the core vault", MemoryCategory::Core, None),
+                ("glob:daily", "orbital telemetry daily rotation note", MemoryCategory::Daily, None),
+                (
+                    "glob:custom",
+                    "orbital telemetry custom bucket note",
+                    MemoryCategory::Custom("notes".into()),
+                    None,
+                ),
+                (
+                    "other:core",
+                    "orbital telemetry bound to its origin session",
+                    MemoryCategory::Core,
+                    Some("other-session"),
+                ),
+                (
+                    "other:chat",
+                    "orbital telemetry in another chat",
+                    MemoryCategory::Conversation,
+                    Some("other-session"),
+                ),
+                (
+                    "mine:chat",
+                    "orbital telemetry in my chat",
+                    MemoryCategory::Conversation,
+                    Some("sess-1"),
+                ),
+            ];
+            for (key, content, category, session) in seeds {
+                memory.store(key, content, category, session).await.unwrap();
+            }
+
+            let expected_scoped = ["glob:core", "glob:daily", "mine:chat"];
+            let expected_all = [
+                "glob:core",
+                "glob:custom",
+                "glob:daily",
+                "mine:chat",
+                "other:chat",
+                "other:core",
+            ];
+
+            for (label, query) in [("ranked", "orbital"), ("recent", "")] {
+                let scoped = memory
+                    .recall(query, 10, Some("sess-1"), None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label} session-scoped recall must succeed: {e}"));
+                let mut keys: Vec<&str> =
+                    scoped.iter().map(|e| e.key.as_str()).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys, expected_scoped,
+                    "{label}: session scope must admit exactly the session's rows plus the session-NULL core/daily carve-out"
+                );
+
+                let unscoped = memory
+                    .recall(query, 10, None, None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label} session-less recall must succeed: {e}"));
+                let mut keys: Vec<&str> =
+                    unscoped.iter().map(|e| e.key.as_str()).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys, expected_all,
+                    "{label}: a session-less recall must admit everything (session_id is a conversation-scope axis, never a visibility gate)"
+                );
+            }
+        });
+    }
+
+    /// The cross-backend parity pin: the SAME seeded fixture recalled through
+    /// the sqlite backend AND the postgres backend returns the SAME key set,
+    /// so the two backends' durable-global carve-out contracts can never
+    /// diverge again (the carve-out was decided in sqlite and missed in the
+    /// postgres migration — this test pins the parity that was lost).
+    ///
+    /// The sqlite half runs on the stock Noop embedder (the BM25-only path —
+    /// the fleet's `search_mode = "bm25"`); the postgres half runs the ranked
+    /// path. Same query, same session, same seeded rows → same admitted set.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn sqlite_and_postgres_recall_admit_the_same_durable_global_set() {
+        use crate::sqlite::SqliteMemory;
+        use tempfile::TempDir;
+
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "parity");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let seeds: [(&str, &str, MemoryCategory, Option<&str>); 6] = [
+            (
+                "glob:core",
+                "orbital telemetry from the core vault",
+                MemoryCategory::Core,
+                None,
+            ),
+            (
+                "glob:daily",
+                "orbital telemetry daily rotation note",
+                MemoryCategory::Daily,
+                None,
+            ),
+            (
+                "glob:custom",
+                "orbital telemetry custom bucket note",
+                MemoryCategory::Custom("notes".into()),
+                None,
+            ),
+            (
+                "other:core",
+                "orbital telemetry bound to its origin session",
+                MemoryCategory::Core,
+                Some("other-session"),
+            ),
+            (
+                "other:chat",
+                "orbital telemetry in another chat",
+                MemoryCategory::Conversation,
+                Some("other-session"),
+            ),
+            (
+                "mine:chat",
+                "orbital telemetry in my chat",
+                MemoryCategory::Conversation,
+                Some("sess-1"),
+            ),
+        ];
+
+        let sqlite_keys = {
+            let tmp = TempDir::new().unwrap();
+            let memory = SqliteMemory::new("parity", tmp.path()).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for (key, content, category, session) in seeds.iter() {
+                    memory
+                        .store(key, content, category.clone(), *session)
+                        .await
+                        .unwrap();
+                }
+                let recalled = memory
+                    .recall("orbital", 10, Some("sess-1"), None, None)
+                    .await
+                    .expect("the sqlite recall must succeed");
+                let mut keys: Vec<String> = recalled.iter().map(|e| e.key.clone()).collect();
+                keys.sort();
+                keys
+            })
+        };
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            for (key, content, category, session) in seeds.iter() {
+                memory
+                    .store(key, content, category.clone(), *session)
+                    .await
+                    .unwrap();
+            }
+            let recalled = memory
+                .recall("orbital", 10, Some("sess-1"), None, None)
+                .await
+                .expect("the postgres ranked recall must succeed");
+            let mut postgres_keys: Vec<&str> = recalled.iter().map(|e| e.key.as_str()).collect();
+            postgres_keys.sort_unstable();
+
+            assert_eq!(
+                sqlite_keys, postgres_keys,
+                "the two backends must admit the same rows under the same session scope"
+            );
+            assert_eq!(
+                postgres_keys,
+                ["glob:core", "glob:daily", "mine:chat"],
+                "the parity set is the carve-out contract: the session's rows plus session-NULL core/daily"
             );
         });
     }

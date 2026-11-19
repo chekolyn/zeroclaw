@@ -19,6 +19,29 @@ pub const RECALL_CANDIDATE_FLOOR: usize = 500;
 /// limit clamp under the ungated tools build.
 pub const POSTGRES_RECALL_CANDIDATE_CAP: usize = 2000;
 
+/// The categories whose session-NULL rows are durable global knowledge: a
+/// `core`/`daily` row with no session binding is long-term knowledge meant
+/// to be recallable from any session, not a per-session artifact. Rows that
+/// DO carry a session binding (consolidation keeps a survivor's
+/// `session_id` even on `core` rows) stay session-scoped, as do
+/// `conversation` and custom categories.
+///
+/// Single source of truth for the carve-out (the sqlite contract, promoted
+/// out of `SqliteMemory` and ported to postgres 2026-11-18 — the fusion
+/// session-scope program): both backends' recall predicates derive their
+/// category sets from this slice, so the set is never spelled twice.
+pub fn durable_global_category_names() -> [&'static str; 2] {
+    ["core", "daily"]
+}
+
+/// Whether a row is durable global knowledge: a `core`/`daily` row with no
+/// session binding (see [`durable_global_category_names`]). The category is
+/// given by its stored name — each backend's own category-to-name mapping
+/// feeds this predicate, so the string spelling lives in exactly one place.
+pub fn is_durable_global_row(category_name: &str, session_id: Option<&str>) -> bool {
+    session_id.is_none() && durable_global_category_names().contains(&category_name)
+}
+
 pub mod agent_scoped;
 pub mod agent_scoped_markdown;
 pub mod audit;
@@ -3351,6 +3374,30 @@ url = "http://localhost:6333"
                 .len(),
             1,
             "a current-thread runtime must construct, cache, and serve memory ops"
+        );
+    }
+
+    /// The single home of the durable-global carve-out set (the sqlite
+    /// contract, promoted out of `SqliteMemory` so postgres ports it without
+    /// a second spelling): exactly `core` and `daily`, and only SESSION-NULL
+    /// rows of those categories are durable global.
+    #[test]
+    fn durable_global_carve_out_set_pins_core_and_daily() {
+        assert_eq!(
+            durable_global_category_names(),
+            ["core", "daily"],
+            "the carve-out set is exactly core and daily — the sqlite contract"
+        );
+        assert!(is_durable_global_row("core", None));
+        assert!(is_durable_global_row("daily", None));
+        assert!(
+            !is_durable_global_row("notes", None),
+            "custom categories stay session-scoped even when session-NULL"
+        );
+        assert!(!is_durable_global_row("conversation", None));
+        assert!(
+            !is_durable_global_row("core", Some("sess-1")),
+            "session-bound rows stay session-scoped (consolidation keeps a survivor's session_id even on core rows)"
         );
     }
 }

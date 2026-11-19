@@ -1426,4 +1426,151 @@ mod tests {
         assert!(result.output.contains("Rust"));
         assert!(!result.output.contains("SOP runbook"));
     }
+
+    /// The tool-plane session-scope guard (the fusion session-scope program,
+    /// Candidate B's pins, 2026-11-18): the `memory_recall` tool is
+    /// SESSION-LESS — its execute passes `session_id = None` to the backend
+    /// on BOTH call paths (the filtered default and the `scope = "all"`
+    /// escape hatch), and its schema exposes no `session_id` parameter.
+    /// `session_id` is a conversation-scope axis set by the wrapper planes,
+    /// never a model-authored tool argument.
+    struct SessionRecordingMemory {
+        recorded: Mutex<Vec<Option<String>>>,
+    }
+
+    impl SessionRecordingMemory {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                recorded: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Memory for SessionRecordingMemory {
+        fn name(&self) -> &str {
+            "session-recording"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push(session_id.map(String::from));
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for SessionRecordingMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "SessionRecordingMemory"
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_execute_passes_session_none_to_the_backend_on_both_scopes() {
+        let mem = SessionRecordingMemory::new();
+        let tool = MemoryRecallTool::new_with_excludes(mem.clone(), RecallExcludes::default());
+
+        // The filtered default path (recall_filtered)...
+        tool.execute(json!({"query": "anything"})).await.unwrap();
+        // ...and the scope=all escape hatch (recall) — both session-less.
+        tool.execute(json!({"query": "anything", "scope": "all"}))
+            .await
+            .unwrap();
+
+        let recorded = mem.recorded.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![None, None],
+            "the recall tool must pass session_id=None to the backend on both call paths"
+        );
+    }
+
+    #[test]
+    fn recall_tool_schema_hides_session_scope() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("session_id")
+                .is_none(),
+            "the tool plane is session-less — the schema must not expose a session_id parameter, got: {}",
+            tool.parameters_schema()
+        );
+    }
 }

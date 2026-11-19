@@ -128,6 +128,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"ConnectionPool",
         "min_count": 10,
     },
+    "memory-durable-global": {
+        "glob": "crates/zeroclaw-memory/src/lib.rs",
+        "pattern": r"durable_global_category_names",
+        "min_count": 4,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt

@@ -511,24 +511,6 @@ impl SqliteMemory {
         }
     }
 
-    /// The categories whose session-NULL rows are durable global knowledge
-    /// (see [`Self::is_durable_global_row`]). Single source of truth for
-    /// the carve-out: the SQL predicate in [`Self::vector_search`] derives
-    /// its bind parameters from this slice via `category_to_str`, so the
-    /// set is never spelled twice.
-    const DURABLE_GLOBAL_CATEGORIES: [MemoryCategory; 2] =
-        [MemoryCategory::Core, MemoryCategory::Daily];
-
-    /// Whether a row is durable global knowledge: a `core`/`daily` row with
-    /// no session binding is long-term knowledge meant to be recallable
-    /// from any session, not a per-session artifact. Rows that DO carry a
-    /// session binding (consolidation keeps a survivor's `session_id` even
-    /// on `core` rows) stay session-scoped, as do `conversation` and custom
-    /// categories.
-    fn is_durable_global_row(category: &MemoryCategory, session_id: Option<&str>) -> bool {
-        session_id.is_none() && Self::DURABLE_GLOBAL_CATEGORIES.contains(category)
-    }
-
     fn decode_kind(raw: Option<String>) -> Option<super::traits::MemoryKind> {
         raw.and_then(|kind| serde_json::from_str(&kind).ok())
     }
@@ -759,7 +741,8 @@ impl SqliteMemory {
         let mut param_idx = 2;
 
         if let Some(sid) = session_id {
-            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+            let categories = crate::durable_global_category_names();
+            let category_placeholders = categories
                 .iter()
                 .enumerate()
                 .map(|(offset, _)| format!("?{}", param_idx + 1 + offset))
@@ -771,10 +754,10 @@ impl SqliteMemory {
                  (m.session_id IS NULL AND m.category IN ({category_placeholders})))"
             );
             param_values.push(Box::new(sid.to_string()));
-            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
-                param_values.push(Box::new(Self::category_to_str(category)));
+            for name in categories {
+                param_values.push(Box::new(name));
             }
-            param_idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+            param_idx += 1 + categories.len();
         }
         if let Some(allowed_agent_ids) = allowed_agent_ids
             && !allowed_agent_ids.is_empty()
@@ -867,7 +850,7 @@ impl SqliteMemory {
     /// when the caller already knows the scope of relevant memories.
     ///
     /// A `session_id` filter still admits durable global rows (see
-    /// `Self::is_durable_global_row`): global `core`/`daily` facts must be
+    /// [`crate::is_durable_global_row`]): global `core`/`daily` facts must be
     /// semantically recallable from sessions that did not write them, while
     /// session-bound rows from other sessions stay excluded.
     pub fn vector_search(
@@ -916,7 +899,8 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+            let categories = crate::durable_global_category_names();
+            let category_placeholders = categories
                 .iter()
                 .enumerate()
                 .map(|(offset, _)| format!("?{}", idx + 1 + offset))
@@ -927,10 +911,10 @@ impl SqliteMemory {
                 " AND (session_id = ?{idx} OR (session_id IS NULL AND category IN ({category_placeholders})))"
             );
             param_values.push(Box::new(sid.to_string()));
-            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
-                param_values.push(Box::new(Self::category_to_str(category)));
+            for name in categories {
+                param_values.push(Box::new(name));
             }
-            idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+            idx += 1 + categories.len();
         }
         if let Some(allowed_agent_ids) = allowed_agent_ids
             && !allowed_agent_ids.is_empty()
@@ -1114,7 +1098,11 @@ impl SqliteMemory {
             // The vector stage is live only when an embedder produced a query
             // vector; it selects the scoped FTS variant. The BM25-only path
             // (stock `embedding_provider = "none"` => Noop embedder, and
-            // explicit `search_mode = "bm25"`) keeps its strict session filter.
+            // explicit `search_mode = "bm25"`) filters through the same
+            // Rust-side session predicate below — the durable-global
+            // carve-out holds on both paths alike (the vector_live gate was
+            // removed 2026-11-18: which stage surfaced a row must not decide
+            // its visibility).
             let vector_live = query_embedding.is_some();
 
             // FTS5 BM25 keyword search (skip for embedding-only mode)
@@ -1301,18 +1289,21 @@ impl SqliteMemory {
                             agent_alias: alias,
                             agent_id: aid,
                         };
-                        // Session filter for the hybrid stage. With a live
-                        // vector stage, durable global rows are exempt so
-                        // they reach recall from any session, whichever
-                        // stage (vector or keyword) surfaced them; the
-                        // BM25-only path keeps the strict legacy filter.
+                        // Session filter for the hybrid stage. The
+                        // durable-global carve-out holds on BOTH stage
+                        // shapes (vector-live and BM25-only — the
+                        // vector_live gate removed 2026-11-18, the sqlite
+                        // contract): session-NULL core/daily rows reach
+                        // recall from any session, whichever stage
+                        // surfaced them; session-bound rows from other
+                        // sessions and session-NULL rows of every other
+                        // category stay excluded.
                         if let Some(filter_sid) = session_ref
                             && entry.session_id.as_deref() != Some(filter_sid)
-                            && !(vector_live
-                                && Self::is_durable_global_row(
-                                    &entry.category,
-                                    entry.session_id.as_deref(),
-                                ))
+                            && !crate::is_durable_global_row(
+                                &SqliteMemory::category_to_str(&entry.category),
+                                entry.session_id.as_deref(),
+                            )
                         {
                             continue;
                         }
@@ -4384,11 +4375,21 @@ mod tests {
     }
 
     /// With the stock Noop embedder (vector stage never runs), session-scoped
-    /// recall keeps the strict legacy filter (global core rows stay out) and
-    /// batch-max normalizes keyword scores onto [0, 1] so downstream relevance
-    /// thresholding and the injection rerank stage see one calibrated scale.
+    /// recall still admits the durable-global carve-out rows — the carve-out
+    /// holds on the BM25-only path too (the vector_live gate removed
+    /// 2026-11-18; `session_id` is a conversation-scope axis, never a
+    /// visibility gate, so a session-NULL `core` fact recallable from any
+    /// session cannot depend on which search stage surfaced it) — and
+    /// batch-max normalizes keyword scores onto [0, 1] so downstream
+    /// relevance thresholding and the injection rerank stage see one
+    /// calibrated scale.
+    ///
+    /// History: pinned the strict legacy filter until the durable-global
+    /// carve-out contract was adjudicated (fusion 2026-11-18, 3/3 seats);
+    /// the pin was FLIPPED deliberately to the carve-out contract — the
+    /// strict BM25-only behavior it pinned was the defect.
     #[tokio::test]
-    async fn noop_embedder_session_recall_keeps_strict_filter_and_normalizes_scores() {
+    async fn noop_embedder_session_recall_admits_durable_global_and_normalizes_scores() {
         let (_tmp, mem) = temp_sqlite();
         mem.store(
             "vault_fact",
@@ -4421,12 +4422,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             hits.len(),
-            2,
-            "strict session filter must hold on the BM25-only path"
+            3,
+            "the durable-global carve-out must hold on the BM25-only path: the session's rows plus the session-NULL core row"
         );
         let mut keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["this_chat", "this_chat_2"]);
+        assert_eq!(
+            keys,
+            vec!["this_chat", "this_chat_2", "vault_fact"],
+            "session-scoped recall admits the session's rows plus session-NULL core/daily, nothing else"
+        );
 
         // Multi-entry normalization: BM25-only scores are batch-max normalized
         // onto [0, 1] (dividing each raw negated BM25 by the batch maximum) so
@@ -5326,14 +5331,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Recall with session-a filter returns only session-a entry
+        // Recall with session-a filter returns the session-a entry plus the
+        // durable-global session-NULL core row: the carve-out contract (the
+        // fusion session-scope program, 2026-11-18) — a session-NULL
+        // `core` fact is recallable from any session. This test pinned the
+        // strict legacy shape until then; the flip is deliberate (the same
+        // contract `session_scoped_recall_includes_durable_global_rows_when_vector_live`
+        // pins on the vector-live path).
         let results = mem
             .recall("fact", 10, Some("sess-a"), None, None)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].key, "k1");
-        assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
+        assert_eq!(results.len(), 2);
+        let mut keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["k1", "k3"]);
+        let k1 = results.iter().find(|e| e.key == "k1").unwrap();
+        assert_eq!(k1.session_id.as_deref(), Some("sess-a"));
     }
 
     #[tokio::test]
