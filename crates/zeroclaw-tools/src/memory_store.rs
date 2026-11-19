@@ -123,10 +123,11 @@ impl Tool for MemoryStoreTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
-    use zeroclaw_memory::SqliteMemory;
+    use zeroclaw_memory::{MemoryEntry, SqliteMemory};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -390,5 +391,162 @@ mod tests {
                 .contains("Rate limit exceeded")
         );
         assert!(mem.get("lang").await.unwrap().is_none());
+    }
+
+    /// The tool-plane session-scope guard (the fusion session-scope program,
+    /// Candidate B's pins, 2026-11-18): the `memory_store` tool is
+    /// SESSION-LESS — its execute passes `session_id = None` to the backend
+    /// on both the plain-store and the append path, and its schema exposes
+    /// no `session_id` parameter. A session-NULL `core`/`daily` row is the
+    /// durable-global knowledge shape; a tool-authored session binding would
+    /// silently strip rows of their carve-out eligibility.
+    struct StoreSessionRecorder {
+        recorded: Mutex<Vec<Option<String>>>,
+    }
+
+    impl StoreSessionRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                recorded: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Memory for StoreSessionRecorder {
+        fn name(&self) -> &str {
+            "store-session-recording"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push(session_id.map(String::from));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn store_append(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.store(key, content, category, session_id).await
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for StoreSessionRecorder {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "StoreSessionRecorder"
+        }
+    }
+
+    #[tokio::test]
+    async fn store_execute_passes_session_none_to_the_backend_on_both_paths() {
+        let mem = StoreSessionRecorder::new();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        tool.execute(json!({"key": "k1", "content": "c"}))
+            .await
+            .unwrap();
+        tool.execute(json!({"key": "k2", "content": "c", "append": true}))
+            .await
+            .unwrap();
+
+        let recorded = mem.recorded.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![None, None],
+            "the store tool must pass session_id=None on both the store and the append path"
+        );
+    }
+
+    #[test]
+    fn store_tool_schema_hides_session_scope() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("session_id")
+                .is_none(),
+            "the tool plane is session-less — the schema must not expose a session_id parameter, got: {}",
+            tool.parameters_schema()
+        );
     }
 }
