@@ -473,6 +473,22 @@ impl Memory for RetrievalPipeline {
         self.memory.list_prefixed(prefix, limit, session_id).await
     }
 
+    /// The filtered export window is a listing, not a recall: forward
+    /// verbatim so the backend's predicate-pushed, windowed query survives
+    /// the decorator (the default compose would route through `list` — the
+    /// unbounded full-store scan per page the export's paging exists to
+    /// avoid).
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .list_limited_filtered(filter, offset, limit)
+            .await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let result = self.memory.forget(key).await;
         // Invalidate unless the backend confirmed a no-op; a backend error
@@ -1679,6 +1695,165 @@ mod tests {
             pipeline.cache_size(),
             0,
             "a failed mutation must still invalidate the cache"
+        );
+    }
+
+    /// A backend whose filtered export window is native: the window records
+    /// its routing; the unbounded `list` must never be reached on the
+    /// export path.
+    struct ExportWindowMemory {
+        entries: Vec<MemoryEntry>,
+        filtered_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ExportWindowMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "export-window"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ExportWindowMemory {
+        fn name(&self) -> &str {
+            "export-window"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.entries.clone())
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            _filter: &ExportFilter,
+            offset: usize,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.filtered_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .entries
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The filtered export window is a LISTING, not a recall: it must
+    /// forward verbatim to the inner backend — the pushed-down predicates
+    /// and the paging window survive the decorator (the default compose
+    /// would route through `list` and unbound every page).
+    #[tokio::test]
+    async fn list_limited_filtered_forwards_verbatim_through_the_pipeline() {
+        let probe = Arc::new(ExportWindowMemory {
+            entries: vec![
+                entry("exp:one", "one", 1.0, MemoryCategory::Core, None),
+                entry("exp:two", "two", 1.0, MemoryCategory::Core, None),
+            ],
+            filtered_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Memory> = probe.clone();
+        let pipeline = RetrievalPipeline::new(inner, RetrievalConfig::default());
+
+        let filter = ExportFilter::default();
+        let page = pipeline
+            .list_limited_filtered(&filter, 0, 2)
+            .await
+            .expect("the filtered export window forwards through the pipeline");
+
+        assert_eq!(
+            probe.filtered_calls.load(Ordering::SeqCst),
+            1,
+            "the window must reach the inner backend's list_limited_filtered"
+        );
+        assert_eq!(
+            probe.list_calls.load(Ordering::SeqCst),
+            0,
+            "the export page must not ride the unbounded list compose"
+        );
+        assert_eq!(
+            page.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["exp:one", "exp:two"],
+            "the backend's page passes through the decorator verbatim"
         );
     }
 }

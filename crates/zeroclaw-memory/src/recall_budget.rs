@@ -29,7 +29,7 @@
 //! result count, and whether the result was degraded, so future measurement
 //! cycles see recall latency and breadth without new instrumentation.
 
-use crate::traits::{Memory, MemoryCategory, MemoryEntry, PrincipalScope};
+use crate::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope};
 use async_trait::async_trait;
 use std::future::Future;
 use std::sync::Arc;
@@ -386,6 +386,30 @@ impl Memory for BudgetedMemory {
         self.bounded_enumeration(
             || self.inner.list_prefixed(prefix, limit, session_id),
             "list_prefixed",
+        )
+        .await
+    }
+
+    /// The filtered export window rides the SAME wall-clock budget, applied
+    /// PER PAGE (the export tool pages the full set through this method):
+    /// a page that exceeds the budget fails bounded — an export page has no
+    /// recent-entries fallback to degrade into — and the export stays
+    /// complete via the tool's remaining pages.
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if self.disabled() {
+            return self
+                .inner
+                .list_limited_filtered(filter, offset, limit)
+                .await;
+        }
+        self.bounded_enumeration(
+            || self.inner.list_limited_filtered(filter, offset, limit),
+            "list_limited_filtered",
         )
         .await
     }
@@ -979,6 +1003,231 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(250),
             "a disabled budget must not interrupt the enumeration"
+        );
+    }
+
+    /// A backend whose filtered export window is native: `list_limited_filtered`
+    /// takes the given delay and records its calls; the unbounded `list`
+    /// must never be reached on the export path.
+    struct SlowExportMemory {
+        export_delay: Duration,
+        export_error: bool,
+        export_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+    }
+
+    impl SlowExportMemory {
+        fn new(export_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                export_delay,
+                export_error: false,
+                export_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn export_entry(key: &str) -> MemoryEntry {
+            MemoryEntry {
+                principal_id: None,
+                id: key.into(),
+                key: key.into(),
+                content: "filtered export window row".into(),
+                category: MemoryCategory::Core,
+                timestamp: "2026-11-18T00:00:00Z".into(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SlowExportMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "slow-export"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for SlowExportMemory {
+        fn name(&self) -> &str {
+            "slow-export"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            _filter: &ExportFilter,
+            _offset: usize,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.export_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.export_delay).await;
+            if self.export_error {
+                anyhow::bail!("export backend down");
+            }
+            Ok(vec![
+                Self::export_entry("exp:one"),
+                Self::export_entry("exp:two"),
+            ])
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    /// The export's filtered window rides the SAME per-call wall-clock
+    /// budget, applied PER PAGE (the tool pages the full set): a
+    /// within-budget page forwards to the backend's `list_limited_filtered`
+    /// — never the default list compose.
+    #[tokio::test]
+    async fn list_limited_filtered_within_budget_forwards_the_window() {
+        let fake = SlowExportMemory::new(Duration::ZERO);
+        let mem = BudgetedMemory::new(fake.clone(), BUDGET);
+
+        let filter = ExportFilter::default();
+        let results = mem.list_limited_filtered(&filter, 0, 10).await.unwrap();
+
+        assert_eq!(results.len(), 2, "the filtered window comes through");
+        assert_eq!(
+            fake.export_calls.load(Ordering::SeqCst),
+            1,
+            "the decorator must call the backend's list_limited_filtered"
+        );
+        assert_eq!(
+            fake.list_calls.load(Ordering::SeqCst),
+            0,
+            "the export page must not ride the unbounded list compose"
+        );
+    }
+
+    /// An over-budget export page FAILS BOUNDED — the budget wraps each
+    /// page, an export page has no recent-entries fallback to degrade into,
+    /// and the tool's remaining pages never run (the whole export errors).
+    #[tokio::test]
+    async fn list_limited_filtered_over_budget_fails_bounded() {
+        let fake = SlowExportMemory::new(Duration::from_secs(2));
+        let mem = BudgetedMemory::new(fake, BUDGET);
+        let start = Instant::now();
+
+        let filter = ExportFilter::default();
+        let result = mem.list_limited_filtered(&filter, 0, 10).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an over-budget export page must fail bounded, not return a partial window"
+        );
+        assert!(
+            result
+                .err()
+                .is_some_and(|e| e.to_string().contains("soft budget")),
+            "the bounded failure must name the soft budget"
+        );
+        assert!(
+            elapsed < BUDGET + BOUNDED_SLACK,
+            "the export page must stay bounded by the soft budget; took {elapsed:?}"
+        );
+    }
+
+    /// `soft_timeout == 0` disables the budget — the disabled contract
+    /// mirrored for the export page: byte-identical pass-through.
+    #[tokio::test]
+    async fn list_limited_filtered_disabled_budget_is_passthrough() {
+        let fake = SlowExportMemory::new(Duration::from_millis(250));
+        let mem = BudgetedMemory::new(fake, Duration::ZERO);
+        let start = Instant::now();
+
+        let filter = ExportFilter::default();
+        let results = mem.list_limited_filtered(&filter, 0, 10).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "a disabled budget must not interrupt the export page"
         );
     }
 }

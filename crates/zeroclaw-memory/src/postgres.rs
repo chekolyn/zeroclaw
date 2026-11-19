@@ -1,6 +1,8 @@
 //! PostgreSQL-backed memory implementation.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use super::traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1124,7 +1126,14 @@ fn recall_rank_expression() -> String {
 /// the text-ish types — and an unparseable bound fails LOUDLY here with the
 /// bound named, never silently dropping the window (a bounded recall that
 /// degrades into an unbounded one is the silent-recall hazard class; the
-/// same shape proven live on the export path, 2026-11-19).
+/// same shape proven live on the export path, 2026-11-19). The bound is
+/// VALIDATED and compared as an instant, never as a string — the RFC 3339
+/// string comparison mis-ordered mixed-offset spellings
+/// (`2026-01-01T01:00:00+02:00` sorts after `2026-01-01T00:00:00Z` though
+/// it is an EARLIER instant); a malformed bound fails the read loudly (the
+/// old string compare silently produced an empty export).
+/// (Rebase note: the RECALL-TIME-BOUND program authored an identical
+/// helper for the recall binds; the two collapsed to this single home.)
 fn parse_rfc3339_bound(bound: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(bound)
         .map(|dt| dt.with_timezone(&Utc))
@@ -1378,6 +1387,75 @@ fn memories_list_sql(qualified_table: &str, qualified_agents: &str, bounded: boo
 /// `list_limited` cannot push the read past the listing max.
 fn list_limited_cap(limit: usize) -> usize {
     limit.min(zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT)
+}
+
+/// Parse an RFC 3339 export bound into a `TIMESTAMPTZ` instant. The bound
+/// The filtered, windowed export projection behind
+/// [`PostgresMemory::list_limited_filtered`]: the shared listing
+/// projection with the export filter predicates pushed INTO the WHERE
+/// clause and the paging window `LIMIT $n OFFSET $n` appended.
+///
+/// Every predicate present in the filter joins the WHERE with the next
+/// sequential placeholder; predicates for ABSENT filter fields are OMITTED,
+/// not `IS NULL`-guarded (the `recall_time_filter` precedent): each hot
+/// shape plans against its own specialized statement, keeping the
+/// `created_at` range and the `updated_at` index walk available to the
+/// planner instead of forcing a generic NULL-guarded plan.
+///
+/// `since`/`until` bind as `::TIMESTAMPTZ` — the RFC 3339 string
+/// comparison the export tool's old post-filter performed mis-ordered
+/// mixed-offset spellings (`2026-01-01T01:00:00+02:00` sorts after
+/// `2026-01-01T00:00:00Z` though it is an EARLIER instant); the timestamptz
+/// bind compares instants. `ORDER BY m.updated_at DESC, m.id DESC` is TOTAL
+/// (id is the primary key), so the offset windows are repeatable: paging
+/// cannot skip or duplicate rows that share an `updated_at`.
+fn memories_list_filtered_sql(
+    qualified_table: &str,
+    qualified_agents: &str,
+    has_namespace: bool,
+    has_category: bool,
+    has_session: bool,
+    has_since: bool,
+    has_until: bool,
+) -> String {
+    let mut predicates: Vec<String> = Vec::new();
+    let mut placeholder = 1usize;
+    if has_namespace {
+        predicates.push(format!("m.namespace = ${placeholder}"));
+        placeholder += 1;
+    }
+    if has_category {
+        predicates.push(format!("m.category = ${placeholder}"));
+        placeholder += 1;
+    }
+    if has_session {
+        predicates.push(format!("m.session_id = ${placeholder}"));
+        placeholder += 1;
+    }
+    if has_since {
+        predicates.push(format!("m.created_at >= ${placeholder}::TIMESTAMPTZ"));
+        placeholder += 1;
+    }
+    if has_until {
+        predicates.push(format!("m.created_at <= ${placeholder}::TIMESTAMPTZ"));
+        placeholder += 1;
+    }
+    let limit_placeholder = placeholder;
+    let offset_placeholder = placeholder + 1;
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+    format!(
+        "
+        SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8
+        FROM {qualified_table} m
+        LEFT JOIN {qualified_agents} a ON a.id = m.agent_id{where_clause}
+        ORDER BY m.updated_at DESC, m.id DESC
+        LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}
+        "
+    )
 }
 
 /// Escape a caller-supplied prefix for the LIKE predicate: `%` and `_` are
@@ -1693,6 +1771,89 @@ impl Memory for PostgresMemory {
                 let category_ref = category.as_deref();
                 let session_ref = sid.as_deref();
                 let rows = client.query(&stmt, &[&category_ref, &session_ref, &limit_i64])?;
+                rows.iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>()
+            })
+        })
+        .await
+    }
+
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let namespace = filter.namespace.clone();
+        let category = filter.category.as_ref().map(Self::category_to_str);
+        let session_id = filter.session_id.clone();
+        // The time bounds parse to instants CLIENT-side and bind as
+        // timestamptz: a text bind cannot serialize into the
+        // server-inferred timestamptz parameter (and an unparseable bound
+        // fails loudly instead of filtering everything out).
+        let since = filter
+            .since
+            .as_deref()
+            .map(parse_rfc3339_bound)
+            .transpose()?;
+        let until = filter
+            .until
+            .as_deref()
+            .map(parse_rfc3339_bound)
+            .transpose()?;
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            pool.with(|client| {
+                let namespace_ref = namespace.as_deref();
+                let category_ref = category.as_deref();
+                let session_ref = session_id.as_deref();
+
+                // Every export predicate rides storage: the filter fields bind
+                // WHERE-side (the time bounds as TIMESTAMPTZ instants), the
+                // paging window binds LIMIT/OFFSET — a page never materializes
+                // the whole store.
+                let stmt = memories_list_filtered_sql(
+                    &qualified_table,
+                    &qualified_agents,
+                    namespace_ref.is_some(),
+                    category_ref.is_some(),
+                    session_ref.is_some(),
+                    since.is_some(),
+                    until.is_some(),
+                );
+
+                #[allow(clippy::cast_possible_wrap)]
+                let limit_i64 = limit as i64;
+                #[allow(clippy::cast_possible_wrap)]
+                let offset_i64 = offset as i64;
+
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
+                if namespace_ref.is_some() {
+                    params.push(&namespace_ref);
+                }
+                if category_ref.is_some() {
+                    params.push(&category_ref);
+                }
+                if session_ref.is_some() {
+                    params.push(&session_ref);
+                }
+                if since.is_some() {
+                    params.push(&since);
+                }
+                if until.is_some() {
+                    params.push(&until);
+                }
+                params.push(&limit_i64);
+                params.push(&offset_i64);
+
+                let rows = client.query(&stmt, &params)?;
                 rows.iter()
                     .map(Self::row_to_entry)
                     .collect::<Result<Vec<MemoryEntry>>>()
@@ -2457,6 +2618,205 @@ mod tests {
             plan.contains("idx_memories_updated_at"),
             "the listing read must be served by the updated_at index, got plan:\n{plan}"
         );
+    }
+
+    /// The filtered export window's SQL carries every export predicate in
+    /// storage: the namespace/category/session equality guards, the
+    /// since/until bounds bound as `::TIMESTAMPTZ` (never the RFC 3339
+    /// string comparison the old export post-filter performed), and the
+    /// `LIMIT/OFFSET` paging window. Predicates for absent filter fields
+    /// are OMITTED (the `recall_time_filter` precedent) so each hot shape
+    /// plans against its own specialized statement instead of a
+    /// NULL-guarded generic plan.
+    #[test]
+    fn list_limited_filtered_sql_carries_the_predicates_and_limit() {
+        let sql = memories_list_filtered_sql("m", "a", true, true, true, true, true);
+        assert!(
+            sql.contains("m.namespace = $1"),
+            "namespace rides storage: {sql}"
+        );
+        assert!(sql.contains("m.category = $2"));
+        assert!(sql.contains("m.session_id = $3"));
+        assert!(
+            sql.contains("m.created_at >= $4::TIMESTAMPTZ"),
+            "since binds as timestamptz, not a string comparison: {sql}"
+        );
+        assert!(
+            sql.contains("m.created_at <= $5::TIMESTAMPTZ"),
+            "until binds as timestamptz, not a string comparison: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT $6 OFFSET $7"),
+            "the paging window is in storage: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY m.updated_at DESC, m.id DESC"),
+            "the order is total (id tie-break) so offset windows cannot skip or duplicate rows: {sql}"
+        );
+
+        // Absent filter fields are omitted, not NULL-guarded: the bare
+        // shape has no WHERE clause at all and the window placeholders
+        // renumber to the front.
+        let bare = memories_list_filtered_sql("m", "a", false, false, false, false, false);
+        assert!(!bare.contains(" WHERE "), "no filter, no WHERE: {bare}");
+        assert!(bare.contains("LIMIT $1 OFFSET $2"));
+
+        // The purge SOP's shape — since+until only — keeps the timestamptz
+        // binds at the leading placeholders with the window behind them.
+        let window = memories_list_filtered_sql("m", "a", false, false, false, true, true);
+        assert!(window.contains("m.created_at >= $1::TIMESTAMPTZ"));
+        assert!(window.contains("m.created_at <= $2::TIMESTAMPTZ"));
+        assert!(window.contains("LIMIT $3 OFFSET $4"));
+    }
+
+    /// G3.3 — the full-set contract: the paged, predicate-pushed export's
+    /// key set is BYTE-IDENTICAL to the unbounded `list`'s key set filtered
+    /// the same way. Seed 2500 in-window rows plus 300 deep-history rows
+    /// (~400 days old, outside the window): the export pages the 2500 as
+    /// 2000 + 500 + the empty terminator page, and no deep row leaks in.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_export_paged_key_set_byte_identical_to_unbounded_list() {
+        use zeroclaw_api::memory_traits::{ExportFilter, MEMORY_LIST_MAX_LIMIT};
+
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "expbound");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        });
+        drop(runtime);
+
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        let qualified_agents = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("agents")
+        );
+        schema
+            .admin
+            .batch_execute(&format!(
+                "INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'recent_' || g, 'expbound:recent:' || g, 'recent ' || g, 'daily',
+                        NOW() - make_interval(secs => g), NOW() - make_interval(secs => g),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 2500) g;
+                 INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 SELECT 'deep_' || g, 'expbound:deep:' || g, 'deep ' || g, 'daily',
+                        NOW() - INTERVAL '400 days' - make_interval(secs => g),
+                        NOW() - INTERVAL '400 days' - make_interval(secs => g),
+                        (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)
+                 FROM generate_series(1, 300) g;
+                 ANALYZE {qualified_table};",
+            ))
+            .expect("seeding the export-paging fixture must succeed");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            // The purge SOP's shape: a since+until window. The tool's paging
+            // loop, exercised against the real backend.
+            let filter = ExportFilter {
+                since: Some("2026-01-01T00:00:00Z".into()),
+                until: Some("2027-01-01T00:00:00Z".into()),
+                ..ExportFilter::default()
+            };
+            let mut paged_keys: Vec<String> = Vec::new();
+            let mut pages = 0usize;
+            let mut offset = 0usize;
+            loop {
+                let page = memory
+                    .list_limited_filtered(&filter, offset, MEMORY_LIST_MAX_LIMIT)
+                    .await
+                    .expect("the filtered export page");
+                pages += 1;
+                let empty = page.is_empty();
+                paged_keys.extend(page.iter().map(|e| e.key.clone()));
+                if empty {
+                    break;
+                }
+                offset += MEMORY_LIST_MAX_LIMIT;
+            }
+
+            assert_eq!(
+                pages, 3,
+                "2500 in-window rows page as 2000 + 500 + the empty terminator page"
+            );
+            assert_eq!(
+                paged_keys.len(),
+                2500,
+                "no duplicates across page boundaries: every row exactly once"
+            );
+
+            // The G3.3 oracle: the UNBOUNDED list, filtered the same way —
+            // the old export's semantics (lexicographic on the entry
+            // timestamps; row_to_entry emits uniform UTC +00:00 spellings
+            // and no seeded row sits near a boundary instant, so the string
+            // oracle and the timestamptz binds partition identically).
+            let all = memory.list(None, None).await.unwrap();
+            let mut expected: Vec<String> = all
+                .iter()
+                .filter(|e| {
+                    let t = e.timestamp.as_str();
+                    t >= "2026-01-01T00:00:00Z" && t <= "2027-01-01T00:00:00Z"
+                })
+                .map(|e| e.key.clone())
+                .collect();
+            assert_eq!(
+                expected.len(),
+                2500,
+                "the oracle's own window must select exactly the 2500 recent rows"
+            );
+            expected.sort();
+            let mut paged_sorted = paged_keys;
+            paged_sorted.sort();
+            assert_eq!(
+                paged_sorted, expected,
+                "G3.3: the paged filtered export's key set is byte-identical to \
+                 the unbounded list's key set filtered the same way"
+            );
+        });
+        drop(runtime);
+
+        let _ = &mut schema; // keep the Drop guard alive until the assertions ran
     }
 
     #[test]

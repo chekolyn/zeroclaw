@@ -545,6 +545,23 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.filter_recalled(entries)
     }
 
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the export predicates and the
+        // paging window must reach the backend's SQL (a compose here would
+        // ride the unbounded `list` once per page). The read-wall scan
+        // still sees every row the caller gets back.
+        let entries = self
+            .inner
+            .list_limited_filtered(filter, offset, limit)
+            .await?;
+        self.filter_recalled(entries)
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.inner.forget(key).await
     }
@@ -1400,6 +1417,158 @@ mod tests {
             page.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
             vec!["probe:1", "probe:2"],
             "the scanned limited read returns the backend's page"
+        );
+    }
+
+    /// A backend whose filtered export window is native: `list_limited_filtered`
+    /// records the `(offset, limit)` window it was given; `list` PANICS — a
+    /// default-compose route through the unbounded list (a missing forward)
+    /// fails the test instead of silently unbounding the export.
+    struct FilteredProbe {
+        entries: Vec<MemoryEntry>,
+        windows: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for FilteredProbe {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "filtered-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for FilteredProbe {
+        fn name(&self) -> &str {
+            "filtered-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            panic!("the filtered export must not ride the unbounded list")
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            _filter: &ExportFilter,
+            offset: usize,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.windows.lock().unwrap().push((offset, limit));
+            Ok(self
+                .entries
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The filtered export window must FORWARD to the backend's
+    /// `list_limited_filtered` — the pushed-down predicates and the paging
+    /// window survive the wrapper — and the read-wall scan still sees every
+    /// row the caller gets back.
+    #[tokio::test]
+    async fn list_limited_filtered_forwards_and_scans_the_window() {
+        let windows = Arc::new(Mutex::new(Vec::new()));
+        let inner = FilteredProbe {
+            entries: vec![test_entry("probe:1", "one"), test_entry("probe:2", "two")],
+            windows: windows.clone(),
+        };
+        // An off policy keeps the scan a passthrough; the pin is the ROUTING
+        // (the unbounded list is never reached, the window is carried), and
+        // the scan-withholding itself is pinned by the recall tests above.
+        let mem = ScannedMemory::new(inner, &policy("off", "block-on-read"));
+
+        let filter = ExportFilter::default();
+        let page = mem
+            .list_limited_filtered(&filter, 0, 7)
+            .await
+            .expect("the filtered export window");
+
+        assert_eq!(
+            windows.lock().unwrap().as_slice(),
+            &[(0usize, 7usize)],
+            "the paging window must reach the backend's list_limited_filtered"
+        );
+        assert_eq!(
+            page.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["probe:1", "probe:2"],
+            "the scanned window returns the backend's page"
         );
     }
 }
