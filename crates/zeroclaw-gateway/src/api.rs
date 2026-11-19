@@ -1170,7 +1170,18 @@ pub async fn handle_api_memory_list(
             other => zeroclaw_memory::MemoryCategory::Custom(other.to_string()),
         });
 
-        match mem.list(category.as_ref(), None).await {
+        // V3 LIST-BOUND: the listing surface is bounded — the newest
+        // MEMORY_LIST_DEFAULT_LIMIT rows, the bound pushed into storage by
+        // the backend. The bulk-read contract is the export path, not the
+        // dashboard listing.
+        match mem
+            .list_limited(
+                category.as_ref(),
+                None,
+                zeroclaw_api::memory_traits::MEMORY_LIST_DEFAULT_LIMIT,
+            )
+            .await
+        {
             Ok(entries) => Json(serde_json::json!({
                 "entries": sanitize_memory_entries_for_api(entries)
             }))

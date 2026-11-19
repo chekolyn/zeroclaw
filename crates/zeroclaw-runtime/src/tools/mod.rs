@@ -1014,6 +1014,21 @@ impl Memory for NativeMemoryBinding {
         actual.list(category, session_id).await
     }
 
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the memory_export tool's
+        // receiver IS this binding, and a missing forward would resolve the
+        // trait default compose into `list`, silently unbounding the
+        // agent-scoped export chain (the T1 list_limited trap, one wrapper
+        // earlier).
+        let actual = self.begin_operation();
+        actual.list_limited_filtered(filter, offset, limit).await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let actual = self.begin_operation();
         actual.forget(key).await
@@ -9909,6 +9924,152 @@ mod native_memory_binding_tests {
         assert!(
             weak.upgrade().is_none(),
             "origin metadata must not own the resource"
+        );
+    }
+
+    /// A backend whose filtered export window is native: the window records
+    /// its routing; the unbounded `list` must never be reached through the
+    /// binding.
+    struct ExportBindingProbe {
+        windows: parking_lot::Mutex<Vec<(usize, usize, Option<String>, Option<String>)>>,
+    }
+
+    impl Attributable for ExportBindingProbe {
+        fn role(&self) -> Role {
+            Role::Memory(MemoryKind::None)
+        }
+        fn alias(&self) -> &str {
+            "export-binding-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ExportBindingProbe {
+        fn name(&self) -> &str {
+            "export-binding-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            panic!("the filtered export must not ride the unbounded list")
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            filter: &ExportFilter,
+            offset: usize,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.windows
+                .lock()
+                .push((offset, limit, filter.since.clone(), filter.until.clone()));
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The binding must FORWARD `list_limited_filtered` — the memory_export
+    /// tool's receiver IS this binding, and a missing forward would resolve
+    /// the trait default compose into `list`, silently unbounding the
+    /// agent-scoped export chain (the T1 trap, one wrapper earlier).
+    #[tokio::test]
+    async fn native_memory_binding_forwards_list_limited_filtered() {
+        let inner = Arc::new(ExportBindingProbe {
+            windows: parking_lot::Mutex::new(Vec::new()),
+        });
+        let binding = NativeMemoryBinding::new(
+            Arc::clone(&inner) as Arc<dyn Memory>,
+            Arc::new(SecurityPolicy::default()),
+        );
+
+        let filter = ExportFilter {
+            since: Some("2026-01-01T00:00:00Z".into()),
+            until: Some("2027-01-01T00:00:00Z".into()),
+            ..ExportFilter::default()
+        };
+        let page = binding
+            .list_limited_filtered(&filter, 40, 7)
+            .await
+            .expect("the filtered export window forwards through the binding");
+
+        assert!(page.is_empty());
+        assert_eq!(
+            inner.windows.lock().as_slice(),
+            &[(
+                40usize,
+                7usize,
+                Some("2026-01-01T00:00:00Z".to_string()),
+                Some("2027-01-01T00:00:00Z".to_string())
+            )],
+            "the binding must forward the window and the filter bounds verbatim"
         );
     }
 }

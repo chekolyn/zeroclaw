@@ -2548,15 +2548,26 @@ mod tests {
         assert!(!result.output.contains("original-backend"));
     }
 
-    /// The rebind must carry the prefix-recall budget: a principal-routed
-    /// session's rebuilt `memory_recall` keeps the bounded prefix listing
-    /// the assembly gave it (the measured canary gap rode exactly this
-    /// path unbounbed). Knob `0` disables — legacy unbounded.
+    /// The rebind's contract for SUPPLIED native memory tools: a registry
+    /// whose memory tools carry no creator binding (pre-built input) is left
+    /// untouched — "unknown supplied tools keep their original backends"
+    /// (`rebind_memory_tools`' doc). The rebind reroutes only creator-bound
+    /// captures; it never rebuilds or retargets a supplied tool.
+    ///
+    /// History: this test originally pinned the rebind carrying the
+    /// prefix-recall wall budget into the rebound `memory_recall` ("knob 0
+    /// disables"). Both halves of that mechanism are gone upstream: the
+    /// tool-level prefix wall-clock belt was REMOVED (2026-11-14, the
+    /// guide-delta-scan live run — the tokio timeout wrapped the
+    /// shared-client mutex wait; the enforced bound is the backend's own
+    /// `statement_timeout` inside `list_prefixed`), and the runtime
+    /// registers `memory_recall` over the raw memory (tools/mod.rs), so a
+    /// binding reroute never reaches it.
     #[tokio::test]
-    async fn rebind_memory_tools_carries_the_prefix_recall_budget() {
+    async fn rebind_memory_tools_keeps_supplied_recall_on_its_original_backend() {
+        use std::time::{Duration, Instant};
         use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry, SqliteMemory};
         use zeroclaw_tools::memory_recall::MemoryRecallTool;
-        use std::time::{Duration, Instant};
 
         struct SlowListMemory;
 
@@ -2679,10 +2690,13 @@ mod tests {
         )
         .await;
 
-        // Budgeted rebind: the slow listing fails bounded inside the knob.
+        // Supplied tools carry no creator binding: the rebind is an accepted
+        // no-op — the supplied recall keeps riding its original (empty)
+        // backend and the reroute target is never activated.
         assembled
             .registry
-            .rebind_memory_tools(Arc::clone(&slow), Arc::clone(&security), 100);
+            .rebind_memory_tools(&fast, Arc::clone(&slow), &security)
+            .unwrap();
         let tool = assembled
             .registry
             .iter()
@@ -2693,40 +2707,19 @@ mod tests {
             .execute(serde_json::json!({"prefix": "p:"}))
             .await
             .unwrap();
-        let elapsed = start.elapsed();
-        assert!(
-            !result.success,
-            "the rebound recall tool must bound the prefix listing"
-        );
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("soft budget")),
-            "got {:?}",
-            result.error
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "the rebound prefix recall must stay bounded; took {elapsed:?}"
-        );
-
-        // Disabled rebind (0): the listing runs unbounded to completion.
-        assembled
-            .registry
-            .rebind_memory_tools(Arc::clone(&slow), Arc::clone(&security), 0);
-        let tool = assembled
-            .registry
-            .iter()
-            .find(|tool| tool.name() == "memory_recall")
-            .expect("memory_recall present after rebind");
-        let result = tool
-            .execute(serde_json::json!({"prefix": "p:"}))
-            .await
-            .unwrap();
         assert!(
             result.success,
-            "a disabled budget must not bound the rebound listing"
+            "the supplied recall keeps its original backend: {result:?}"
+        );
+        assert!(
+            result.output.contains("No memories found"),
+            "the supplied recall must still serve the original backend, got: {:?}",
+            result.output
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the reroute target must never be activated; took {:?}",
+            start.elapsed()
         );
     }
 

@@ -35,6 +35,36 @@ pub struct ExportFilter {
     pub until: Option<String>,
 }
 
+/// The client-side form of the export filter: namespace equality plus the
+/// inclusive `since`/`until` bounds on the entry timestamp. ONE home for
+/// the predicate — [`Memory::list_limited_filtered`]'s default compose
+/// filters through it, so a backend without a native filtered read still
+/// serves the export contract.
+///
+/// The timestamp comparison is LEXICOGRAPHIC on the RFC 3339 text — the
+/// pre-existing semantics the export tool's post-filter performed. Backends
+/// with real temporal types replace it in storage: the postgres override
+/// binds `since`/`until` as `::TIMESTAMPTZ`, where mixed offset spellings
+/// compare as instants instead of strings.
+pub fn entry_matches_export_filter(entry: &MemoryEntry, filter: &ExportFilter) -> bool {
+    if let Some(ref namespace) = filter.namespace
+        && entry.namespace != *namespace
+    {
+        return false;
+    }
+    if let Some(ref since) = filter.since
+        && entry.timestamp.as_str() < since.as_str()
+    {
+        return false;
+    }
+    if let Some(ref until) = filter.until
+        && entry.timestamp.as_str() > until.as_str()
+    {
+        return false;
+    }
+    true
+}
+
 /// The composite scope of one principal's private memory (RFC 7141).
 ///
 /// The owner is one dimension composed WITH, never instead of, the agent,
@@ -321,6 +351,19 @@ pub enum MemoryPolicyDecision {
     Deny { reason: String },
 }
 
+/// The default row bound for the bounded listing surfaces
+/// ([`Memory::list_limited`], the `memory/list` RPC, the gateway
+/// `GET /api/memory`): the newest 200 rows, most-recent first. The bound
+/// exists because the unbounded listing measured 15.76s on the prod
+/// leader's store under the operator TUI's no-category poll (the 06:09Z
+/// cron-wave cascade cancelled it at the 30s op_timeout).
+pub const MEMORY_LIST_DEFAULT_LIMIT: usize = 200;
+
+/// The ceiling any caller may push the bounded listing to. The listing is
+/// a preview-pane read; bulk enumeration is the export path's contract
+/// ([`Memory::list`], unbounded by design).
+pub const MEMORY_LIST_MAX_LIMIT: usize = 2000;
+
 /// Core memory trait — implement for any persistence backend
 ///
 /// Some wrappers forward every method to another `Memory`, such as the
@@ -430,6 +473,79 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
             .filter(|e| e.key.starts_with(prefix))
             .take(limit)
             .collect())
+    }
+
+    /// List the newest `limit` entries, optionally filtered by category
+    /// and/or session — the BOUNDED listing surface (the `memory/list` RPC
+    /// and the gateway `GET /api/memory` ride it).
+    ///
+    /// Unlike [`Memory::list`] — the unbounded full-store listing the
+    /// GDPR export contract rides by design — this method exists so a
+    /// listing pane cannot hold the whole store hostage: measured 15.76s
+    /// for a no-category read on the prod leader's store (the operator
+    /// TUI's 5s serial poll), with the 06:09Z cron-wave cascade cancelling
+    /// it at the 30s op_timeout. Implementations push the bound down to
+    /// the store so the call is fast AND bounded on large stores.
+    ///
+    /// Default: compose [`Memory::list`] with a truncation (correct for
+    /// the small sqlite backend) — the RESULT is bounded by `limit` but
+    /// the SCAN is the backend's full list. Backends with a
+    /// recency-servable index (postgres `idx_memories_updated_at`)
+    /// override this with a native bounded query.
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let mut entries = self.list(category, session_id).await?;
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    /// List one OFFSET WINDOW of the export's filtered read: the entries
+    /// matching `filter` (namespace equality plus the inclusive RFC 3339
+    /// `since`/`until` bounds on `created_at`), most-recent first, windowed
+    /// to `limit` rows starting at `offset`.
+    ///
+    /// This is the bulk-export surface: the `memory_export` tool pages the
+    /// full filtered set through it (`limit` = [`MEMORY_LIST_MAX_LIMIT`],
+    /// advancing `offset` by the page and stopping at the first EMPTY page).
+    /// Unlike [`Memory::list`] — whose unbounded scan the tool's old
+    /// post-filter rode, comparing the entry timestamps as RFC 3339 STRINGS
+    /// (mixed offset spellings mis-order: `2026-01-01T01:00:00+02:00` sorts
+    /// after `2026-01-01T00:00:00Z` though it is an EARLIER instant) — the
+    /// backends with a native engine push every predicate into storage: the
+    /// postgres override binds `since`/`until` as `::TIMESTAMPTZ` and
+    /// carries the `LIMIT/OFFSET` paging window, so a page never
+    /// materializes the whole store.
+    ///
+    /// The `offset` counts STORE rows of the filtered stream, NOT
+    /// caller-visible rows: a filtering wrapper in between (the agent-scoped
+    /// attribution filter, the read-wall scan) may withhold rows from a
+    /// page, so the caller advances `offset` by the PAGE SIZE each call and
+    /// stops at the first EMPTY page — the windows tile the stream exactly
+    /// once no matter how many rows the wrappers withhold.
+    ///
+    /// Default: compose [`Memory::list`] with the client-side filter
+    /// ([`entry_matches_export_filter`]) and the window slice — correct for
+    /// the small backends, whose own `list` bound (sqlite caps its listing
+    /// read at 1000 rows) is preserved. Backends with a native query engine
+    /// override with the pushed-down predicates.
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = self
+            .list(filter.category.as_ref(), filter.session_id.as_deref())
+            .await?;
+        entries.retain(|e| entry_matches_export_filter(e, filter));
+        Ok(entries.into_iter().skip(offset).take(limit).collect())
     }
 
     /// Remove a memory by key. Deletes every row matching `key`, regardless
@@ -1538,5 +1654,165 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.len(), 2, "limit caps the post-filter result count");
+    }
+
+    // ── list_limited_filtered (the export paging window) tests ──────────
+
+    /// Stub backend returning a fixed result set from `list` so the
+    /// `list_limited_filtered` DEFAULT impl's compose (list + client-side
+    /// filter + offset window) can be exercised without a real database.
+    /// The default is the small-backend contract (sqlite et al.) — the
+    /// postgres backend overrides with the pushed-down predicates.
+    struct ListEchoMemory(Vec<MemoryEntry>);
+
+    impl crate::attribution::Attributable for ListEchoMemory {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Memory(crate::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "list-echo"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for ListEchoMemory {
+        fn name(&self) -> &str {
+            "list-echo"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            // A real backend carries category/session IN its list read
+            // (sqlite/postgres do); the default compose relies on it and
+            // adds only the namespace/time dims client-side.
+            Ok(self
+                .0
+                .iter()
+                .filter(|e| category.is_none_or(|c| e.category == *c))
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.0.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The DEFAULT compose: `list` + the client-side namespace filter +
+    /// since/until on the entry timestamps + the `(offset, limit)` window
+    /// over the FILTERED stream. The export's paging loop relies on the
+    /// window semantics: offset counts filtered rows, an offset past the
+    /// stream's end returns an empty page.
+    #[tokio::test]
+    async fn list_limited_filtered_default_composes_filters_offset_and_limit() {
+        let mut early = filtered_entry("sop-early", "team", MemoryCategory::Core, "drop:early");
+        early.timestamp = "2026-01-01T00:00:00Z".into();
+        let mem = ListEchoMemory(vec![
+            filtered_entry("sop1", "team", MemoryCategory::Core, "keep:1"),
+            filtered_entry("sop2", "other", MemoryCategory::Core, "drop:ns"),
+            filtered_entry("sop3", "team", MemoryCategory::Daily, "drop:cat"),
+            filtered_entry("sop4", "team", MemoryCategory::Core, "keep:2"),
+            early,
+        ]);
+
+        let filter = ExportFilter {
+            namespace: Some("team".into()),
+            category: Some(MemoryCategory::Core),
+            since: Some("2026-02-01T00:00:00Z".into()),
+            ..ExportFilter::default()
+        };
+
+        // The filtered stream is [keep:1, keep:2] — namespace, category and
+        // the since bound all applied client-side.
+        let page = mem.list_limited_filtered(&filter, 0, 2).await.unwrap();
+        let mut keys: Vec<String> = page.iter().map(|e| e.key.clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["keep:1", "keep:2"],
+            "the default compose filters namespace, category and since client-side"
+        );
+
+        // A mid-stream window slices the FILTERED stream.
+        let page = mem.list_limited_filtered(&filter, 1, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].key, "keep:2",
+            "the offset counts FILTERED rows, not raw list rows"
+        );
+
+        // An offset past the filtered stream's end: the empty page that
+        // ends the export's paging loop.
+        let page = mem.list_limited_filtered(&filter, 2, 2).await.unwrap();
+        assert!(
+            page.is_empty(),
+            "an offset past the filtered stream's end returns an empty page"
+        );
     }
 }

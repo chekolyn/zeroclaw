@@ -2200,6 +2200,15 @@
               "null"
             ]
           },
+          "limit": {
+            "description": "The bounded listing's row ceiling: the newest `limit` rows,\nmost-recent first. Absent means the listing default; the server\nclamps any value above the listing max. The bulk-read contract\nis the export path, not this listing.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "plane": {
             "description": "Memory plane: `\"private\"` (the caller's own; the default for every\nauthenticated principal) or `\"shared\"` (honoured only for callers\nwith the admin bypass, audited).",
             "type": [
@@ -2219,6 +2228,7 @@
       "MemoryListResult": {
         "properties": {
           "count": {
+            "description": "The number of entries RETURNED in this response — the bounded\nlisting's page size, not the store total (the semantic change\nfrom the unbounded listing is disclosed in the manifest row,\nV3 LIST-BOUND). A client that needs the store total asks the\nexport path.",
             "format": "uint",
             "minimum": 0,
             "type": "integer"
@@ -2226,6 +2236,11 @@
           "entries": {
             "items": true,
             "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "description": "`true` when the returned page is full (`entries.len()` reached\nthe resolved limit), so more entries may exist beyond it. The\nprivate-plane listing carries the same boundary heuristic.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -5667,6 +5682,19 @@
           "schema": {
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "The bounded listing's row ceiling: the newest `limit` rows,\nmost-recent first. Absent means the listing default; the server\nclamps any value above the listing max. The bulk-read contract\nis the export path, not this listing.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           }

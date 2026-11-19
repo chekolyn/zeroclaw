@@ -19366,6 +19366,7 @@ type = "manual"
             run_id: "r-orphan".to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-orphan".to_string(),
             status: SopRunStatus::Running,

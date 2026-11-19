@@ -517,6 +517,28 @@ impl Memory for AgentScopedMemory {
         }
     }
 
+    /// The filtered export window, attribution-filtered. The `offset`
+    /// counts STORE rows of the backend's filtered stream (NOT
+    /// caller-visible rows): this wrapper may withhold rows from a page,
+    /// so the caller pages by advancing `offset` by the page size and
+    /// stopping at the first EMPTY page — the windows tile the stream
+    /// exactly once. NO refill/doubling loop applies here (the
+    /// `list_prefixed` shape): a refill refetches from the stream start,
+    /// which would double-count rows the earlier windows already delivered
+    /// and square the export cost.
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .list_limited_filtered(filter, offset, limit)
+            .await?;
+        Ok(self.filter_attributed_entries(entries))
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);
@@ -1541,6 +1563,178 @@ mod tests {
         assert!(
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
+        );
+    }
+
+    /// A backend whose filtered export window is native: `list_limited_filtered`
+    /// records the `(offset, limit)` window and returns the RAW window
+    /// (every agent's rows) — the wrapper's attribution filter must do the
+    /// slicing; `list` PANICS so a default-compose route (a missing
+    /// forward) fails the pin instead of silently unbounding the export.
+    struct ExportScopeProbe {
+        entries: Vec<MemoryEntry>,
+        windows: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ExportScopeProbe {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "export-scope-probe"
+        }
+    }
+
+    fn scope_entry(key: &str, agent_id: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            principal_id: None,
+            id: key.into(),
+            key: key.into(),
+            content: "v".into(),
+            category: MemoryCategory::Core,
+            timestamp: "2026-11-18T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: agent_id.map(String::from),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for ExportScopeProbe {
+        fn name(&self) -> &str {
+            "export-scope-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            panic!("the filtered export must not ride the unbounded list")
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            _filter: &ExportFilter,
+            offset: usize,
+            limit: usize,
+        ) -> Result<Vec<MemoryEntry>> {
+            self.windows.lock().unwrap().push((offset, limit));
+            Ok(self.entries.clone())
+        }
+
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The filtered export window rides the attribution filter: the purge
+    /// SOP's exports run as agents, so the window the wrapper returns holds
+    /// ONLY the bound agent's and its allowlisted peers' attributable rows.
+    #[tokio::test]
+    async fn list_limited_filtered_filters_to_attributed_rows() {
+        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = Arc::new(ExportScopeProbe {
+            entries: vec![
+                scope_entry("alpha-row", Some("alpha-uuid")),
+                scope_entry("beta-row", Some("beta-uuid")),
+                scope_entry("rogue-row", Some("rogue-uuid")),
+                scope_entry("legacy-row", None),
+            ],
+            windows: windows.clone(),
+        });
+        let wrapper = AgentScopedMemory::new(inner, "alpha-uuid", vec!["beta-uuid".to_string()]);
+
+        let filter = ExportFilter::default();
+        let page = wrapper
+            .list_limited_filtered(&filter, 40, 2000)
+            .await
+            .expect("the filtered export window");
+
+        assert_eq!(
+            windows.lock().unwrap().as_slice(),
+            &[(40usize, 2000usize)],
+            "the paging window must reach the backend's list_limited_filtered"
+        );
+        let mut keys: Vec<String> = page.iter().map(|e| e.key.clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["alpha-row", "beta-row"],
+            "attribution preserved: the bound agent's and the allowlisted peer's rows \
+             only — rogue and unattributed rows stay withheld"
         );
     }
 }

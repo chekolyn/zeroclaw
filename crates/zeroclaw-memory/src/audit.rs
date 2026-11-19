@@ -251,6 +251,40 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.list(category, session_id).await
     }
 
+    async fn list_limited(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the bound must reach the
+        // backend's SQL. The limited listing is audited like the plain
+        // list.
+        self.log_audit(AuditOp::List, None, None, session_id, None);
+        self.inner.list_limited(category, session_id, limit).await
+    }
+
+    async fn list_limited_filtered(
+        &self,
+        filter: &ExportFilter,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the export predicates and the
+        // paging window must reach the backend's SQL. The filtered export
+        // window is audited like the plain list.
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            filter.session_id.as_deref(),
+            None,
+        );
+        self.inner
+            .list_limited_filtered(filter, offset, limit)
+            .await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.log_audit(AuditOp::Forget, Some(key), None, None, None);
         self.inner.forget(key).await
@@ -928,6 +962,304 @@ mod tests {
                     if action == "store" && backend == "none" && *success
             )),
             "expected a MemoryAudit store event via the observer bridge"
+        );
+    }
+
+    /// A backend whose limited read is native: `list_limited` records the
+    /// limit and returns rows, while the unbounded `list` must never be
+    /// reached on the listing path.
+    struct LimitedProbe {
+        entries: Vec<MemoryEntry>,
+        limits: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for LimitedProbe {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "limited-probe"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for LimitedProbe {
+        fn name(&self) -> &str {
+            "limited-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            panic!("the limited listing must not ride the unbounded list")
+        }
+
+        async fn list_limited(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.limits.lock().unwrap().push(limit);
+            Ok(self.entries.iter().take(limit).cloned().collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The limited listing must FORWARD to the backend's `list_limited` —
+    /// the SQL-side bound survives the wrapper — and the limited read is
+    /// audited like the plain list.
+    #[tokio::test]
+    async fn audited_memory_forwards_list_limited_and_logs_it() {
+        let tmp = TempDir::new().unwrap();
+        let limits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let audited = AuditedMemory::new(
+            LimitedProbe {
+                entries: vec![],
+                limits: limits.clone(),
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let page = audited
+            .list_limited(None, None, 3)
+            .await
+            .expect("the limited read forwards through the audit wrapper");
+
+        assert_eq!(
+            limits.lock().unwrap().as_slice(),
+            &[3],
+            "the limit must reach the backend's list_limited"
+        );
+        assert!(page.is_empty());
+        assert_eq!(
+            audited.audit_count().unwrap(),
+            1,
+            "the limited listing is audited like the plain list"
+        );
+    }
+
+    /// A backend whose filtered export window is native: `list_limited_filtered`
+    /// records the `(offset, limit)` window; the unbounded `list` must never
+    /// be reached on the export path.
+    struct FilteredAuditProbe {
+        entries: Vec<MemoryEntry>,
+        windows: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for FilteredAuditProbe {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "filtered-audit-probe"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for FilteredAuditProbe {
+        fn name(&self) -> &str {
+            "filtered-audit-probe"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            panic!("the filtered export must not ride the unbounded list")
+        }
+
+        async fn list_limited_filtered(
+            &self,
+            _filter: &ExportFilter,
+            offset: usize,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.windows.lock().unwrap().push((offset, limit));
+            Ok(self
+                .entries
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test backend is read-only")
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The filtered export window must FORWARD to the backend's
+    /// `list_limited_filtered` — the pushed-down predicates and the paging
+    /// window survive the wrapper — and the filtered read is audited like
+    /// the plain list.
+    #[tokio::test]
+    async fn audited_memory_forwards_list_limited_filtered_and_logs_it() {
+        let tmp = TempDir::new().unwrap();
+        let windows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let audited = AuditedMemory::new(
+            FilteredAuditProbe {
+                entries: vec![],
+                windows: windows.clone(),
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let filter = ExportFilter::default();
+        let page = audited
+            .list_limited_filtered(&filter, 40, 3)
+            .await
+            .expect("the filtered export window forwards through the audit wrapper");
+
+        assert_eq!(
+            windows.lock().unwrap().as_slice(),
+            &[(40usize, 3usize)],
+            "the paging window must reach the backend's list_limited_filtered"
+        );
+        assert!(page.is_empty());
+        assert_eq!(
+            audited.audit_count().unwrap(),
+            1,
+            "the filtered export window is audited like the plain list"
         );
     }
 }
