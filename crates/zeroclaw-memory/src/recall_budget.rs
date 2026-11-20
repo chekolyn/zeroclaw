@@ -63,14 +63,22 @@ const FALLBACK_BUDGET_FLOOR: Duration = Duration::from_millis(1000);
 mod outcome_telemetry {
     use opentelemetry::KeyValue;
     use opentelemetry::global;
-    use opentelemetry::metrics::Counter;
+    use opentelemetry::metrics::{Counter, Histogram};
     use std::sync::OnceLock;
 
     struct Instruments {
         outcome: Counter<u64>,
+        duration: Histogram<f64>,
     }
 
     static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+
+    /// The same bucket set as the runtime's `zeroclaw.memory.recall.duration`
+    /// (`otel.rs`): explicit SECOND-scale buckets, because OTel's default
+    /// millisecond boundaries put every recall above 1 s in `+Inf` and the
+    /// quantiles were interpolation artifacts (2026-11-20).
+    const ATTEMPT_BUCKETS_S: [f64; 11] =
+        [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0];
 
     fn instruments() -> &'static Instruments {
         INSTRUMENTS.get_or_init(|| {
@@ -82,24 +90,86 @@ mod outcome_telemetry {
                         "Memory recall attempts by outcome (ok | degraded | error) and failure class",
                     )
                     .build(),
+                duration: meter
+                    .f64_histogram("zeroclaw.memory.recall.attempt.duration")
+                    .with_description(
+                        "Caller-visible latency of a recall attempt, by shape and outcome",
+                    )
+                    .with_unit("s")
+                    .with_boundaries(ATTEMPT_BUCKETS_S.to_vec())
+                    .build(),
             }
         })
     }
 
-    pub(crate) fn record(label: &str, outcome: &'static str, reason: Option<&str>) {
-        let mut attrs = Vec::with_capacity(3);
+    /// `ZEROCLAW_ENV`, read once. Without it a canary rollout and a prod
+    /// rollout write IDENTICAL series and the store alternates between their
+    /// cumulative values — which made `increase()` read ~9x high on the prod
+    /// counter on 2026-11-21 (raw counter +11, `increase[5m]` +48), so the
+    /// ratio the counter exists to provide was unciteable.
+    fn env_label() -> &'static str {
+        static ENV: OnceLock<String> = OnceLock::new();
+        ENV.get_or_init(|| std::env::var("ZEROCLAW_ENV").unwrap_or_else(|_| "unknown".to_string()))
+    }
+
+    /// `HOSTNAME` is the pod name in Kubernetes. Two pods of the same image
+    /// still emit distinct series, which is what makes a per-image acceptance
+    /// run attributable instead of fleet-wide.
+    fn pod_label() -> &'static str {
+        static POD: OnceLock<String> = OnceLock::new();
+        POD.get_or_init(|| std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))
+    }
+
+    /// The attribute set shared by every recall instrument.
+    fn outcome_attrs(label: &str, outcome: &'static str, reason: Option<&str>) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(5);
         attrs.push(KeyValue::new("recall", label.to_string()));
         attrs.push(KeyValue::new("outcome", outcome));
         if let Some(reason) = reason {
             attrs.push(KeyValue::new("reason", reason.to_string()));
         }
-        instruments().outcome.add(1, &attrs);
+        attrs.push(KeyValue::new("env", env_label()));
+        attrs.push(KeyValue::new("pod", pod_label()));
+        attrs
+    }
+
+    /// Count the attempt AND record its caller-visible latency.
+    ///
+    /// Paired on purpose: recording one without the other is how the plane
+    /// ended up with a duration histogram that no outcome could be compared
+    /// against (the histogram carries no shape label, the counter carried no
+    /// latency).
+    pub(crate) fn record(
+        label: &str,
+        outcome: &'static str,
+        reason: Option<&str>,
+        elapsed: std::time::Duration,
+    ) {
+        let attrs = outcome_attrs(label, outcome, reason);
+        let instruments = instruments();
+        instruments.outcome.add(1, &attrs);
+        instruments.duration.record(elapsed.as_secs_f64(), &attrs);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attrs_for_test(
+        label: &str,
+        outcome: &'static str,
+        reason: Option<&str>,
+    ) -> Vec<KeyValue> {
+        outcome_attrs(label, outcome, reason)
     }
 }
 
 #[cfg(not(feature = "observability-otel"))]
 mod outcome_telemetry {
-    pub(crate) fn record(_label: &str, _outcome: &'static str, _reason: Option<&str>) {}
+    pub(crate) fn record(
+        _label: &str,
+        _outcome: &'static str,
+        _reason: Option<&str>,
+        _elapsed: std::time::Duration,
+    ) {
+    }
 }
 
 /// Classify a recall failure into a bounded, series-friendly reason.
@@ -181,13 +251,18 @@ impl BudgetedMemory {
                         })),
                     "memory recall completed within the soft budget"
                 );
-                outcome_telemetry::record(label, "ok", None);
+                outcome_telemetry::record(label, "ok", None, elapsed);
                 return Ok(entries);
             }
             // A real backend failure that did NOT consume the budget: the
             // recency fallback must not mask it.
             Ok(Err(error)) if elapsed < self.soft_timeout => {
-                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
+                outcome_telemetry::record(
+                    label,
+                    "error",
+                    Some(&degradation_reason(&error)),
+                    elapsed,
+                );
                 return Err(error);
             }
             // Budget exhausted: tokio timeout, or an error that arrived after
@@ -239,7 +314,12 @@ impl BudgetedMemory {
                         })),
                     "memory recall exceeded the soft budget; degraded to recent-entries fallback"
                 );
-                outcome_telemetry::record(label, "degraded", Some(&reason));
+                outcome_telemetry::record(
+                    label,
+                    "degraded",
+                    Some(&reason),
+                    elapsed + fallback_start.elapsed(),
+                );
                 Ok(entries)
             }
             Ok(Err(error)) => {
@@ -255,7 +335,12 @@ impl BudgetedMemory {
                         })),
                     "memory recall fallback errored after the soft budget"
                 );
-                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
+                outcome_telemetry::record(
+                    label,
+                    "error",
+                    Some(&degradation_reason(&error)),
+                    elapsed + fallback_start.elapsed(),
+                );
                 Err(error)
             }
             Err(_) => {
@@ -270,7 +355,12 @@ impl BudgetedMemory {
                         })),
                     "memory recall fallback also exceeded its budget; recall failed bounded"
                 );
-                outcome_telemetry::record(label, "error", Some("budget_exhausted"));
+                outcome_telemetry::record(
+                    label,
+                    "error",
+                    Some("budget_exhausted"),
+                    elapsed + fallback_start.elapsed(),
+                );
                 Err(anyhow::anyhow!(
                     "memory recall ({label}) exceeded the soft budget ({:?}) and its fallback budget",
                     self.soft_timeout
@@ -309,13 +399,18 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration completed within the soft budget"
                 );
-                outcome_telemetry::record(label, "ok", None);
+                outcome_telemetry::record(label, "ok", None, elapsed);
                 Ok(entries)
             }
             // A real backend failure that did NOT consume the budget: it
             // propagates as-is.
             Ok(Err(error)) if elapsed < self.soft_timeout => {
-                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
+                outcome_telemetry::record(
+                    label,
+                    "error",
+                    Some(&degradation_reason(&error)),
+                    elapsed,
+                );
                 Err(error)
             }
             Ok(Err(error)) => {
@@ -328,6 +423,12 @@ impl BudgetedMemory {
                             "error": error.to_string(),
                         })),
                     "memory enumeration errored after exhausting the soft budget"
+                );
+                outcome_telemetry::record(
+                    label,
+                    "error",
+                    Some(&degradation_reason(&error)),
+                    elapsed,
                 );
                 Err(error)
             }
@@ -343,7 +444,7 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration exceeded the soft budget; failed bounded"
                 );
-                outcome_telemetry::record(label, "error", Some("soft_budget"));
+                outcome_telemetry::record(label, "error", Some("soft_budget"), elapsed);
                 Err(anyhow::anyhow!(
                     "memory enumeration ({label}) exceeded the soft budget ({:?})",
                     self.soft_timeout

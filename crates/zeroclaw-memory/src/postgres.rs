@@ -1126,16 +1126,24 @@ impl RecallTsqueryParse {
 /// lexeme, so punctuation-only fragments are dropped — an OR over them is
 /// still empty). Fewer than two tokens means there is nothing to relax: a
 /// one-token OR IS the same conjunction, so no fallback is built.
-/// The relaxation's term budget.
+/// The relaxation's term budget — and, past it, its refusal.
 ///
-/// GIN walks one posting list per DISTINCT lexeme in the tsquery, so the OR
-/// arm's cost is linear in the term count and independent of the row count —
-/// measured on the prod primary (2026-11-21, 93,749 rows / 1.7 GB): 12 terms
-/// = 85 ms, ~450 terms (a 10 KB agent message) = 4.77 s. Twelve is the
-/// deliberate ceiling: past it the disjunction stops being a query and
-/// becomes a scan that can only be ranked by how often a row repeats the
-/// most common word in the message.
-const RECALL_OR_RELAX_MAX_TERMS: usize = 12;
+/// A relaxation is a REPAIR for a short selector query whose one absent word
+/// collapsed the conjunction (`pr drain state waiting_streak` when
+/// `waiting_streak` is not stored). It is never a fallback for prose.
+///
+/// Measured on the prod primary (2026-11-21, 93,749 rows / 1.7 GB): GIN walks
+/// one posting list per DISTINCT lexeme, so an OR of twelve stopwords — the
+/// first twelve distinct words of a heartbeat prompt — matched 44 305 rows,
+/// and when the planner reached them through `idx_memories_agent_id` instead
+/// of the FTS index the per-row tsvector recheck cost 45 s. Even 85 ms of OR
+/// over a sentence is wasted work: the ranking it produces is a frequency
+/// count of the message's most common word.
+///
+/// So the budget is also a REFUSAL: more distinct tokens than this means the
+/// caller asked with prose, and prose gets the strict conjunction's answer
+/// (usually none) instead of a full scan.
+const RECALL_OR_RELAX_MAX_TERMS: usize = 6;
 
 /// The query bind's character budget.
 ///
@@ -1197,8 +1205,9 @@ fn tsquery_or_fallback_input(query: &str) -> Option<String> {
         }
         folded_seen.push(folded);
         tokens.push(token);
-        if tokens.len() == RECALL_OR_RELAX_MAX_TERMS {
-            break;
+        if tokens.len() > RECALL_OR_RELAX_MAX_TERMS {
+            // Prose, not a selector: refuse rather than scan.
+            return None;
         }
     }
     if tokens.len() < 2 {
@@ -3413,11 +3422,36 @@ mod tests {
     /// user message as the query — that is the 8 s budget timeout behind the
     /// 237-degraded-in-10-minutes ratio the outcome counter surfaced.
     #[test]
-    fn or_fallback_input_caps_distinct_terms() {
+    fn or_fallback_input_refuses_prose() {
         let long = (0..40).map(|i| format!("term{i}")).collect::<Vec<_>>().join(" ");
-        let built = tsquery_or_fallback_input(&long).expect("a multi-token query relaxes");
-        assert_eq!(built.split(" or ").count(), RECALL_OR_RELAX_MAX_TERMS);
-        assert!(built.starts_with("term0 or term1"), "message order is preserved: {built}");
+        assert_eq!(
+            tsquery_or_fallback_input(&long),
+            None,
+            "prose does not relax: an OR over a sentence's words is a scan, not a query"
+        );
+    }
+
+    /// The measured prod case, verbatim (2026-11-21, the primary's slow-query
+    /// log): the per-turn injection passes the whole message, a heartbeat
+    /// prompt relaxed to an OR of its own stopwords, matching 44 305 rows and
+    /// — when the planner chose the agent index over the FTS index — 45 s of
+    /// heap recheck. The relaxation must refuse this shape outright.
+    #[test]
+    fn or_fallback_input_refuses_a_heartbeat_prompt() {
+        let prompt = "[Heartbeat or Task or decision] You are a heartbeat scheduler. \\
+                      Review the following periodic task and continue.";
+        assert_eq!(tsquery_or_fallback_input(prompt), None);
+    }
+
+    /// The relaxation exists for a SHORT selector query whose one absent word
+    /// collapsed the conjunction ("pr drain state waiting_streak" when
+    /// `waiting_streak` is not stored). That case is preserved exactly.
+    #[test]
+    fn or_fallback_input_relaxes_a_short_selector() {
+        assert_eq!(
+            tsquery_or_fallback_input("pr drain state waiting_streak").as_deref(),
+            Some("pr or drain or state or waiting_streak")
+        );
     }
 
     /// Duplicates are ONE posting list, so the cap counts DISTINCT terms — a
