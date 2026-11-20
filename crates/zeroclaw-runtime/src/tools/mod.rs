@@ -1015,6 +1015,25 @@ impl Memory for NativeMemoryBinding {
         actual.list(category, session_id).await
     }
 
+
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose: the memory_recall tool's
+        // `prefix=` mode is served by THIS binding, and the trait default
+        // composes over the UNBOUNDED `list` — a full-store read (93k rows /
+        // ~1.7 GB of content on prod) that the prefix-pushed `list_prefixed`
+        // exists to replace. The 8 s soft budget then fires on the enumeration
+        // and the caller reads a timeout where the key may well exist (live
+        // 2026-11-21: `prefix="proposal:"` at 8001 ms while the indexed query
+        // takes 3.6 ms).
+        let actual = self.begin_operation();
+        actual.list_prefixed(prefix, limit, session_id).await
+    }
+
     async fn list_limited_filtered(
         &self,
         filter: &ExportFilter,
@@ -9969,6 +9988,13 @@ mod native_memory_binding_tests {
         /// forward reads as zero — which is exactly the regression the pin
         /// must catch.
         scoped_recalls: std::sync::atomic::AtomicUsize,
+        /// Counts calls that reached this probe's `list_prefixed` — the
+        /// discriminator for the prefix-enumeration forward (the trait default
+        /// would call `list` instead and pay the full-store scan).
+        prefix_calls: std::sync::atomic::AtomicUsize,
+        /// Counts the trait default's `list` compose, which must NOT run when
+        /// a prefix is enumerated.
+        list_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl Attributable for ExportBindingProbe {
@@ -10017,6 +10043,17 @@ mod native_memory_binding_tests {
             _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             panic!("the filtered export must not ride the unbounded list")
+        }
+
+        async fn list_prefixed(
+            &self,
+            _prefix: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.prefix_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
         }
 
         async fn list_limited_filtered(
@@ -10097,6 +10134,8 @@ mod native_memory_binding_tests {
         let inner = Arc::new(ExportBindingProbe {
             windows: parking_lot::Mutex::new(Vec::new()),
             scoped_recalls: std::sync::atomic::AtomicUsize::new(0),
+            prefix_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let binding = NativeMemoryBinding::new(
             Arc::clone(&inner) as Arc<dyn Memory>,
@@ -10126,6 +10165,43 @@ mod native_memory_binding_tests {
         );
     }
 
+    /// `prefix=` enumeration must reach the backend's INDEXED range scan, not
+    /// the trait default's compose over `list` — the unbounded full-store read
+    /// (93k rows / ~1.7 GB of content) that made the memory tool's
+    /// `prefix="proposal:"` exceed the 8 s soft budget while the indexed query
+    /// itself ran in 3.6 ms (live prod, 2026-11-21). The probe counts which
+    /// method ran: a default compose shows up as `list_calls == 1`.
+    #[tokio::test]
+    async fn native_memory_binding_forwards_list_prefixed() {
+        let inner = Arc::new(ExportBindingProbe {
+            windows: parking_lot::Mutex::new(Vec::new()),
+            scoped_recalls: std::sync::atomic::AtomicUsize::new(0),
+            prefix_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let binding = NativeMemoryBinding::new(
+            Arc::clone(&inner) as Arc<dyn Memory>,
+            Arc::new(SecurityPolicy::default()),
+        );
+
+        let rows = binding
+            .list_prefixed("proposal:", 10, None)
+            .await
+            .expect("the prefix enumeration forwards through the binding");
+
+        assert!(rows.is_empty());
+        assert_eq!(
+            inner.prefix_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the binding must forward list_prefixed — the indexed range scan is the whole point"
+        );
+        assert_eq!(
+            inner.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the unbounded `list` compose must never run for a prefix enumeration"
+        );
+    }
+
     /// The exclusion push-down only reaches Postgres if the binding forwards
     /// `recall_filtered_scoped`: the memory tool's receiver IS this binding, so
     /// a missing forward resolves the TRAIT DEFAULT here — which filters a
@@ -10138,6 +10214,8 @@ mod native_memory_binding_tests {
         let inner = Arc::new(ExportBindingProbe {
             windows: parking_lot::Mutex::new(Vec::new()),
             scoped_recalls: std::sync::atomic::AtomicUsize::new(0),
+            prefix_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let binding = NativeMemoryBinding::new(
             Arc::clone(&inner) as Arc<dyn Memory>,
