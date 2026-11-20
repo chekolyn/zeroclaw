@@ -48,6 +48,82 @@ pub const DEFAULT_RECALL_SOFT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// `soft_timeout + FALLBACK_BUDGET_FLOOR` even when the primary hangs.
 const FALLBACK_BUDGET_FLOOR: Duration = Duration::from_millis(1000);
 
+/// The recall OUTCOME counter — the denominator the log plane cannot give.
+///
+/// Success used to be recorded at DEBUG and degradation at WARN, so with the
+/// deployed filter (`zeroclaw_log_event=warn`) only failures shipped: every
+/// ratio quoted from logs was failures-over-nothing. This counter makes
+/// `ok / degraded / error` measurable and joinable with
+/// `zeroclaw.memory.recall.duration` (the latency histogram) on the same
+/// OTLP→Mimir pipeline.
+///
+/// `reason` is a bounded CLASS, never the raw error: label cardinality has to
+/// stay small enough for a Prometheus series.
+#[cfg(feature = "observability-otel")]
+mod outcome_telemetry {
+    use opentelemetry::KeyValue;
+    use opentelemetry::global;
+    use opentelemetry::metrics::Counter;
+    use std::sync::OnceLock;
+
+    struct Instruments {
+        outcome: Counter<u64>,
+    }
+
+    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+
+    fn instruments() -> &'static Instruments {
+        INSTRUMENTS.get_or_init(|| {
+            let meter = global::meter("zeroclaw");
+            Instruments {
+                outcome: meter
+                    .u64_counter("zeroclaw.memory.recall.outcome")
+                    .with_description(
+                        "Memory recall attempts by outcome (ok | degraded | error) and failure class",
+                    )
+                    .build(),
+            }
+        })
+    }
+
+    pub(crate) fn record(label: &str, outcome: &'static str, reason: Option<&str>) {
+        let mut attrs = Vec::with_capacity(3);
+        attrs.push(KeyValue::new("recall", label.to_string()));
+        attrs.push(KeyValue::new("outcome", outcome));
+        if let Some(reason) = reason {
+            attrs.push(KeyValue::new("reason", reason.to_string()));
+        }
+        instruments().outcome.add(1, &attrs);
+    }
+}
+
+#[cfg(not(feature = "observability-otel"))]
+mod outcome_telemetry {
+    pub(crate) fn record(_label: &str, _outcome: &'static str, _reason: Option<&str>) {}
+}
+
+/// Classify a recall failure into a bounded, series-friendly reason.
+///
+/// The raw error text goes to the log line; the metric label stays a small
+/// enum so a Grafana query can group by cause without exploding series.
+fn degradation_reason(error: &anyhow::Error) -> String {
+    let text = error.to_string().to_ascii_lowercase();
+    let class = if text.contains("serializing parameter") {
+        "bind_mismatch"
+    } else if text.contains("statement timeout") || text.contains("canceling statement") {
+        "statement_timeout"
+    } else if text.contains("soft budget") {
+        "soft_budget"
+    } else if text.contains("connection") || text.contains("closed") {
+        "connection"
+    } else if text.contains("does not exist") || text.contains("syntax") {
+        "sql"
+    } else {
+        "other"
+    };
+    class.to_string()
+}
+
 /// Decorator that bounds recall wall-clock time and degrades gracefully.
 /// Wraps the per-agent handle; non-generic over the inner backend so it can
 /// wrap `Arc<dyn Memory>` compositions (the [`RetrievalPipeline`] pattern).
@@ -87,6 +163,9 @@ impl BudgetedMemory {
         FF: Future<Output = anyhow::Result<Vec<MemoryEntry>>>,
     {
         let start = Instant::now();
+        // The primary attempt's failure, carried into the WARN so the degrade
+        // rate is attributable by cause (it used to be DEBUG-only and dropped).
+        let mut primary_failure: Option<anyhow::Error> = None;
         let outcome = tokio::time::timeout(self.soft_timeout, primary()).await;
         let elapsed = start.elapsed();
         match outcome {
@@ -102,11 +181,15 @@ impl BudgetedMemory {
                         })),
                     "memory recall completed within the soft budget"
                 );
+                outcome_telemetry::record(label, "ok", None);
                 return Ok(entries);
             }
             // A real backend failure that did NOT consume the budget: the
             // recency fallback must not mask it.
-            Ok(Err(error)) if elapsed < self.soft_timeout => return Err(error),
+            Ok(Err(error)) if elapsed < self.soft_timeout => {
+                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
+                return Err(error);
+            }
             // Budget exhausted: tokio timeout, or an error that arrived after
             // the budget elapsed (the server-side per-attempt cancel shape).
             Ok(Err(error)) => {
@@ -120,6 +203,7 @@ impl BudgetedMemory {
                         })),
                     "memory recall errored after exhausting the soft budget; degrading"
                 );
+                primary_failure = Some(error);
             }
             Err(_) => {}
         }
@@ -133,19 +217,29 @@ impl BudgetedMemory {
         let fallback_start = Instant::now();
         match tokio::time::timeout(fallback_budget, fallback()).await {
             Ok(Ok(entries)) => {
+                // `fallback_elapsed_ms` is the RECOVERY leg, never the recall
+                // latency — reading it as "recall got slow" against the 8 s
+                // budget is a misread the old field name invited.
+                let reason = primary_failure
+                    .as_ref()
+                    .map(degradation_reason)
+                    .unwrap_or_else(|| "soft_budget".to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "recall": label,
-                            "elapsed_ms": fallback_start.elapsed().as_millis() as u64,
+                            "fallback_elapsed_ms": fallback_start.elapsed().as_millis() as u64,
                             "count": entries.len(),
                             "degraded": true,
+                            "reason": reason,
+                            "primary_error": primary_failure.as_ref().map(ToString::to_string),
                             "soft_timeout_ms": self.soft_timeout.as_millis() as u64,
                         })),
                     "memory recall exceeded the soft budget; degraded to recent-entries fallback"
                 );
+                outcome_telemetry::record(label, "degraded", Some(&reason));
                 Ok(entries)
             }
             Ok(Err(error)) => {
@@ -161,6 +255,7 @@ impl BudgetedMemory {
                         })),
                     "memory recall fallback errored after the soft budget"
                 );
+                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
                 Err(error)
             }
             Err(_) => {
@@ -175,6 +270,7 @@ impl BudgetedMemory {
                         })),
                     "memory recall fallback also exceeded its budget; recall failed bounded"
                 );
+                outcome_telemetry::record(label, "error", Some("budget_exhausted"));
                 Err(anyhow::anyhow!(
                     "memory recall ({label}) exceeded the soft budget ({:?}) and its fallback budget",
                     self.soft_timeout
@@ -213,11 +309,15 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration completed within the soft budget"
                 );
+                outcome_telemetry::record(label, "ok", None);
                 Ok(entries)
             }
             // A real backend failure that did NOT consume the budget: it
             // propagates as-is.
-            Ok(Err(error)) if elapsed < self.soft_timeout => Err(error),
+            Ok(Err(error)) if elapsed < self.soft_timeout => {
+                outcome_telemetry::record(label, "error", Some(&degradation_reason(&error)));
+                Err(error)
+            }
             Ok(Err(error)) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -243,6 +343,7 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration exceeded the soft budget; failed bounded"
                 );
+                outcome_telemetry::record(label, "error", Some("soft_budget"));
                 Err(anyhow::anyhow!(
                     "memory enumeration ({label}) exceeded the soft budget ({:?})",
                     self.soft_timeout
@@ -1287,5 +1388,22 @@ mod tests {
             elapsed >= Duration::from_millis(250),
             "a disabled budget must not interrupt the export page"
         );
+    }
+    /// The metric label must stay a bounded CLASS — a raw error string as a
+    /// label would explode the series set, and the point of the counter is a
+    /// queryable denominator, not a log copy.
+    #[test]
+    fn degradation_reason_classifies_without_leaking_the_message() {
+        let cases: [(&str, &str); 5] = [
+            ("error serializing parameter 3", "bind_mismatch"),
+            ("canceling statement due to statement timeout", "statement_timeout"),
+            ("memory recall (recall) exceeded the soft budget", "soft_budget"),
+            ("connection closed", "connection"),
+            ("something unexpected happened", "other"),
+        ];
+        for (message, expected) in cases {
+            let err = anyhow::anyhow!("{message}");
+            assert_eq!(degradation_reason(&err), expected, "message: {message}");
+        }
     }
 }
