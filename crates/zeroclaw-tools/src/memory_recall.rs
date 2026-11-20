@@ -293,6 +293,27 @@ impl Tool for MemoryRecallTool {
             limit
         };
 
+        // `search_mode` is a SCHEMA-ONLY parameter today: the postgres backend
+        // has no vector index (0 of 91,698 prod rows carry an embedding), so
+        // embedding/hybrid silently execute the same keyword path as bm25.
+        // A caller that asked for similarity and got keyword results cannot
+        // tell the difference — the 2026-11-20 probe read that silence as
+        // "the mode returned rows", which is true and misleading. Say it
+        // instead: results are unchanged, the fallback is disclosed.
+        let requested_mode = args
+            .get("search_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("bm25");
+        let mode_note = if requested_mode.eq_ignore_ascii_case("bm25") {
+            String::new()
+        } else {
+            format!(
+                "\nNote: search_mode=\"{requested_mode}\" fell back to keyword (bm25) search — \
+                 this store has no vector index, so these results are keyword-ranked, not \
+                 similarity-ranked."
+            )
+        };
+
         // Prefix mode: list all entries whose key starts with the given prefix
         if let Some(prefix) = args.get("prefix").and_then(|v| v.as_str()) {
             let prefix = prefix.trim();
@@ -327,7 +348,7 @@ impl Tool for MemoryRecallTool {
         match recall_result {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
-                output: "No memories found.".into(),
+                output: format!("No memories found.{mode_note}").into(),
                 error: None,
             }),
             Ok(entries) => {
@@ -366,6 +387,7 @@ impl Tool for MemoryRecallTool {
                         entry.category, entry.key, entry.content
                     );
                 }
+                output.push_str(&mode_note);
                 Ok(ToolResult {
                     success: true,
                     output: output.into(),
@@ -1238,6 +1260,24 @@ mod tests {
             *mem.last_limit.lock().unwrap(),
             Some(60),
             "a category filter must widen the backend fetch (3 x 20)"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_bm25_mode_discloses_the_keyword_fallback() {
+        // embedding/hybrid have no vector index behind them, so they execute
+        // the keyword path. Returning results without saying so is the quiet
+        // lie the 2026-11-20 probe caught; the note makes the fallback legible.
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"query": "*", "limit": 5, "search_mode": "hybrid"}))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("fell back to keyword"),
+            "a non-bm25 mode must disclose the fallback: {}",
+            result.output
         );
     }
 
