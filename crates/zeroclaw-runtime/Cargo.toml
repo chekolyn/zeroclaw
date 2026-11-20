@@ -110,7 +110,7 @@ process-wrap = { version = "=9.0.0", default-features = false, features = ["job-
 default = ["observability-prometheus", "schema-export"]
 channel-mqtt = ["dep:rumqttc"]
 observability-prometheus = ["dep:prometheus"]
-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "zeroclaw-log/otel-bridge", "zeroclaw-providers/observability-otel"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "zeroclaw-log/otel-bridge", "zeroclaw-providers/observability-otel", "zeroclaw-memory/observability-otel"]
 sandbox-landlock = ["dep:landlock"]
 schema-export = [
     "dep:schemars",
