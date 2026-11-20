@@ -1380,14 +1380,19 @@ fn ranked_recall_sql(
     };
     format!(
         "
-        WITH candidates AS MATERIALIZED (
-            SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id,
-                   m.agent_id, m.namespace, m.importance, m.updated_at
+        WITH matched AS MATERIALIZED (
+            SELECT m.id, m.updated_at
             FROM {qualified_table} m
             WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ {tsq}('simple', $1))
               AND {session_filter}{allowlist_filter}
               {time_filter}
-            ORDER BY m.updated_at DESC
+        ),
+        candidates AS MATERIALIZED (
+            SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id,
+                   m.agent_id, m.namespace, m.importance, m.updated_at
+            FROM {qualified_table} m
+            JOIN matched c ON c.id = m.id
+            ORDER BY c.updated_at DESC
             LIMIT ${cap_placeholder}
         )
         SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.namespace, m.importance::FLOAT8,
@@ -3341,12 +3346,58 @@ mod tests {
         );
     }
 
-    /// The ranked recall must bound its candidate set BEFORE ranking: a
-    /// `WITH candidates AS MATERIALIZED` stage carries the full-content FTS
-    /// predicate (the preserved deep-match contract), the session/scope
-    /// predicates, and the recency ORDER BY closed by the cap LIMIT — the
-    /// rank expression, the score ORDER BY and the result LIMIT all follow
-    /// the candidate join. Measured driver (2026-11-18, idle prod primary,
+    /// The 2026-11-21 plan defect, pinned structurally: the full-content FTS
+    /// predicate must be evaluated by its OWN materialized CTE, with no
+    /// recency ORDER BY inside it. With the predicate and `ORDER BY
+    /// updated_at DESC LIMIT n` in one stage the planner answers from
+    /// `idx_memories_updated_at` and re-parses `to_tsvector` per row walked —
+    /// measured on the 92,852-row prod store: `fleet` cap 500 → **12,716 ms**
+    /// — while the same predicate routed through the GIN index
+    /// (`idx_memories_key_content_fts`) is 17 ms. Splitting the stage is what
+    /// makes the index-driven plan unconditional rather than a cost flip.
+    #[test]
+    fn ranked_recall_sql_materializes_the_fts_match_before_the_recency_cap() {
+        let sql = ranked_recall_sql(
+            "mem.memories",
+            "mem.agents",
+            false,
+            true,
+            true,
+            RecallTsqueryParse::Strict,
+        );
+        let ctes: Vec<&str> = sql.split("AS MATERIALIZED (").collect();
+        assert_eq!(
+            ctes.len(),
+            3,
+            "the ranked shape must declare exactly two materialized stages (match, then capped candidates), got: {sql}"
+        );
+        let match_stage = ctes[1];
+        assert!(
+            match_stage.contains("@@ plainto_tsquery('simple', $1)"),
+            "the FTS predicate must ride the FIRST materialized stage, got: {match_stage}"
+        );
+        assert!(
+            !match_stage.contains("ORDER BY"),
+            "the match stage must carry no ordering or LIMIT — ordering it is what lets the planner \
+             answer from the recency index and re-parse every row (12.7 s vs 17 ms), got: {match_stage}"
+        );
+        assert!(
+            !match_stage.contains("LIMIT"),
+            "the match stage must be uncapped: the cap belongs to the recency selection above it, got: {match_stage}"
+        );
+        let candidate_stage = ctes[2];
+        assert!(
+            candidate_stage.contains("ORDER BY c.updated_at DESC") && candidate_stage.contains("LIMIT $"),
+            "the second stage takes the newest cap rows of the matched set, got: {candidate_stage}"
+        );
+    }
+
+    /// The ranked recall must bound its candidate set BEFORE ranking:
+    /// `matched AS MATERIALIZED` carries the full-content FTS predicate (the
+    /// preserved deep-match contract) with the session/scope predicates, and
+    /// `candidates AS MATERIALIZED` takes its recency ORDER BY closed by the
+    /// cap LIMIT — the rank expression, the score ORDER BY and the result
+    /// LIMIT all follow the candidate join. Measured driver (2026-11-18, idle prod primary,
     /// 86,110 rows): 'circuit breaker' → 10,805 candidates / 6,093 ms —
     /// ranked cost is O(candidates), so the stage must cap it.
     #[test]
@@ -3358,7 +3409,7 @@ mod tests {
             .find("* 2.0")
             .expect("the key-arm rank weight must be present");
         let stage_at = sql
-            .find("WITH candidates AS MATERIALIZED")
+            .find("candidates AS MATERIALIZED")
             .expect("the candidate stage must be a MATERIALIZED CTE");
         assert!(
             stage_at < rank_at,
@@ -3383,7 +3434,7 @@ mod tests {
             "the session predicate rides the stage"
         );
         let order_at = sql
-            .find("ORDER BY m.updated_at DESC")
+            .find("ORDER BY c.updated_at DESC")
             .expect("the stage recency ORDER BY must be present");
         let cap_at = sql
             .find("LIMIT $4")
