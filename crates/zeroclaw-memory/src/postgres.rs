@@ -1268,6 +1268,23 @@ fn recall_candidate_cap(limit: usize) -> usize {
         .min(crate::POSTGRES_RECALL_CANDIDATE_CAP)
 }
 
+/// Normalize a user query before it is bound into `plainto_tsquery`.
+///
+/// The `simple` text-search parser emits BOTH a compound lexeme and its parts
+/// for a hyphenated run, so `plainto_tsquery('simple', 'bare-json')` parses to
+/// `'bare-json' & 'bare' & 'json'`. A document whose key carries the term only
+/// inside a LONGER hyphen chain (`deploy-executor-step-output-bare-json`)
+/// produces that longer compound and never a standalone `'bare-json'`, so the
+/// conjunction is unsatisfiable and the query returns nothing — silently
+/// (prod evidence 2026-11-20: whole key families unfindable, which reads as
+/// "too fresh" or "absent" to the caller).
+///
+/// Splitting on hyphens makes the query the conjunction of its words, which
+/// matches the key and the body regardless of how the document is hyphenated.
+fn normalize_tsquery_input(query: &str) -> String {
+    query.replace('-', " ")
+}
+
 /// The ranked-recall shape shared by the unscoped and agent-scoped paths: a
 /// `MATERIALIZED` candidate stage bounds the ranked cost to
 /// O(candidate_cap) before the rank expression ever runs (measured
@@ -1563,7 +1580,7 @@ impl Memory for PostgresMemory {
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_recent_recall_query(query).trim().to_string();
+        let query = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
         let sid = session_id.map(str::to_string);
         // The time bounds parse to instants CLIENT-side and bind as
         // timestamptz: a text bind cannot serialize into the
@@ -2152,7 +2169,7 @@ impl Memory for PostgresMemory {
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let q = normalize_recent_recall_query(query).trim().to_string();
+        let q = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
         let sid = session_id.map(str::to_string);
         // The time bounds parse to instants CLIENT-side and bind as
         // timestamptz: a text bind cannot serialize into the
@@ -3045,6 +3062,148 @@ mod tests {
         );
     }
 
+    /// The 2026-11-20 score-display defect: raw `ts_rank_cd` lands ~0.01–0.1
+    /// on prod-sized inputs and the tool renders `{:.0}%` of a 0..1 score, so
+    /// every row displayed `[0%]` and ranking was invisible. Normalization
+    /// flag 32 (`rank/(rank+1)`) lands each arm in 0..1; the key arm keeps
+    /// its 2.0 boost applied AFTER normalization, and the final expression is
+    /// bounded at 1.0 so the rendered percentage can never exceed 100%.
+    #[test]
+    fn recall_rank_expression_normalizes_scores_bounded_in_range() {
+        let sql = recall_rank_expression(RecallTsqueryParse::Strict);
+
+        assert!(
+            sql.contains(
+                "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1), 32) * 2.0"
+            ),
+            "the key arm must carry normalization flag 32 before its 2.0 boost, got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "ts_rank_cd(to_tsvector('simple', left(m.content, 4096)), plainto_tsquery('simple', $1), 32)"
+            ),
+            "the content arm must carry normalization flag 32, got: {sql}"
+        );
+        assert!(
+            sql.contains("LEAST(") && sql.contains(", 1.0)"),
+            "the final score expression must be bounded at 1.0 so the rendered percentage stays in range, got: {sql}"
+        );
+    }
+
+    /// The OR-relaxation shape rides BESIDE the strict shape: identical SQL
+    /// except the parse function. `websearch_to_tsquery` honors the OR
+    /// keyword and can never raise a syntax error on user input (malformed
+    /// text is ignored — the reason the fallback binds a caller-built
+    /// `token or token` string instead of building `to_tsquery` syntax), and
+    /// `plainto_tsquery` cannot express OR at all.
+    #[test]
+    fn ranked_recall_sql_or_relaxation_shape_differs_only_in_the_parse_fn() {
+        for agent_scoped in [false, true] {
+            for (since, until) in [(false, false), (true, false), (false, true), (true, true)] {
+                let strict = ranked_recall_sql(
+                    "mem.memories",
+                    "mem.agents",
+                    agent_scoped,
+                    since,
+                    until,
+                    RecallTsqueryParse::Strict,
+                );
+                let relaxed = ranked_recall_sql(
+                    "mem.memories",
+                    "mem.agents",
+                    agent_scoped,
+                    since,
+                    until,
+                    RecallTsqueryParse::Relaxed,
+                );
+
+                assert_eq!(
+                    strict.matches("plainto_tsquery('simple', $1)").count(),
+                    5,
+                    "the strict shape binds plainto at the stage filter (1) and the rank arms (4), got: {strict}"
+                );
+                assert!(
+                    !strict.contains("websearch_to_tsquery"),
+                    "the strict shape must not carry the relaxed parse fn, got: {strict}"
+                );
+                assert_eq!(
+                    relaxed.matches("websearch_to_tsquery('simple', $1)").count(),
+                    5,
+                    "the relaxed shape binds websearch everywhere the strict shape binds plainto, got: {relaxed}"
+                );
+                assert!(
+                    !relaxed.contains("plainto_tsquery"),
+                    "the relaxed shape must not carry the strict parse fn, got: {relaxed}"
+                );
+                assert_eq!(
+                    strict.replace("plainto_tsquery", "websearch_to_tsquery"),
+                    relaxed,
+                    "the two shapes must differ ONLY in the parse function (same candidate stage, same rank expression, same filters); agent_scoped={agent_scoped} since={since} until={until}"
+                );
+            }
+        }
+    }
+
+    /// The OR-fallback token builder: the normalized query's tokens (hyphens
+    /// already split, empty/punctuation-only tokens dropped — they yield no
+    /// lexeme) joined with websearch's OR keyword. The AND expectation is the
+    /// SAME token sequence joined by single spaces (what the strict shape
+    /// binds); the OR expectation joins them with ` or `. Fewer than two
+    /// tokens means there is nothing to relax — no fallback input is built.
+    #[test]
+    fn or_fallback_input_builds_the_or_shape_from_the_normalized_query() {
+        // AND expectation: the normalized query is the conjunction of its tokens.
+        assert_eq!(normalize_tsquery_input("bare-json"), "bare json");
+        assert_eq!(
+            normalize_tsquery_input("pr drain state waiting_streak"),
+            "pr drain state waiting_streak"
+        );
+        // OR expectation: the SAME tokens joined with websearch's OR keyword.
+        assert_eq!(
+            tsquery_or_fallback_input("bare json").as_deref(),
+            Some("bare or json")
+        );
+        assert_eq!(
+            tsquery_or_fallback_input("pr drain state waiting_streak").as_deref(),
+            Some("pr or drain or state or waiting_streak")
+        );
+    }
+
+    /// A single-token query has no fallback: a one-token OR query IS the same
+    /// conjunction, so the builder returns None and the relaxation never
+    /// fires (pinned at the builder level; the live-tier behavioral pin is
+    /// `postgres_recall_hyphen_key_and_or_relaxation`).
+    #[test]
+    fn or_fallback_input_none_for_single_token() {
+        assert_eq!(tsquery_or_fallback_input("recall"), None);
+        assert_eq!(tsquery_or_fallback_input("  waiting_stre  "), None);
+    }
+
+    /// Punctuation-only input yields no tokens and therefore no fallback:
+    /// punctuation contributes no lexemes, so an OR over it is still empty.
+    #[test]
+    fn or_fallback_input_none_for_punctuation_only() {
+        assert_eq!(tsquery_or_fallback_input("!!! ???"), None);
+        assert_eq!(tsquery_or_fallback_input("---"), None);
+        assert_eq!(tsquery_or_fallback_input("_ :"), None);
+    }
+
+    /// Mixed input: punctuation-only tokens are dropped from the join, and a
+    /// token is kept when it carries ANY alphanumeric character (the simple
+    /// parser will extract its lexeme; `websearch_to_tsquery` ignores the
+    /// rest by design).
+    #[test]
+    fn or_fallback_input_drops_punctuation_only_tokens() {
+        assert_eq!(
+            tsquery_or_fallback_input("bare !!! json").as_deref(),
+            Some("bare or json")
+        );
+        assert_eq!(
+            tsquery_or_fallback_input("(bare) [json]").as_deref(),
+            Some("(bare) or [json]")
+        );
+    }
+
     /// The ranked recall must bound its candidate set BEFORE ranking: a
     /// `WITH candidates AS MATERIALIZED` stage carries the full-content FTS
     /// predicate (the preserved deep-match contract), the session/scope
@@ -3911,6 +4070,93 @@ mod tests {
                     .iter()
                     .map(|e| (e.key.as_str(), e.content.as_str()))
                     .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// The 2026-11-20 bm25 query-quality batch, live: (1) a long hyphen-chain
+    /// key is findable by a hyphenated sub-term (the split normalization),
+    /// (2) a deliberately-unsatisfiable multi-token query relaxes to the OR
+    /// shape and returns the row instead of reading as absence, and (3) a
+    /// single-token query never takes the fallback (nothing to relax).
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_recall_hyphen_key_and_or_relaxation() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "recallorrelax");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            memory
+                .store(
+                    "decision:2026-11-20:deploy-executor-step-output-bare-json",
+                    "the deploy executor step emitted bare json output for zebra umbrella",
+                    MemoryCategory::Core,
+                    Some("orrelax_session"),
+                )
+                .await
+                .unwrap();
+
+            let seeded = memory
+                .recall("bare-json", 10, Some("orrelax_session"), None, None)
+                .await
+                .expect("the hyphenated sub-term recall must PARSE");
+            assert!(
+                seeded.iter().any(|e| e.key.contains("bare-json")),
+                "a hyphenated sub-term must find the long hyphen-chain key via the AND path, got: {:?}",
+                seeded.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+
+            // 'zebra' matches the seeded content; 'qzxnonexistent' matches
+            // nothing — the conjunction is unsatisfiable, so the pre-fix
+            // behavior is ZERO rows (the absence-costume defect). After the
+            // fix the OR-relaxed shape returns the row.
+            let relaxed = memory
+                .recall(
+                    "zebra qzxnonexistent",
+                    10,
+                    Some("orrelax_session"),
+                    None,
+                    None,
+                )
+                .await
+                .expect("the unsatisfiable multi-token recall must PARSE");
+            assert!(
+                relaxed.iter().any(|e| e.key.contains("bare-json")),
+                "an unsatisfiable multi-token AND query must relax to OR and return the matching row, got: {:?}",
+                relaxed.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+            );
+
+            // A single token that matches nothing stays empty: a one-token OR
+            // query IS the same conjunction — there is nothing to relax.
+            let single = memory
+                .recall("qzxnonexistent", 10, Some("orrelax_session"), None, None)
+                .await
+                .expect("the single-token zero-hit recall must PARSE");
+            assert!(
+                single.is_empty(),
+                "a single-token zero-hit query must NOT take the fallback path, got: {:?}",
+                single.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
             );
         });
     }
@@ -5137,5 +5383,33 @@ mod tests {
             "the await must unblock at the timeout, not wait out the operation: {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod hyphen_tsquery_tests {
+    use super::normalize_tsquery_input;
+
+    /// The 2026-11-20 defect: a compound query could never match a key whose
+    /// term sits inside a longer hyphen chain. Splitting makes the query the
+    /// conjunction of its words, which both forms satisfy.
+    #[test]
+    fn splits_hyphenated_compounds_into_words() {
+        assert_eq!(normalize_tsquery_input("bare-json"), "bare json");
+        assert_eq!(
+            normalize_tsquery_input("deploy-executor-step-output-bare-json"),
+            "deploy executor step output bare json"
+        );
+        assert_eq!(normalize_tsquery_input("a--b"), "a  b");
+    }
+
+    /// Non-hyphenated queries pass through untouched (no behaviour change for
+    /// the overwhelmingly common case).
+    #[test]
+    fn leaves_plain_queries_untouched() {
+        assert_eq!(normalize_tsquery_input("circuit breaker"), "circuit breaker");
+        assert_eq!(normalize_tsquery_input("recall"), "recall");
+        assert_eq!(normalize_tsquery_input(""), "");
+        assert_eq!(normalize_tsquery_input("wasmtime_heapless"), "wasmtime_heapless");
     }
 }

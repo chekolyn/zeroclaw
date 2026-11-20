@@ -7,6 +7,24 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::{Memory, POSTGRES_RECALL_CANDIDATE_CAP, RecallExcludes};
 
 /// Let the agent search its own memory
+/// Render a score as a percentage of the STRONGEST hit in the same result set.
+///
+/// Raw `ts_rank_cd` values are tiny (~0.01–0.1), so an ABSOLUTE percentage
+/// truncates every row to `[0%]` — the ranking the caller asked for is then
+/// invisible, and a well-ordered list is indistinguishable from an arbitrary
+/// one (prod observation 2026-11-20). Relative display makes the ordering
+/// legible: the strongest hit reads 100%, the rest proportionally.
+fn format_relative_score(score: Option<f64>, max_score: f64) -> String {
+    score.map_or_else(String::new, |s| {
+        let pct = if max_score > 0.0 {
+            (s / max_score) * 100.0
+        } else {
+            0.0
+        };
+        format!(" [{pct:.0}%]")
+    })
+}
+
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
     /// Three-axis exclude set sourced from `[memory] exclude_namespaces /
@@ -246,6 +264,35 @@ impl Tool for MemoryRecallTool {
             // ranked-recall regression.
             .min(POSTGRES_RECALL_CANDIDATE_CAP);
 
+        // Inclusion filters (category / namespace / key_prefix) are applied
+        // CLIENT-SIDE after the backend call, so asking the backend for
+        // exactly `limit` rows starves any filter over a sparse category: the
+        // 2026-11-20 prod measurement had `category=core` return 3 rows at
+        // limit=10 and 5 at limit=30 in a store holding 2,408 core rows,
+        // because recency is dominated by `sop` ledger writes. Widening the
+        // fetch before filtering restores `limit` as a floor on what the
+        // caller asked for, and the post-filter truncates back to `limit`.
+        //
+        // Bounded by the ranked-recall candidate ceiling: the widening must
+        // never reopen the seconds-scale ranked-recall regression.
+        let has_inclusion_filter = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .is_some()
+            || args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .is_some()
+            || args
+                .get("key_prefix")
+                .and_then(|v| v.as_str())
+                .is_some();
+        let fetch_limit = if has_inclusion_filter {
+            limit.saturating_mul(20).min(POSTGRES_RECALL_CANDIDATE_CAP)
+        } else {
+            limit
+        };
+
         // Prefix mode: list all entries whose key starts with the given prefix
         if let Some(prefix) = args.get("prefix").and_then(|v| v.as_str()) {
             let prefix = prefix.trim();
@@ -268,10 +315,12 @@ impl Tool for MemoryRecallTool {
             .unwrap_or("filtered");
         let skip_excludes = scope.eq_ignore_ascii_case("all");
         let recall_result = if skip_excludes {
-            self.memory.recall(query, limit, None, since, until).await
+            self.memory
+                .recall(query, fetch_limit, None, since, until)
+                .await
         } else {
             self.memory
-                .recall_filtered(query, limit, None, since, until, &self.excludes)
+                .recall_filtered(query, fetch_limit, None, since, until, &self.excludes)
                 .await
         };
 
@@ -295,6 +344,7 @@ impl Tool for MemoryRecallTool {
                     })
                     .filter(|e| namespace_f.map_or(true, |ns| e.namespace == ns))
                     .filter(|e| key_prefix_f.map_or(true, |kp| e.key.starts_with(kp)))
+                    .take(limit)
                     .collect();
                 if entries.is_empty() {
                     return Ok(ToolResult {
@@ -303,11 +353,13 @@ impl Tool for MemoryRecallTool {
                         error: None,
                     });
                 }
+                let max_score = entries
+                    .iter()
+                    .filter_map(|e| e.score)
+                    .fold(0.0_f64, f64::max);
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
-                    let score = entry
-                        .score
-                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+                    let score = format_relative_score(entry.score, max_score);
                     let _ = writeln!(
                         output,
                         "- [{}] {}: {}{score}",
@@ -1170,23 +1222,34 @@ mod tests {
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }
 
+    #[tokio::test]
+    async fn inclusion_filters_widen_the_fetch_before_filtering() {
+        // category/namespace/key_prefix are applied client-side, so asking the
+        // backend for exactly `limit` rows starves sparse categories (prod:
+        // 3 core rows at limit=10 in a store holding 2,408). The fetch must
+        // widen, and the post-filter must truncate back to `limit`.
+        let mem = LimitCaptureMemory::new();
+        let tool = MemoryRecallTool::new(mem.clone());
+        let _ = tool
+            .execute(json!({"query": "anything", "limit": 3, "category": "core"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *mem.last_limit.lock().unwrap(),
+            Some(60),
+            "a category filter must widen the backend fetch (3 x 20)"
+        );
+    }
+
     #[test]
     fn score_formatted_as_percent() {
-        let score: Option<f64> = Some(0.63);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [63%]");
-
-        let score: Option<f64> = Some(0.42);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [42%]");
-
-        let score: Option<f64> = Some(1.0);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [100%]");
-
-        let score: Option<f64> = Some(0.0);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [0%]");
+        // Relative to the strongest hit: raw ts_rank_cd is tiny, so an
+        // absolute percentage showed every row as [0%].
+        assert_eq!(format_relative_score(Some(0.05), 0.05), " [100%]");
+        assert_eq!(format_relative_score(Some(0.025), 0.05), " [50%]");
+        assert_eq!(format_relative_score(Some(0.0), 0.05), " [0%]");
+        assert_eq!(format_relative_score(None, 0.05), "");
+        assert_eq!(format_relative_score(Some(0.0), 0.0), " [0%]");
 
         let score: Option<f64> = None;
         let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
