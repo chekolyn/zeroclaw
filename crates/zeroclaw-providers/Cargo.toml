@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1.10"
@@ -46,6 +47,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
@@ -63,3 +65,11 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [features]
 default = []
 test-helpers = []
+# OTel meter emission for the provider retry/rate-limit wait path. Chained
+# from the runtime's `observability-otel` feature (the gateway image builds
+# with it); off, every emission compiles to a no-op.
+observability-otel = ["dep:opentelemetry"]
+
+[[test]]
+name = "rate_limit_telemetry"
+required-features = ["observability-otel"]
