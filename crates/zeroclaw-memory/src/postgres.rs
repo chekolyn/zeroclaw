@@ -1126,14 +1126,81 @@ impl RecallTsqueryParse {
 /// lexeme, so punctuation-only fragments are dropped — an OR over them is
 /// still empty). Fewer than two tokens means there is nothing to relax: a
 /// one-token OR IS the same conjunction, so no fallback is built.
+/// The relaxation's term budget.
+///
+/// GIN walks one posting list per DISTINCT lexeme in the tsquery, so the OR
+/// arm's cost is linear in the term count and independent of the row count —
+/// measured on the prod primary (2026-11-21, 93,749 rows / 1.7 GB): 12 terms
+/// = 85 ms, ~450 terms (a 10 KB agent message) = 4.77 s. Twelve is the
+/// deliberate ceiling: past it the disjunction stops being a query and
+/// becomes a scan that can only be ranked by how often a row repeats the
+/// most common word in the message.
+const RECALL_OR_RELAX_MAX_TERMS: usize = 12;
+
+/// The query bind's character budget.
+///
+/// The per-turn memory injection hands over the WHOLE user message, and the
+/// conjunction arm pays a per-lexeme cost too: a 50 KB message measured 117 s
+/// of primary time on the same 93,749-row store (per-row tsvector reparse of
+/// 1.7 GB), which only ever ends at the 8 s statement timeout — after which
+/// the caller receives the recent-entries fallback instead of a recall. The
+/// budget is a prefix of the caller's own words, never a rewrite, cut at a
+/// word boundary so the last term is a term the caller actually wrote.
+const RECALL_QUERY_CHAR_BUDGET: usize = 1024;
+
+/// Bound a normalized recall query to [`RECALL_QUERY_CHAR_BUDGET`] characters,
+/// cutting at the last word boundary inside the budget.
+///
+/// Applied by the backend rather than left to each caller: the measured
+/// offenders are the runtime's per-turn injection and the dispatch/SOP paths,
+/// none of which know the store's per-lexeme cost, and a new caller added
+/// tomorrow inherits the bound only if it lives here.
+fn bound_recall_query(query: &str) -> String {
+    let trimmed = query.trim();
+    let mut chars = 0usize;
+    let mut cut = None;
+    for (idx, _) in trimmed.char_indices() {
+        if chars == RECALL_QUERY_CHAR_BUDGET {
+            cut = Some(idx);
+            break;
+        }
+        chars += 1;
+    }
+    let Some(cut) = cut else {
+        return trimmed.to_string();
+    };
+    let head = &trimmed[..cut];
+    // A half token is not a term the caller wrote; give the tail of the
+    // budget back to the words that fit whole.
+    match head.rfind(char::is_whitespace) {
+        Some(at) if at > 0 => head[..at].trim_end().to_string(),
+        _ => head.to_string(),
+    }
+}
+
 fn tsquery_or_fallback_input(query: &str) -> Option<String> {
     // Whitespace-split, then drop tokens that carry no lexeme at all. The
     // punctuation AROUND a token is kept: `websearch_to_tsquery` ignores it,
-    // and stripping it would rewrite the caller's terms.
-    let tokens: Vec<&str> = query
-        .split_whitespace()
-        .filter(|token| token.chars().any(char::is_alphanumeric))
-        .collect();
+    // and stripping it would rewrite the caller's terms. Duplicates fold into
+    // one term (the parser lowercases before it looks anything up), and the
+    // DISTINCT count is capped at `RECALL_OR_RELAX_MAX_TERMS` so a long
+    // message cannot turn the fallback into a full scan.
+    let mut folded_seen: Vec<String> = Vec::new();
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in query.split_whitespace() {
+        if !token.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        let folded = token.to_ascii_lowercase();
+        if folded_seen.iter().any(|seen| seen == &folded) {
+            continue;
+        }
+        folded_seen.push(folded);
+        tokens.push(token);
+        if tokens.len() == RECALL_OR_RELAX_MAX_TERMS {
+            break;
+        }
+    }
     if tokens.len() < 2 {
         None
     } else {
@@ -1664,9 +1731,11 @@ impl PostgresMemory {
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_tsquery_input(normalize_recent_recall_query(query))
-            .trim()
-            .to_string();
+        // Normalize, then bound: every caller of every recall shape funnels
+        // through here, so the per-lexeme budget is inherited rather than
+        // re-implemented per call site.
+        let query =
+            bound_recall_query(&normalize_tsquery_input(normalize_recent_recall_query(query)));
         let sid = session_id.map(str::to_string);
         // The time bounds parse to instants CLIENT-side and bind as
         // timestamptz: a text bind cannot serialize into the
@@ -3331,6 +3400,59 @@ mod tests {
             tsquery_or_fallback_input("(bare) [json]").as_deref(),
             Some("(bare) or [json]")
         );
+    }
+
+    /// A relaxation is a bounded RETRIEVAL, not a scan.
+    ///
+    /// `websearch_to_tsquery` ORs every token, and GIN walks one posting list
+    /// per DISTINCT lexeme, so relaxation cost is linear in the term count and
+    /// independent of the row count. Measured on the prod primary (2026-11-21,
+    /// 93,749 rows / 1.7 GB): a 12-term OR costs 85 ms; the ~450-term OR that a
+    /// 10 KB agent message produces costs 4.77 s, and a 50 KB message's
+    /// conjunction costs 117 s. The per-turn memory injection passes the WHOLE
+    /// user message as the query — that is the 8 s budget timeout behind the
+    /// 237-degraded-in-10-minutes ratio the outcome counter surfaced.
+    #[test]
+    fn or_fallback_input_caps_distinct_terms() {
+        let long = (0..40).map(|i| format!("term{i}")).collect::<Vec<_>>().join(" ");
+        let built = tsquery_or_fallback_input(&long).expect("a multi-token query relaxes");
+        assert_eq!(built.split(" or ").count(), RECALL_OR_RELAX_MAX_TERMS);
+        assert!(built.starts_with("term0 or term1"), "message order is preserved: {built}");
+    }
+
+    /// Duplicates are ONE posting list, so the cap counts DISTINCT terms — a
+    /// message that repeats the same words must not spend the budget
+    /// re-walking a list it already walked. The fold is case-insensitive
+    /// because `websearch_to_tsquery` lowercases before it looks anything up.
+    #[test]
+    fn or_fallback_input_dedupes_case_insensitively_before_capping() {
+        assert_eq!(
+            tsquery_or_fallback_input("Alpha alpha ALPHA beta Beta gamma").as_deref(),
+            Some("Alpha or beta or gamma")
+        );
+    }
+
+    /// The backend bounds the query bind itself rather than trusting every
+    /// caller to trim: the injection path hands over an entire turn message,
+    /// and a 50 KB one measured 117 s of primary time (per-row tsvector
+    /// reparse) — bounded only by the 8 s statement timeout, after which the
+    /// caller gets the recent-entries fallback instead of a recall.
+    #[test]
+    fn bound_recall_query_caps_length_at_a_word_boundary() {
+        let long = "alpha bravo charlie delta ".repeat(200);
+        let bounded = bound_recall_query(&long);
+        assert!(bounded.chars().count() <= RECALL_QUERY_CHAR_BUDGET);
+        assert!(long.starts_with(&bounded), "a bound is a prefix, never a rewrite");
+        let rest = &long[bounded.len()..];
+        assert!(
+            rest.is_empty() || rest.starts_with(' '),
+            "cut at a word boundary, not mid-token: {bounded}"
+        );
+        // A single unterminated token still bounds (no whitespace to cut at).
+        let no_space = "x".repeat(RECALL_QUERY_CHAR_BUDGET * 2);
+        assert_eq!(bound_recall_query(&no_space).chars().count(), RECALL_QUERY_CHAR_BUDGET);
+        // Short queries pass through untouched.
+        assert_eq!(bound_recall_query("proj:pr-drain:lock"), "proj:pr-drain:lock");
     }
 
     /// The 2026-11-21 plan defect, pinned structurally: the full-content FTS
