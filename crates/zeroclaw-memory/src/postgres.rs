@@ -1268,6 +1268,23 @@ fn recall_candidate_cap(limit: usize) -> usize {
         .min(crate::POSTGRES_RECALL_CANDIDATE_CAP)
 }
 
+/// Normalize a user query before it is bound into `plainto_tsquery`.
+///
+/// The `simple` text-search parser emits BOTH a compound lexeme and its parts
+/// for a hyphenated run, so `plainto_tsquery('simple', 'bare-json')` parses to
+/// `'bare-json' & 'bare' & 'json'`. A document whose key carries the term only
+/// inside a LONGER hyphen chain (`deploy-executor-step-output-bare-json`)
+/// produces that longer compound and never a standalone `'bare-json'`, so the
+/// conjunction is unsatisfiable and the query returns nothing — silently
+/// (prod evidence 2026-11-20: whole key families unfindable, which reads as
+/// "too fresh" or "absent" to the caller).
+///
+/// Splitting on hyphens makes the query the conjunction of its words, which
+/// matches the key and the body regardless of how the document is hyphenated.
+fn normalize_tsquery_input(query: &str) -> String {
+    query.replace('-', " ")
+}
+
 /// The ranked-recall shape shared by the unscoped and agent-scoped paths: a
 /// `MATERIALIZED` candidate stage bounds the ranked cost to
 /// O(candidate_cap) before the rank expression ever runs (measured
@@ -1563,7 +1580,7 @@ impl Memory for PostgresMemory {
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_recent_recall_query(query).trim().to_string();
+        let query = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
         let sid = session_id.map(str::to_string);
         // The time bounds parse to instants CLIENT-side and bind as
         // timestamptz: a text bind cannot serialize into the
@@ -2152,7 +2169,7 @@ impl Memory for PostgresMemory {
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let q = normalize_recent_recall_query(query).trim().to_string();
+        let q = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
         let sid = session_id.map(str::to_string);
         // The time bounds parse to instants CLIENT-side and bind as
         // timestamptz: a text bind cannot serialize into the
@@ -5137,5 +5154,33 @@ mod tests {
             "the await must unblock at the timeout, not wait out the operation: {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod hyphen_tsquery_tests {
+    use super::normalize_tsquery_input;
+
+    /// The 2026-11-20 defect: a compound query could never match a key whose
+    /// term sits inside a longer hyphen chain. Splitting makes the query the
+    /// conjunction of its words, which both forms satisfy.
+    #[test]
+    fn splits_hyphenated_compounds_into_words() {
+        assert_eq!(normalize_tsquery_input("bare-json"), "bare json");
+        assert_eq!(
+            normalize_tsquery_input("deploy-executor-step-output-bare-json"),
+            "deploy executor step output bare json"
+        );
+        assert_eq!(normalize_tsquery_input("a--b"), "a  b");
+    }
+
+    /// Non-hyphenated queries pass through untouched (no behaviour change for
+    /// the overwhelmingly common case).
+    #[test]
+    fn leaves_plain_queries_untouched() {
+        assert_eq!(normalize_tsquery_input("circuit breaker"), "circuit breaker");
+        assert_eq!(normalize_tsquery_input("recall"), "recall");
+        assert_eq!(normalize_tsquery_input(""), "");
+        assert_eq!(normalize_tsquery_input("wasmtime_heapless"), "wasmtime_heapless");
     }
 }
