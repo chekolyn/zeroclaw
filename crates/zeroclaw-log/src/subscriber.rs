@@ -17,6 +17,17 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::event::ZeroclawAttribution;
 use crate::layer::{F_EPHEMERAL_ATTRS, LogCaptureLayer};
 
+/// The stderr fmt layer's filter when `--verbose` is off. Structured
+/// `zeroclaw_log_event` records at WARN and above reach the container
+/// stream (the forensic channel for the provider rate-limit WARNs and the
+/// other structured failures); everything else — DEBUG chatter like the
+/// cooldown-skip notes, INFO flow records, and every foreign target — stays
+/// off the stream. The recording floor (the JSONL capture) keeps its own
+/// filter and is unaffected.
+fn non_verbose_fmt_filter() -> EnvFilter {
+    EnvFilter::new("zeroclaw_log_event=warn")
+}
+
 pub fn install_global_subscriber(
     recording_override: Option<&str>,
     default_filter: &str,
@@ -38,7 +49,7 @@ pub fn install_global_subscriber(
             }
         }
     } else {
-        EnvFilter::new("off")
+        non_verbose_fmt_filter()
     };
 
     let fmt_layer = fmt::layer()
@@ -1367,6 +1378,64 @@ mod tests {
             !line.contains("log.target"),
             "normalized metadata must replace the raw `log.*` transport fields \
              rather than printing them alongside: {line:?}"
+        );
+    }
+
+    #[test]
+    fn non_verbose_fmt_filter_passes_warn_zeroclaw_log_event_and_blocks_the_rest() {
+        // The stderr fmt layer with `--verbose` off must surface structured
+        // `zeroclaw_log_event` records at WARN and above (the forensic
+        // channel for the provider rate-limit WARNs) while staying silent
+        // for DEBUG chatter, INFO flow records, and every other target —
+        // the non-verbose stream carries ONLY structured zeroclaw records.
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new())
+            .with_filter(non_verbose_fmt_filter());
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            crate::record!(
+                WARN,
+                crate::Event::new(module_path!(), crate::Action::Note)
+                    .with_outcome(crate::EventOutcome::Unknown)
+                    .with_attrs(serde_json::json!({"probe": "warn"})),
+                "warn lands on the stream"
+            );
+            crate::record!(
+                DEBUG,
+                crate::Event::new(module_path!(), crate::Action::Note),
+                "debug stays off the stream"
+            );
+            crate::record!(
+                INFO,
+                crate::Event::new(module_path!(), crate::Action::Note),
+                "info stays off the stream"
+            );
+            tracing::warn!(target: "some_other_target", "unstructured warn stays off the stream");
+        });
+
+        let captured = buf.0.lock().expect("test buffer mutex").clone();
+        let text = String::from_utf8(captured).expect("fmt output is utf-8");
+        assert!(
+            text.contains("warn lands on the stream"),
+            "a WARN zeroclaw_log_event record must pass the non-verbose filter: {text:?}"
+        );
+        assert!(
+            !text.contains("debug stays off the stream"),
+            "a DEBUG record must not pass the non-verbose filter: {text:?}"
+        );
+        assert!(
+            !text.contains("info stays off the stream"),
+            "an INFO record must not pass the non-verbose filter: {text:?}"
+        );
+        assert!(
+            !text.contains("unstructured warn stays off the stream"),
+            "a foreign-target WARN must not pass the scoped filter: {text:?}"
         );
     }
 }

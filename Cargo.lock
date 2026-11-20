@@ -7099,6 +7099,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -14474,6 +14475,8 @@ dependencies = [
  "image",
  "libc",
  "nix 0.30.1",
+ "opentelemetry 0.33.0",
+ "opentelemetry_sdk 0.33.0",
  "parking_lot",
  "process-wrap",
  "rand 0.10.2",

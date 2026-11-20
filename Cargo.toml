@@ -431,7 +431,7 @@ observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
     "zeroclaw-gateway?/observability-prometheus",
 ]
-observability-otel = ["zeroclaw-runtime/observability-otel", "zeroclaw-log/otel-bridge"]
+observability-otel = ["zeroclaw-runtime/observability-otel", "zeroclaw-log/otel-bridge", "zeroclaw-providers/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 # Forwards `zeroclaw-hardware/dev-sim`: extends the serial allow-list with

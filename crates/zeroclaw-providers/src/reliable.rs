@@ -13,6 +13,7 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage,
 };
+use crate::telemetry::{self, ShapedBy, WaitClass};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
@@ -1537,8 +1538,10 @@ fn provider_retry_attrs(
 
 /// Cadence attrs for an in-place rate-limit wait (spec 2026-11-15 provider
 /// rate-limit backoff, §5): the generic retry attrs with `reason` pinned to
-/// `rate_limited`, plus `rate_limit_events` (real 429s so far this call) and
-/// `cooldown_ms` present only when the remaining-cooldown term shaped the
+/// `rate_limited`, plus `rate_limit_events` (real 429s so far this call),
+/// `retry_after_ms` (the strongest Retry-After seen so far this call,
+/// omitted before the first real 429), and `cooldown_ms` present only when
+/// the remaining-cooldown term shaped the
 /// wait (cooldown term ≥ doubling term and ≥ retry-after term and > 0).
 fn rate_limit_retry_attrs(
     provider_name: &str,
@@ -1548,6 +1551,7 @@ fn rate_limit_retry_attrs(
     error_detail: &str,
     diagnostic: &ProviderErrorDiagnostic,
     cooldown_ms: Option<u64>,
+    retry_after_ms: Option<u64>,
     rate_limit_events: u32,
 ) -> serde_json::Value {
     let mut attrs = provider_retry_attrs(
@@ -1561,6 +1565,12 @@ fn rate_limit_retry_attrs(
     );
     if let Some(cooldown_ms) = cooldown_ms {
         attrs["cooldown_ms"] = serde_json::json!(cooldown_ms);
+    }
+    if let Some(retry_after_ms) = retry_after_ms {
+        // The strongest Retry-After seen among this call's real 429s so far
+        // (the ledger's per-call max) — computed since the ledger landed and
+        // never emitted before this surface.
+        attrs["retry_after_ms"] = serde_json::json!(retry_after_ms);
     }
     attrs["rate_limit_events"] = serde_json::json!(rate_limit_events);
     attrs
@@ -2174,6 +2184,52 @@ pub static RATE_LIMIT_CALL_ORDINAL: AtomicU64 = AtomicU64::new(0);
 /// jittered and finally clamped by the whole-expression bound
 /// `min(cap_ms, budget_remaining_ms)`. A zero remaining budget returns zero:
 /// the caller's fail-fast signal. Pure, zero sleeps — the caller owns the wait.
+/// Compute the rate-limit wait AND how it was shaped — the ONE computation
+/// site for the curve and its classification, so the emitted `shaped_by`
+/// can never drift from the wait itself.
+///
+/// Classification priority: a clamp that bound the wait wins first
+/// (`BudgetClamp`, then `CapClamp`), then the dominant pre-jitter term. The
+/// `Cooldown` arm is EXACTLY the historical `cooldown_shaped` predicate
+/// (`cooldown > 0 && cooldown >= doubling && cooldown >= retry_after_term`)
+/// — pinned by `shaped_by_cooldown_arm_equals_the_cooldown_shaped_predicate`
+/// below. A clamp-armed wait deliberately diverges from that predicate in
+/// the label: the log record keeps emitting `cooldown_ms` off the raw-term
+/// predicate, while the meter names what bounded the final wait.
+pub(crate) fn rate_limit_wait_shaped(
+    base_ms: u64,
+    attempt: u32,
+    cap_ms: u64,
+    budget_remaining_ms: u64,
+    cooldown_remaining_ms: u64,
+    retry_after_ms: Option<u64>,
+    jitter_scale: f64,
+) -> (u64, ShapedBy) {
+    let doubling = base_ms
+        .saturating_mul(2u64.saturating_pow(attempt))
+        .min(cap_ms);
+    let retry_after_term = retry_after_ms.map_or(0, |ms| ms.min(cap_ms));
+    let raw = doubling.max(cooldown_remaining_ms).max(retry_after_term);
+    // Float→int `as` saturates: NaN/negative → 0, +inf → u64::MAX.
+    let jittered = (raw as f64 * jitter_scale) as u64;
+    let wait = jittered.min(cap_ms).min(budget_remaining_ms);
+    let shaped_by = if wait == budget_remaining_ms && budget_remaining_ms < jittered {
+        ShapedBy::BudgetClamp
+    } else if wait == cap_ms && cap_ms < jittered {
+        ShapedBy::CapClamp
+    } else if cooldown_remaining_ms > 0
+        && cooldown_remaining_ms >= doubling
+        && cooldown_remaining_ms >= retry_after_term
+    {
+        ShapedBy::Cooldown
+    } else if retry_after_term > 0 && retry_after_term >= doubling {
+        ShapedBy::RetryAfter
+    } else {
+        ShapedBy::Doubling
+    };
+    (wait, shaped_by)
+}
+
 pub fn rate_limit_wait_ms(
     base_ms: u64,
     attempt: u32,
@@ -2183,14 +2239,16 @@ pub fn rate_limit_wait_ms(
     retry_after_ms: Option<u64>,
     jitter_scale: f64,
 ) -> u64 {
-    let doubling = base_ms
-        .saturating_mul(2u64.saturating_pow(attempt))
-        .min(cap_ms);
-    let retry_after_term = retry_after_ms.map_or(0, |ms| ms.min(cap_ms));
-    let raw = doubling.max(cooldown_remaining_ms).max(retry_after_term);
-    // Float→int `as` saturates: NaN/negative → 0, +inf → u64::MAX.
-    let jittered = (raw as f64 * jitter_scale) as u64;
-    jittered.min(cap_ms).min(budget_remaining_ms)
+    rate_limit_wait_shaped(
+        base_ms,
+        attempt,
+        cap_ms,
+        budget_remaining_ms,
+        cooldown_remaining_ms,
+        retry_after_ms,
+        jitter_scale,
+    )
+    .0
 }
 
 /// Deterministic ±20% jitter scale in `[0.8, 1.2]` for the rate-limit wait
@@ -2313,17 +2371,38 @@ impl ReliableModelProvider {
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
+    ///
+    /// Test-only since the shaped variant replaced the production callers:
+    /// every retry site now consumes `compute_backoff_shaped` (one pass →
+    /// wait AND shaping, never disagreeing), and these curve pins are the
+    /// wrapper's remaining callers.
+    #[cfg(test)]
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
+        self.compute_backoff_shaped(base, err).0
+    }
+
+    /// The backoff computation WITH its shaping classification — the same
+    /// single pass as `compute_backoff`, returning how the wait was shaped
+    /// for the telemetry emission.
+    fn compute_backoff_shaped(&self, base: u64, err: &anyhow::Error) -> (u64, ShapedBy) {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Use Retry-After but cap at 30s to avoid indefinite waits
-            retry_after.min(30_000).max(base)
+            let shaped = if retry_after > 30_000 {
+                ShapedBy::RetryAfterCapped
+            } else {
+                ShapedBy::RetryAfter
+            };
+            (retry_after.min(30_000).max(base), shaped)
         } else if is_overloaded(err) {
             // Overload sheds arrive without a Retry-After; an immediate
             // re-send lands back in the same shed window, so hold at least
             // the floor. Growth across attempts stays the loop's doubling.
-            base.max(Self::OVERLOAD_BACKOFF_FLOOR_MS)
+            (
+                base.max(Self::OVERLOAD_BACKOFF_FLOOR_MS),
+                ShapedBy::OverloadFloor,
+            )
         } else {
-            base
+            (base, ShapedBy::Doubling)
         }
     }
 
@@ -2521,6 +2600,7 @@ impl ReliableModelProvider {
     }
 
     fn log_cooldown_skip(&self, provider_name: &str, model: &str) {
+        telemetry::emit_cooldown_skip(provider_name);
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -2611,11 +2691,12 @@ impl ReliableModelProvider {
         ledger.retry_after_max_ms = ledger.retry_after_max_ms.max(retry_after_ms);
 
         if ledger.budget_remaining_ms == 0 {
+            telemetry::emit_budget_exhausted(entry.display_name.as_str());
             return RateLimitWaitOutcome::BudgetExhausted;
         }
         let budget_remaining_ms = ledger.budget_remaining_ms;
         let cooldown_term_ms = cooldown_remaining.as_millis() as u64;
-        let wait = rate_limit_wait_ms(
+        let (wait, shaped_by) = rate_limit_wait_shaped(
             self.base_backoff_ms,
             attempt,
             self.provider_max_backoff_ms,
@@ -2625,6 +2706,7 @@ impl ReliableModelProvider {
             jitter_scale_for(call_ordinal, attempt),
         );
         if wait == 0 {
+            telemetry::emit_budget_exhausted(entry.display_name.as_str());
             return RateLimitWaitOutcome::BudgetExhausted;
         }
 
@@ -2652,9 +2734,16 @@ impl ReliableModelProvider {
                     error_detail,
                     diagnostic,
                     cooldown_shaped.then_some(cooldown_term_ms),
+                    ledger.retry_after_max_ms,
                     ledger.real_rate_limit_events,
                 )),
             "ModelProvider rate-limited; waiting in place before retry"
+        );
+        telemetry::emit_wait(
+            entry.display_name.as_str(),
+            WaitClass::RateLimit,
+            shaped_by,
+            wait,
         );
         tokio::time::sleep(Duration::from_millis(wait)).await;
         ledger.budget_remaining_ms -= wait;
@@ -3092,7 +3181,13 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let (wait, shaped_by) = self.compute_backoff_shaped(backoff_ms, &e);
+                                telemetry::emit_wait(
+                                    provider_name,
+                                    WaitClass::Backoff,
+                                    shaped_by,
+                                    wait,
+                                );
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -3498,7 +3593,13 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let (wait, shaped_by) = self.compute_backoff_shaped(backoff_ms, &e);
+                                telemetry::emit_wait(
+                                    provider_name,
+                                    WaitClass::Backoff,
+                                    shaped_by,
+                                    wait,
+                                );
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -4039,7 +4140,13 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let (wait, shaped_by) = self.compute_backoff_shaped(backoff_ms, &e);
+                                telemetry::emit_wait(
+                                    provider_name,
+                                    WaitClass::Backoff,
+                                    shaped_by,
+                                    wait,
+                                );
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -4508,7 +4615,13 @@ impl ModelProvider for ReliableModelProvider {
                                         }
                                     }
                                 }
-                                let wait = self.compute_backoff(backoff_ms, &e);
+                                let (wait, shaped_by) = self.compute_backoff_shaped(backoff_ms, &e);
+                                telemetry::emit_wait(
+                                    provider_name,
+                                    WaitClass::Backoff,
+                                    shaped_by,
+                                    wait,
+                                );
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -15174,6 +15287,163 @@ mod tests {
     }
 
     #[test]
+    fn shaped_by_priority_matrix_pins_every_arm_and_the_priority_order() {
+        use super::ShapedBy;
+        // Doubling: no cooldown, no Retry-After, no clamp anywhere.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 0, None, 1.0),
+            (2000, ShapedBy::Doubling)
+        );
+        // RetryAfter dominates a smaller doubling term.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 0, Some(30_000), 1.0),
+            (30_000, ShapedBy::RetryAfter)
+        );
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 1, 60_000, u64::MAX, 0, Some(5000), 1.0),
+            (5000, ShapedBy::RetryAfter)
+        );
+        // A Retry-After BELOW the doubling term stays doubling.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 0, Some(1000), 1.0),
+            (2000, ShapedBy::Doubling)
+        );
+        // Cooldown dominates both other terms.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 45_000, None, 1.0),
+            (45_000, ShapedBy::Cooldown)
+        );
+        // The >= boundary holds: a cooldown exactly at the doubling term wins.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 1, 60_000, u64::MAX, 4000, None, 1.0),
+            (4000, ShapedBy::Cooldown)
+        );
+        // Cooldown loses to a larger Retry-After term.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 10_000, Some(20_000), 1.0),
+            (20_000, ShapedBy::RetryAfter)
+        );
+        // Cooldown loses to a larger doubling term.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 1000, None, 1.0),
+            (2000, ShapedBy::Doubling)
+        );
+        // CapClamp: the ceiling bound the wait even though the cooldown term
+        // shaped the raw value.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, u64::MAX, 120_000, None, 1.0),
+            (60_000, ShapedBy::CapClamp)
+        );
+        // CapClamp via the jitter band: 45000 * 1.2 exceeds the 50 s cap.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 50_000, u64::MAX, 45_000, None, 1.2),
+            (50_000, ShapedBy::CapClamp)
+        );
+        // BudgetClamp: the remaining per-call budget bound the wait.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, 10_000, 45_000, None, 1.0),
+            (10_000, ShapedBy::BudgetClamp)
+        );
+        // Priority: budget_clamp beats cap_clamp (both clamp candidates
+        // present, the smaller budget wins the label).
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 5000, 3000, 45_000, None, 1.0),
+            (3000, ShapedBy::BudgetClamp)
+        );
+        // Equality edges are NOT clamps: budget == jittered == cap leaves the
+        // wait at the shaped value, classified by term.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 2000, 2000, 0, None, 1.0),
+            (2000, ShapedBy::Doubling)
+        );
+        // budget == jittered (< cap) is a pass-through, not a budget clamp:
+        // the strict `<` keeps the cooldown label.
+        assert_eq!(
+            rate_limit_wait_shaped(2000, 0, 60_000, 45_000, 45_000, None, 1.0),
+            (45_000, ShapedBy::Cooldown)
+        );
+    }
+
+    #[test]
+    fn shaped_by_cooldown_arm_equals_the_cooldown_shaped_predicate() {
+        use super::ShapedBy;
+        // The classification's cooldown arm must be EXACTLY the predicate
+        // the WARN record's `cooldown_ms` presence has always used. The
+        // clamps are held out of the way (budget = MAX, cap above every raw
+        // value) so the priority order cannot mask the equivalence.
+        for base in [50_u64, 2000] {
+            for attempt in 0..=4u32 {
+                let doubling = base.saturating_mul(2u64.saturating_pow(attempt));
+                for cooldown in [0_u64, 1, 1000, 4000, 45_000, 120_000] {
+                    for retry_after in [None, Some(500_u64), Some(30_000), Some(1_000_000_000)] {
+                        let cap = doubling.max(cooldown).max(retry_after.unwrap_or(0)) + 1;
+                        let (_, shaped_by) = rate_limit_wait_shaped(
+                            base,
+                            attempt,
+                            cap,
+                            u64::MAX,
+                            cooldown,
+                            retry_after,
+                            1.0,
+                        );
+                        // The site's own predicate, verbatim (reliable.rs
+                        // `cooldown_shaped`): pre-jitter terms, cooldown
+                        // term capped the same way as the wait fn.
+                        let retry_after_term = retry_after.map_or(0, |ms| ms.min(cap));
+                        let cooldown_shaped = cooldown > 0
+                            && cooldown >= doubling.min(cap)
+                            && cooldown >= retry_after_term;
+                        assert_eq!(
+                            shaped_by == ShapedBy::Cooldown,
+                            cooldown_shaped,
+                            "cooldown arm vs cooldown_shaped diverged: base {base} \
+                             attempt {attempt} cap {cap} cooldown {cooldown} \
+                             retry_after {retry_after:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_backoff_classification_pins_each_arm() {
+        use super::ShapedBy;
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        // A Retry-After honoured as-is (below the 30 s cap).
+        let err = anyhow::Error::msg("429 Retry-After: 3");
+        assert_eq!(
+            model_provider.compute_backoff_shaped(500, &err),
+            (3_000, ShapedBy::RetryAfter)
+        );
+        // A Retry-After above the 30 s cap is honoured at the cap and
+        // labelled capped.
+        let err = anyhow::Error::msg("429 Retry-After: 120");
+        assert_eq!(
+            model_provider.compute_backoff_shaped(500, &err),
+            (30_000, ShapedBy::RetryAfterCapped)
+        );
+        // A Retry-After below the base still counts the branch as retry_after.
+        let err = anyhow::Error::msg("429 Retry-After: 0.5");
+        assert_eq!(
+            model_provider.compute_backoff_shaped(500, &err),
+            (500, ShapedBy::RetryAfter)
+        );
+        // The overload floor applies when no Retry-After parsed.
+        let err = anyhow::Error::msg("ModelProvider error: overloaded_error: Overloaded");
+        assert_eq!(
+            model_provider.compute_backoff_shaped(500, &err),
+            (2_000, ShapedBy::OverloadFloor)
+        );
+        // The default arm: the doubling curve, unchanged.
+        let err = anyhow::Error::msg("500 Server Error");
+        assert_eq!(
+            model_provider.compute_backoff_shaped(500, &err),
+            (500, ShapedBy::Doubling)
+        );
+    }
+
+    #[test]
     fn jitter_scale_for_stays_in_band_and_is_deterministic() {
         for call_ordinal in 0..=999u64 {
             for attempt in 0..=13u32 {
@@ -15457,6 +15727,7 @@ mod tests {
             "HTTP 429 Too Many Requests",
             &diagnostic,
             Some(45_000),
+            Some(30_000),
             2,
         );
         assert_eq!(attrs["attempt"], serde_json::json!(3));
@@ -15464,6 +15735,9 @@ mod tests {
         assert_eq!(attrs["reason"], serde_json::json!("rate_limited"));
         assert_eq!(attrs["rate_limit_events"], serde_json::json!(2));
         assert_eq!(attrs["cooldown_ms"], serde_json::json!(45_000));
+        // The per-call max Retry-After is computed at the ledger and was
+        // never emitted; the WARN record now carries it.
+        assert_eq!(attrs["retry_after_ms"], serde_json::json!(30_000));
 
         let unshaped = rate_limit_retry_attrs(
             "provider-name",
@@ -15473,9 +15747,14 @@ mod tests {
             "HTTP 429 Too Many Requests",
             &diagnostic,
             None,
+            None,
             2,
         );
         assert!(unshaped.get("cooldown_ms").is_none());
+        assert!(
+            unshaped.get("retry_after_ms").is_none(),
+            "no Retry-After seen so far → the attr stays absent"
+        );
         assert_eq!(unshaped["rate_limit_events"], serde_json::json!(2));
     }
 

@@ -31,6 +31,7 @@ pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
+pub(crate) mod telemetry;
 pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
