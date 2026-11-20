@@ -25,7 +25,7 @@
 
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ProceduralMessage, RecallExcludes, StoreOptions,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -690,6 +690,33 @@ impl Memory for RetrievalPipeline {
             .await;
         self.invalidate_cache();
         result
+    }
+
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Not cached, like `recall_for_agents` above: a correct cache key
+        // would have to carry the exclusion axes, and a stale hit would serve
+        // excluded rows.
+        self.memory
+            .recall_filtered_scoped(
+                excludes,
+                allowed_agent_ids,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+            )
+            .await
     }
 
     async fn recall_for_agents(

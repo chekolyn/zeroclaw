@@ -1,7 +1,8 @@
 //! PostgreSQL-backed memory implementation.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, RecallExcludes,
+    normalize_recent_recall_query,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -1256,6 +1257,7 @@ fn recent_recall_sql(
     let time_filter = recall_time_filter(since, until, 2);
     let categories_placeholder = 2 + usize::from(since) + usize::from(until);
     let limit_placeholder = categories_placeholder + 1;
+    let exclude_filter = recall_exclude_predicate(limit_placeholder + 1);
     let session_filter = recall_session_scope_predicate(1, categories_placeholder);
     format!(
         "
@@ -1263,7 +1265,7 @@ fn recent_recall_sql(
         FROM {qualified_table} m
         LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
         WHERE {session_filter}
-          {time_filter}
+          {time_filter}{exclude_filter}
         ORDER BY m.updated_at DESC
         LIMIT ${limit_placeholder}
         "
@@ -1287,6 +1289,7 @@ fn recent_recall_sql_for_agents(
     let time_filter = recall_time_filter(since, until, 3);
     let categories_placeholder = 3 + usize::from(since) + usize::from(until);
     let limit_placeholder = categories_placeholder + 1;
+    let exclude_filter = recall_exclude_predicate(limit_placeholder + 1);
     let session_filter = recall_session_scope_predicate(2, categories_placeholder);
     format!(
         "
@@ -1295,7 +1298,7 @@ fn recent_recall_sql_for_agents(
         LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
         WHERE m.agent_id = ANY($1)
           AND {session_filter}
-          {time_filter}
+          {time_filter}{exclude_filter}
         ORDER BY m.updated_at DESC
         LIMIT ${limit_placeholder}
         "
@@ -1329,6 +1332,40 @@ fn recall_candidate_cap(limit: usize) -> usize {
 /// matches the key and the body regardless of how the document is hyphenated.
 fn normalize_tsquery_input(query: &str) -> String {
     query.replace('-', " ")
+}
+
+/// The three-axis exclusion predicate, bound at three consecutive
+/// placeholders (namespaces, categories, key prefixes).
+///
+/// Semantics MUST mirror [`zeroclaw_api::memory_traits::entry_matches_recall_excludes`],
+/// which is what every non-pushing backend applies client-side:
+/// - `namespaces` and `key_prefixes` are PREFIX matches (literal, never
+///   `LIKE` with unescaped metacharacters — `starts_with` makes a `%` in an
+///   operator-supplied prefix inert);
+/// - `categories` is an exact match on the rendered category.
+///
+/// Empty axes are no-ops in SQL: `unnest` of an empty array yields no rows,
+/// and `= ANY('{}')` is false — so a caller with no excludes passes empty
+/// arrays and the predicate costs nothing.
+///
+/// Why it rides the candidate stage rather than a client-side post-filter:
+/// excluded rows dominate this store (measured 2026-11-21: 51 of the newest
+/// 60 rows are `sop`/`telemetry`), so a post-filter over a `limit * 2` fetch
+/// returned 9 rows for a limit-30 request and zero for `fleet` at limit 20.
+fn recall_exclude_predicate(first_placeholder: usize) -> String {
+    let (ns, cats, keys) = (
+        first_placeholder,
+        first_placeholder + 1,
+        first_placeholder + 2,
+    );
+    format!(
+        "
+              AND NOT (
+                  EXISTS (SELECT 1 FROM unnest(${ns}::TEXT[]) AS ex_ns WHERE starts_with(m.namespace, ex_ns))
+                  OR m.category = ANY(${cats}::TEXT[])
+                  OR EXISTS (SELECT 1 FROM unnest(${keys}::TEXT[]) AS ex_key WHERE starts_with(m.key, ex_key))
+              )"
+    )
 }
 
 /// The ranked-recall shape shared by the unscoped and agent-scoped paths: a
@@ -1372,6 +1409,7 @@ fn ranked_recall_sql(
     let first_time_placeholder = cap_placeholder + 1;
     let time_filter = recall_time_filter(since, until, first_time_placeholder);
     let categories_placeholder = first_time_placeholder + usize::from(since) + usize::from(until);
+    let exclude_filter = recall_exclude_predicate(categories_placeholder + 1);
     let session_filter = recall_session_scope_predicate(2, categories_placeholder);
     let allowlist_filter = if agent_scoped {
         "\n          AND m.agent_id = ANY($4)"
@@ -1385,7 +1423,7 @@ fn ranked_recall_sql(
             FROM {qualified_table} m
             WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ {tsq}('simple', $1))
               AND {session_filter}{allowlist_filter}
-              {time_filter}
+              {time_filter}{exclude_filter}
         ),
         candidates AS MATERIALIZED (
             SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id,
@@ -1598,6 +1636,198 @@ fn store_insert_sql(qualified_table: &str, qualified_agents: &str) -> String {
     )
 }
 
+/// The recall body shared by the three trait entry points.
+///
+/// Inherent (not part of `Memory`): `#[async_trait]` only accepts trait
+/// members in the trait impl block.
+impl PostgresMemory {
+    /// The single recall body behind `recall`, `recall_for_agents` and
+    /// `recall_filtered_scoped`.
+    ///
+    /// One body, three entry points: `recall` and `recall_for_agents` were
+    /// near-identical 150-line copies, which is exactly why the OR-relaxation
+    /// fallback had to be wired twice (2026-11-20). The SQL builders emit the
+    /// exclusion predicate UNCONDITIONALLY and it is bound from these three
+    /// arrays, so the unfiltered callers pass empty ones and the predicate is
+    /// a no-op — one statement shape per (scope, time-bounds) combination.
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_impl(
+        &self,
+        agent_scope: Option<Vec<String>>,
+        excludes: RecallExcludes,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let pool = self.pool.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let query = normalize_tsquery_input(normalize_recent_recall_query(query))
+            .trim()
+            .to_string();
+        let sid = session_id.map(str::to_string);
+        // The time bounds parse to instants CLIENT-side and bind as
+        // timestamptz: a text bind cannot serialize into the
+        // server-inferred timestamptz parameter (postgres-types 0.2.14's
+        // `&str::accepts` excludes TIMESTAMPTZ), and an unparseable bound
+        // fails LOUDLY here instead of silently recalling unbounded
+        // ([`parse_rfc3339_bound`]).
+        let since = since.map(parse_rfc3339_bound).transpose()?;
+        let until = until.map(parse_rfc3339_bound).transpose()?;
+        let agent_scoped = agent_scope.is_some();
+        let allowed: Vec<String> = agent_scope.unwrap_or_default();
+        let excl_ns = excludes.namespaces;
+        let excl_cat = excludes.categories;
+        let excl_key = excludes.key_prefixes;
+
+        // Empty-query fast path: the bare `*` / omitted-query contract is an
+        // indexed recency read, not a full-text scan. It carries the
+        // exclusion predicate too — the newest rows of this store are
+        // dominated by excluded `sop`/`telemetry` writes, so an unfiltered
+        // recency read starves the caller the same way the ranked path did.
+        if query.is_empty() {
+            let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
+            return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+                pool.with(|client| {
+                    let since_ref = since.as_ref();
+                    let until_ref = until.as_ref();
+                    let stmt = if agent_scoped {
+                        recent_recall_sql_for_agents(
+                            &qualified_table,
+                            &qualified_agents,
+                            since_ref.is_some(),
+                            until_ref.is_some(),
+                        )
+                    } else {
+                        recent_recall_sql(
+                            &qualified_table,
+                            &qualified_agents,
+                            since_ref.is_some(),
+                            until_ref.is_some(),
+                        )
+                    };
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    let limit_i64 = limit as i64;
+
+                    let mut binds: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
+                    if agent_scoped {
+                        binds.push(&allowed);
+                    }
+                    binds.push(&sid);
+                    if let Some(s) = since_ref {
+                        binds.push(s);
+                    }
+                    if let Some(u) = until_ref {
+                        binds.push(u);
+                    }
+                    binds.push(&categories);
+                    binds.push(&limit_i64);
+                    binds.push(&excl_ns);
+                    binds.push(&excl_cat);
+                    binds.push(&excl_key);
+
+                    let rows = client.query(&stmt, &binds)?;
+                    rows.iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
+                })
+            })
+            .await;
+        }
+
+        let pool = self.pool.get().clone();
+        let attempt_timeout = self.recall_soft_timeout;
+        let op_timeout = self.op_timeout;
+        let cap = recall_candidate_cap(limit);
+        let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
+
+        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
+            pool.with(|client| {
+                let since_ref = since.as_ref();
+                let until_ref = until.as_ref();
+
+                let stmt = ranked_recall_sql(
+                    &qualified_table,
+                    &qualified_agents,
+                    agent_scoped,
+                    since_ref.is_some(),
+                    until_ref.is_some(),
+                    RecallTsqueryParse::Strict,
+                );
+
+                #[allow(clippy::cast_possible_wrap)]
+                let limit_i64 = limit as i64;
+                #[allow(clippy::cast_possible_wrap)]
+                let cap_i64 = cap as i64;
+
+                // The bind order the builders declare: query, session,
+                // [allowlist], result limit, cap, [since], [until],
+                // categories, then the three exclusion axes.
+                let mut binds: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
+                binds.push(&query);
+                binds.push(&sid);
+                if agent_scoped {
+                    binds.push(&allowed);
+                }
+                binds.push(&limit_i64);
+                binds.push(&cap_i64);
+                if let Some(s) = since_ref {
+                    binds.push(s);
+                }
+                if let Some(u) = until_ref {
+                    binds.push(u);
+                }
+                binds.push(&categories);
+                binds.push(&excl_ns);
+                binds.push(&excl_cat);
+                binds.push(&excl_key);
+
+                // Bound THIS attempt server-side at the soft budget so a caller
+                // that gives up leaves no orphan holding the pooled connection.
+                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
+                    let rows = client.query(&stmt, &binds)?;
+                    let entries = rows
+                        .iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()?;
+                    if !entries.is_empty() {
+                        return Ok(entries);
+                    }
+                    // OR relaxation: a multi-token query whose conjunction
+                    // matched nothing is retried as a disjunction, so one
+                    // absent token no longer collapses the whole search to a
+                    // silent empty (which callers read as "no such memory").
+                    // A single-token query has nothing to relax and returns
+                    // the empty result unchanged.
+                    let Some(or_query) = tsquery_or_fallback_input(&query) else {
+                        return Ok(entries);
+                    };
+                    let relaxed_stmt = ranked_recall_sql(
+                        &qualified_table,
+                        &qualified_agents,
+                        agent_scoped,
+                        since_ref.is_some(),
+                        until_ref.is_some(),
+                        RecallTsqueryParse::Relaxed,
+                    );
+                    // Same layout, only the query bind moves.
+                    let mut relaxed_binds = binds.clone();
+                    relaxed_binds[0] = &or_query;
+                    let relaxed_rows = client.query(&relaxed_stmt, &relaxed_binds)?;
+                    relaxed_rows
+                        .iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()
+                })
+            })
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl Memory for PostgresMemory {
     fn name(&self) -> &str {
@@ -1630,153 +1860,87 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let pool = self.pool.get().clone();
-        let qualified_table = self.qualified_table.clone();
-        let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
-        let sid = session_id.map(str::to_string);
-        // The time bounds parse to instants CLIENT-side and bind as
-        // timestamptz: a text bind cannot serialize into the
-        // server-inferred timestamptz parameter (postgres-types 0.2.14's
-        // `&str::accepts` excludes TIMESTAMPTZ), and an unparseable bound
-        // fails LOUDLY here instead of silently recalling unbounded
-        // ([`parse_rfc3339_bound`]).
-        let since = since.map(parse_rfc3339_bound).transpose()?;
-        let until = until.map(parse_rfc3339_bound).transpose()?;
-
-        // Empty-query fast path: the bare `*` / omitted-query contract is an
-        // indexed recency read, not a full-text scan.
-        if query.is_empty() {
-            let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
-            return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-                pool.with(|client| {
-                    let since_ref = since.as_ref();
-                    let until_ref = until.as_ref();
-                    let stmt = recent_recall_sql(
-                        &qualified_table,
-                        &qualified_agents,
-                        since_ref.is_some(),
-                        until_ref.is_some(),
-                    );
-
-                    #[allow(clippy::cast_possible_wrap)]
-                    let limit_i64 = limit as i64;
-
-                    let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => {
-                            client.query(&stmt, &[&sid, &s, &u, &categories, &limit_i64])?
-                        }
-                        (Some(s), None) => {
-                            client.query(&stmt, &[&sid, &s, &categories, &limit_i64])?
-                        }
-                        (None, Some(u)) => {
-                            client.query(&stmt, &[&sid, &u, &categories, &limit_i64])?
-                        }
-                        (None, None) => client.query(&stmt, &[&sid, &categories, &limit_i64])?,
-                    };
-                    rows.iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()
-                })
-            })
-            .await;
-        }
-
-        let pool = self.pool.get().clone();
-        let attempt_timeout = self.recall_soft_timeout;
-        let op_timeout = self.op_timeout;
-        let cap = recall_candidate_cap(limit);
-        let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
-
-        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            pool.with(|client| {
-                let since_ref = since.as_ref();
-                let until_ref = until.as_ref();
-
-                let stmt = ranked_recall_sql(
-                    &qualified_table,
-                    &qualified_agents,
-                    false,
-                    since_ref.is_some(),
-                    until_ref.is_some(),
-                    RecallTsqueryParse::Strict,
-                );
-
-                #[allow(clippy::cast_possible_wrap)]
-                let limit_i64 = limit as i64;
-                #[allow(clippy::cast_possible_wrap)]
-                let cap_i64 = cap as i64;
-
-                // Bound THIS attempt server-side at the soft budget so a caller
-                // that gives up leaves no orphan holding the pooled connection.
-                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
-                    let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(
-                            &stmt,
-                            &[&query, &sid, &limit_i64, &cap_i64, &s, &u, &categories],
-                        )?,
-                        (Some(s), None) => client.query(
-                            &stmt,
-                            &[&query, &sid, &limit_i64, &cap_i64, &s, &categories],
-                        )?,
-                        (None, Some(u)) => client.query(
-                            &stmt,
-                            &[&query, &sid, &limit_i64, &cap_i64, &u, &categories],
-                        )?,
-                        (None, None) => client
-                            .query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &categories])?,
-                    };
-                    let entries = rows
-                        .iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()?;
-                    if !entries.is_empty() {
-                        return Ok(entries);
-                    }
-                    // OR relaxation: a multi-token query whose conjunction
-                    // matched nothing is retried as a disjunction, so one
-                    // absent token no longer collapses the whole search to a
-                    // silent empty (which callers read as "no such memory").
-                    // A single-token query has nothing to relax and returns
-                    // the empty result unchanged.
-                    let Some(or_query) = tsquery_or_fallback_input(&query) else {
-                        return Ok(entries);
-                    };
-                    let relaxed_stmt = ranked_recall_sql(
-                        &qualified_table,
-                        &qualified_agents,
-                        false,
-                        since_ref.is_some(),
-                        until_ref.is_some(),
-                        RecallTsqueryParse::Relaxed,
-                    );
-                    let relaxed_rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &cap_i64, &s, &u, &categories],
-                        )?,
-                        (Some(s), None) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &cap_i64, &s, &categories],
-                        )?,
-                        (None, Some(u)) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &cap_i64, &u, &categories],
-                        )?,
-                        (None, None) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &cap_i64, &categories],
-                        )?,
-                    };
-                    relaxed_rows
-                        .iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()
-                })
-            })
-        })
+        // The memory tool's `scope="all"` audit hatch rides THIS path, so it
+        // stays exclusion-free by construction: excludes travel only through
+        // `recall_filtered_scoped`.
+        self.recall_impl(
+            None,
+            RecallExcludes::default(),
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+        )
         .await
     }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if allowed_agent_ids.is_empty() {
+            return self.recall(query, limit, session_id, since, until).await;
+        }
+        self.recall_impl(
+            Some(allowed_agent_ids.iter().map(|s| (*s).to_string()).collect()),
+            RecallExcludes::default(),
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+        )
+        .await
+    }
+
+    /// The exclusion-aware, optionally agent-scoped recall — the ONE entry
+    /// point that carries both caller-constrainable axes.
+    ///
+    /// This is the backend half of the trait's `recall_filtered_scoped`
+    /// override: the predicate rides the SQL candidate stage instead of
+    /// filtering a `limit * 2` fetch client-side. Measured driver
+    /// (2026-11-21, prod store): 51 of the newest 60 rows are excluded, so
+    /// the post-filter shape returned 9 rows for a limit-30 request and ZERO
+    /// for `fleet` at limit 20; the pushed-down shape fills `limit` from the
+    /// whole corpus.
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let agent_scope = if allowed_agent_ids.is_empty() {
+            None
+        } else {
+            Some(
+                allowed_agent_ids
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<String>>(),
+            )
+        };
+        self.recall_impl(
+            agent_scope,
+            excludes.clone(),
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+        )
+        .await
+    }
+
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         let pool = self.pool.get().clone();
@@ -2242,187 +2406,6 @@ impl Memory for PostgresMemory {
                     ],
                 )?;
                 Ok(())
-            })
-        })
-        .await
-    }
-
-    async fn recall_for_agents(
-        &self,
-        allowed_agent_ids: &[&str],
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> Result<Vec<MemoryEntry>> {
-        // Empty allowlist means "no agent filter": fall back to plain
-        // recall. The wrapper always includes the bound agent's UUID,
-        // so a non-empty allowlist is the live-runtime case.
-        if allowed_agent_ids.is_empty() {
-            return self.recall(query, limit, session_id, since, until).await;
-        }
-
-        let pool = self.pool.get().clone();
-        let qualified_table = self.qualified_table.clone();
-        let qualified_agents = self.qualified_agents.clone();
-        let q = normalize_tsquery_input(normalize_recent_recall_query(query)).trim().to_string();
-        let sid = session_id.map(str::to_string);
-        // The time bounds parse to instants CLIENT-side and bind as
-        // timestamptz: a text bind cannot serialize into the
-        // server-inferred timestamptz parameter (postgres-types 0.2.14's
-        // `&str::accepts` excludes TIMESTAMPTZ), and an unparseable bound
-        // fails LOUDLY here instead of silently recalling unbounded
-        // ([`parse_rfc3339_bound`]). Below the empty-allowlist early
-        // return, which delegates with the unparsed bounds for `recall` to
-        // parse at its own seam.
-        let since = since.map(parse_rfc3339_bound).transpose()?;
-        let until = until.map(parse_rfc3339_bound).transpose()?;
-        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-
-        // Empty-query fast path: indexed recency within the agent allowlist.
-        // Carries the caller's session + the durable-global carve-out — the
-        // budget-fallback bleed fix (the pre-fix shape dropped the session
-        // filter entirely on this path).
-        if q.is_empty() {
-            let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
-            return run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-                pool.with(|client| {
-                    let since_ref = since.as_ref();
-                    let until_ref = until.as_ref();
-                    let stmt = recent_recall_sql_for_agents(
-                        &qualified_table,
-                        &qualified_agents,
-                        since_ref.is_some(),
-                        until_ref.is_some(),
-                    );
-
-                    #[allow(clippy::cast_possible_wrap)]
-                    let limit_i64 = limit as i64;
-
-                    let rows =
-                        match (since_ref, until_ref) {
-                            (Some(s), Some(u)) => client
-                                .query(&stmt, &[&allowed, &sid, &s, &u, &categories, &limit_i64])?,
-                            (Some(s), None) => client
-                                .query(&stmt, &[&allowed, &sid, &s, &categories, &limit_i64])?,
-                            (None, Some(u)) => client
-                                .query(&stmt, &[&allowed, &sid, &u, &categories, &limit_i64])?,
-                            (None, None) => {
-                                client.query(&stmt, &[&allowed, &sid, &categories, &limit_i64])?
-                            }
-                        };
-                    rows.iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()
-                })
-            })
-            .await;
-        }
-
-        let pool = self.pool.get().clone();
-        let attempt_timeout = self.recall_soft_timeout;
-        let op_timeout = self.op_timeout;
-        let cap = recall_candidate_cap(limit);
-        let categories: Vec<&'static str> = crate::durable_global_category_names().to_vec();
-
-        run_on_os_thread(self.op_timeout, move || -> Result<Vec<MemoryEntry>> {
-            pool.with(|client| {
-                let since_ref = since.as_ref();
-                let until_ref = until.as_ref();
-
-                let stmt = ranked_recall_sql(
-                    &qualified_table,
-                    &qualified_agents,
-                    true,
-                    since_ref.is_some(),
-                    until_ref.is_some(),
-                    RecallTsqueryParse::Strict,
-                );
-
-                #[allow(clippy::cast_possible_wrap)]
-                let limit_i64 = limit as i64;
-                #[allow(clippy::cast_possible_wrap)]
-                let cap_i64 = cap as i64;
-
-                // Bound THIS attempt server-side at the soft budget so a caller
-                // that gives up leaves no orphan holding the pooled connection.
-                with_statement_timeout(client, attempt_timeout, op_timeout, |client| {
-                    let rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(
-                            &stmt,
-                            &[
-                                &q,
-                                &sid,
-                                &limit_i64,
-                                &allowed,
-                                &cap_i64,
-                                &s,
-                                &u,
-                                &categories,
-                            ],
-                        )?,
-                        (Some(s), None) => client.query(
-                            &stmt,
-                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &s, &categories],
-                        )?,
-                        (None, Some(u)) => client.query(
-                            &stmt,
-                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &u, &categories],
-                        )?,
-                        (None, None) => client.query(
-                            &stmt,
-                            &[&q, &sid, &limit_i64, &allowed, &cap_i64, &categories],
-                        )?,
-                    };
-                    let entries = rows
-                        .iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()?;
-                    if !entries.is_empty() {
-                        return Ok(entries);
-                    }
-                    // OR relaxation on the AGENT-SCOPED path too — this is the
-                    // path an agent's own recall takes, so wiring only the
-                    // unscoped shape leaves the fallback inert exactly where
-                    // agents exhaust their reads (2026-11-20 live finding: the
-                    // unscoped shape relaxed, agent-scoped did not).
-                    let Some(or_query) = tsquery_or_fallback_input(&q) else {
-                        return Ok(entries);
-                    };
-                    let relaxed_stmt = ranked_recall_sql(
-                        &qualified_table,
-                        &qualified_agents,
-                        true,
-                        since_ref.is_some(),
-                        until_ref.is_some(),
-                        RecallTsqueryParse::Relaxed,
-                    );
-                    let relaxed_rows = match (since_ref, until_ref) {
-                        (Some(s), Some(u)) => client.query(
-                            &relaxed_stmt,
-                            &[
-                                &or_query, &sid, &limit_i64, &allowed, &cap_i64, &s, &u, &categories,
-                            ],
-                        )?,
-                        (Some(s), None) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &s, &categories],
-                        )?,
-                        (None, Some(u)) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &u, &categories],
-                        )?,
-                        (None, None) => client.query(
-                            &relaxed_stmt,
-                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &categories],
-                        )?,
-                    };
-                    relaxed_rows
-                        .iter()
-                        .map(Self::row_to_entry)
-                        .collect::<Result<Vec<MemoryEntry>>>()
-                })
             })
         })
         .await
@@ -3355,6 +3338,93 @@ mod tests {
     /// — while the same predicate routed through the GIN index
     /// (`idx_memories_key_content_fts`) is 17 ms. Splitting the stage is what
     /// makes the index-driven plan unconditional rather than a cost flip.
+    /// The exclusion predicate must ride the CANDIDATE STAGE, not a
+    /// client-side post-filter: 51 of the newest 60 rows in the prod store are
+    /// excluded (`sop` / `telemetry` / `user_msg_` …), so a `limit * 2` fetch
+    /// filtered afterwards returned 9 rows for a limit-30 request and ZERO for
+    /// `fleet` at limit 20 (measured 2026-11-21). These pins hold the exact
+    /// placeholder arithmetic too — a shifted bind is a type error at runtime,
+    /// not at compile time.
+    #[test]
+    fn recall_sql_pushes_the_exclusion_predicate_into_the_candidate_stage() {
+        // Ranked, unscoped, no time bounds: cap $4, categories $5, excludes $6-$8.
+        let stmt = ranked_recall_sql(
+            "mem.memories",
+            "mem.agents",
+            false,
+            false,
+            false,
+            RecallTsqueryParse::Strict,
+        );
+        let stage = stmt
+            .split("candidates AS MATERIALIZED")
+            .next()
+            .expect("the match stage must precede the candidate stage");
+        assert!(
+            stage.contains("unnest($6::TEXT[]) AS ex_ns")
+                && stage.contains("starts_with(m.namespace, ex_ns)"),
+            "the namespace axis must be a literal prefix match inside the match stage, got: {stage}"
+        );
+        assert!(
+            stage.contains("m.category = ANY($7::TEXT[])"),
+            "the category axis must be an exact match inside the match stage, got: {stage}"
+        );
+        assert!(
+            stage.contains("unnest($8::TEXT[]) AS ex_key")
+                && stage.contains("starts_with(m.key, ex_key)"),
+            "the key-prefix axis must be a literal prefix match inside the match stage, got: {stage}"
+        );
+        assert!(
+            !stmt.contains("LIKE ex_") && !stmt.contains("LIKE $6"),
+            "prefix axes must never use LIKE — a `%` in an operator prefix would change the exclusion set"
+        );
+
+        // Ranked, agent-scoped, no bounds: allowlist $4, cap $5, categories $6,
+        // excludes $7-$9.
+        let scoped = ranked_recall_sql(
+            "mem.memories",
+            "mem.agents",
+            true,
+            false,
+            false,
+            RecallTsqueryParse::Strict,
+        );
+        let scoped_stage = scoped
+            .split("candidates AS MATERIALIZED")
+            .next()
+            .expect("the match stage must precede the candidate stage");
+        assert!(
+            scoped_stage.contains("m.agent_id = ANY($4)")
+                && scoped_stage.contains("unnest($7::TEXT[]) AS ex_ns")
+                && scoped_stage.contains("m.category = ANY($8::TEXT[])")
+                && scoped_stage.contains("unnest($9::TEXT[]) AS ex_key"),
+            "the agent-scoped shape keeps the allowlist at $4 and shifts the axes to $7-$9, got: {scoped_stage}"
+        );
+
+        // Recency, unscoped, no bounds: session $1, categories $2, limit $3,
+        // excludes $4-$6.
+        let recent = recent_recall_sql("mem.memories", "mem.agents", false, false);
+        assert!(
+            recent.contains("unnest($4::TEXT[]) AS ex_ns")
+                && recent.contains("m.category = ANY($5::TEXT[])")
+                && recent.contains("unnest($6::TEXT[]) AS ex_key")
+                && recent.contains("LIMIT $3"),
+            "the bare `*` recency read must carry the same predicate (its window is where the density bites hardest), got: {recent}"
+        );
+
+        // Recency, agent-scoped: allowlist $1, session $2, categories $3,
+        // limit $4, excludes $5-$7.
+        let recent_scoped = recent_recall_sql_for_agents("mem.memories", "mem.agents", false, false);
+        assert!(
+            recent_scoped.contains("m.agent_id = ANY($1)")
+                && recent_scoped.contains("unnest($5::TEXT[]) AS ex_ns")
+                && recent_scoped.contains("m.category = ANY($6::TEXT[])")
+                && recent_scoped.contains("unnest($7::TEXT[]) AS ex_key")
+                && recent_scoped.contains("LIMIT $4"),
+            "the agent-scoped recency read carries the axes at $5-$7, got: {recent_scoped}"
+        );
+    }
+
     #[test]
     fn ranked_recall_sql_materializes_the_fts_match_before_the_recency_cap() {
         let sql = ranked_recall_sql(

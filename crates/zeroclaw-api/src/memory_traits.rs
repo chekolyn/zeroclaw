@@ -46,6 +46,42 @@ pub struct ExportFilter {
 /// with real temporal types replace it in storage: the postgres override
 /// binds `since`/`until` as `::TIMESTAMPTZ`, where mixed offset spellings
 /// compare as instants instead of strings.
+/// The three-axis recall exclusion predicate, as a function so the trait
+/// default and any backend that post-filters agree on its exact semantics.
+///
+/// - `namespaces`: PREFIX match (`entry.namespace` starts with the axis value);
+/// - `categories`: EXACT match on the rendered category;
+/// - `key_prefixes`: PREFIX match on `entry.key`.
+///
+/// An empty axis excludes nothing. A backend that pushes this predicate into
+/// storage (Postgres does) must reproduce these semantics exactly — prefix
+/// matching must stay literal, never `LIKE` with unescaped metacharacters.
+#[must_use]
+pub fn entry_matches_recall_excludes(entry: &MemoryEntry, excludes: &RecallExcludes) -> bool {
+    if excludes
+        .namespaces
+        .iter()
+        .any(|ns| entry.namespace.starts_with(ns.as_str()))
+    {
+        return false;
+    }
+    if excludes
+        .categories
+        .iter()
+        .any(|c| entry.category.to_string() == c.as_str())
+    {
+        return false;
+    }
+    if excludes
+        .key_prefixes
+        .iter()
+        .any(|p| entry.key.starts_with(p.as_str()))
+    {
+        return false;
+    }
+    true
+}
+
 pub fn entry_matches_export_filter(entry: &MemoryEntry, filter: &ExportFilter) -> bool {
     if let Some(ref namespace) = filter.namespace
         && entry.namespace != *namespace
@@ -878,35 +914,55 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         until: Option<&str>,
         excludes: &RecallExcludes,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit.saturating_mul(2), session_id, since, until)
-            .await?;
+        self.recall_filtered_scoped(excludes, &[], query, limit, session_id, since, until)
+            .await
+    }
+
+    /// The exclusion-aware recall with an OPTIONAL agent scope: the one entry
+    /// point that carries both axes a caller can constrain.
+    ///
+    /// `recall_filtered` is this method with an empty allowlist, and the
+    /// allowlist-aware wrappers forward here, so a backend with native
+    /// exclusion support overrides ONE method and serves both shapes.
+    ///
+    /// The default post-filters, exactly as `recall_filtered` always has:
+    /// fetch `limit * 2`, drop entries matching any exclude axis, take
+    /// `limit`. That is a correct-but-starving shape when the excluded rows
+    /// dominate the candidate window (measured 2026-11-21 on the prod store:
+    /// 51 of the newest 60 rows are excluded, so a caller asking for 30 rows
+    /// received 9) — which is why a backend able to push the predicate into
+    /// storage must override.
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = limit.saturating_mul(2);
+        let entries = if allowed_agent_ids.is_empty() {
+            self.recall(query, fetch_limit, session_id, since, until)
+                .await?
+        } else {
+            self.recall_for_agents(
+                allowed_agent_ids,
+                query,
+                fetch_limit,
+                session_id,
+                since,
+                until,
+            )
+            .await?
+        };
         let filtered: Vec<MemoryEntry> = entries
             .into_iter()
-            .filter(|e| {
-                if excludes
-                    .namespaces
-                    .iter()
-                    .any(|ns| e.namespace.starts_with(ns.as_str()))
-                {
-                    return false;
-                }
-                if excludes
-                    .categories
-                    .iter()
-                    .any(|c| e.category.to_string() == c.as_str())
-                {
-                    return false;
-                }
-                if excludes
-                    .key_prefixes
-                    .iter()
-                    .any(|p| e.key.starts_with(p.as_str()))
-                {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| entry_matches_recall_excludes(e, excludes))
             .take(limit)
             .collect();
         Ok(filtered)
@@ -1555,6 +1611,39 @@ mod tests {
             filtered_entry("core1", "default", MemoryCategory::Core, "core:1"),
             filtered_entry("ws1", "ws", MemoryCategory::Daily, "ws:infra:id:1"),
         ]
+    }
+
+    /// The new entry point must honour BOTH axes: the allowlist selects the
+    /// agent-scoped backend call, and the excludes still filter. This is the
+    /// method every wrapper forwards, so a regression here would reach the
+    /// live agent path unchanged.
+    #[tokio::test]
+    async fn recall_filtered_scoped_filters_and_carries_the_allowlist() {
+        let memory = FilterEchoMemory(filtered_seed());
+        let excludes = RecallExcludes {
+            categories: vec!["sop".into()],
+            ..RecallExcludes::default()
+        };
+
+        let scoped = memory
+            .recall_filtered_scoped(&excludes, &["agent-a"], "q", 10, None, None, None)
+            .await
+            .expect("the scoped default must filter through recall_for_agents");
+        assert!(
+            scoped.iter().all(|e| e.category.to_string() != "sop"),
+            "the excluded category must not survive the scoped path, got: {:?}",
+            scoped.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        );
+
+        let unscoped = memory
+            .recall_filtered("q", 10, None, None, None, &excludes)
+            .await
+            .expect("recall_filtered delegates to the same predicate");
+        assert_eq!(
+            unscoped.len(),
+            scoped.len(),
+            "delegation must not change the filtered set"
+        );
     }
 
     #[tokio::test]

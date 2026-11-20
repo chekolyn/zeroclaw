@@ -1,6 +1,6 @@
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope, ProceduralMessage,
-    StoreOptions,
+    RecallExcludes, StoreOptions,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -124,6 +124,54 @@ impl AgentScopedMemory {
             .into_iter()
             .filter(|entry| entry.agent_id.is_some() && self.entry_allowed(entry))
             .collect()
+    }
+
+    /// The exclusion-aware sibling of [`Self::recall_with_category_refill`]:
+    /// the excludes ride the backend's SQL (so the candidate window fills with
+    /// usable rows), while the per-agent CATEGORY grants stay client-side and
+    /// keep the same bounded doubling refill. Both axes therefore still hold,
+    /// and a narrow grant no longer starves against a window saturated by
+    /// excluded telemetry.
+    async fn recall_with_category_refill_filtered(
+        &self,
+        allowed_agent_ids: &[&str],
+        excludes: &RecallExcludes,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .inner
+                .recall_filtered_scoped(
+                    excludes,
+                    allowed_agent_ids,
+                    query,
+                    fetch_limit,
+                    session_id,
+                    since,
+                    until,
+                )
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered = self.filter_entries(entries);
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     async fn recall_with_category_refill(
@@ -414,6 +462,53 @@ impl Memory for AgentScopedMemory {
         let allowed = self.allowed_slice();
         self.recall_with_category_refill(&allowed, query, limit, session_id, since, until)
             .await
+    }
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        caller_allowed: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        // Same intersection semantics as `recall_for_agents` above: an empty
+        // caller allowlist means "the bound grants", never "every agent".
+        if caller_allowed.is_empty() {
+            let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
+            return self
+                .recall_with_category_refill_filtered(
+                    &bound,
+                    excludes,
+                    query,
+                    limit,
+                    session_id,
+                    since,
+                    until,
+                )
+                .await;
+        }
+
+        let intersected: Vec<&str> = caller_allowed
+            .iter()
+            .copied()
+            .filter(|id| self.allowed_agent_ids.contains(*id))
+            .collect();
+        if intersected.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.recall_with_category_refill_filtered(
+            &intersected,
+            excludes,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+        )
+        .await
     }
 
     async fn recall_for_agents(
@@ -1527,6 +1622,51 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "bound agent row in target-session must be deleted"
+        );
+    }
+
+    /// The exclusion-aware entry point must keep the SAME allowlist
+    /// intersection as `recall_for_agents`: a caller naming an agent outside
+    /// the bound grants gets nothing. This is the security seam — the
+    /// exclusion path is a new method, so it needs its own pin.
+    #[tokio::test]
+    async fn recall_filtered_scoped_intersects_the_caller_allowlist() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+        let rogue_uuid = &uuids[2];
+
+        inner
+            .store_with_agent(
+                "rogue-key",
+                "rogue-val",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(rogue_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+        let hits = wrapper
+            .recall_filtered_scoped(
+                &RecallExcludes::default(),
+                &[rogue_uuid.as_str()],
+                "rogue-key",
+                10,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "a caller allowlist outside the bound grants must intersect to nothing, got: {:?}",
+            hits.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
         );
     }
 

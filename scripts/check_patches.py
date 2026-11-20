@@ -133,10 +133,14 @@ PROBE_REGISTRY: dict = {
         "pattern": r"durable_global_category_names",
         "min_count": 4,
     },
+    # 12 -> 11 on 2026-11-21: `recall` and `recall_for_agents` were near-identical
+    # 150-line bodies, each with its own time-bound parse seam; RECALL-EXCLUDE-PUSHDOWN
+    # collapsed them into one `recall_impl`, so the seam (and its two parse calls)
+    # occurs once. The mechanism is unchanged — only the duplication went away.
     "recall-time-bound": {
         "glob": "crates/zeroclaw-memory/src/postgres.rs",
         "pattern": r"parse_rfc3339_bound",
-        "min_count": 12,
+        "min_count": 11,
     },
     "memory-listing-bound": {
         "glob": "crates/zeroclaw-api/src/memory_traits.rs",

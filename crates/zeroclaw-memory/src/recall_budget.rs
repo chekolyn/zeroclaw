@@ -29,7 +29,9 @@
 //! result count, and whether the result was degraded, so future measurement
 //! cycles see recall latency and breadth without new instrumentation.
 
-use crate::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope};
+use crate::traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope, RecallExcludes,
+};
 use async_trait::async_trait;
 use std::future::Future;
 use std::sync::Arc;
@@ -284,6 +286,62 @@ impl Memory for BudgetedMemory {
             || self.inner.recall(query, limit, session_id, since, until),
             || self.inner.recall("", limit, session_id, since, until),
             "recall",
+        )
+        .await
+    }
+
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if self.disabled() {
+            return self
+                .inner
+                .recall_filtered_scoped(
+                    excludes,
+                    allowed_agent_ids,
+                    query,
+                    limit,
+                    session_id,
+                    since,
+                    until,
+                )
+                .await;
+        }
+        // The degraded fallback keeps the CALLER's excludes: a budget-tripped
+        // recall that silently returned excluded rows would be a leak, not a
+        // degradation.
+        self.bounded(
+            || {
+                self.inner.recall_filtered_scoped(
+                    excludes,
+                    allowed_agent_ids,
+                    query,
+                    limit,
+                    session_id,
+                    since,
+                    until,
+                )
+            },
+            || {
+                self.inner.recall_filtered_scoped(
+                    excludes,
+                    allowed_agent_ids,
+                    "",
+                    limit,
+                    session_id,
+                    since,
+                    until,
+                )
+            },
+            "recall_filtered_scoped",
         )
         .await
     }

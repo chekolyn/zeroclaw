@@ -2,7 +2,7 @@
 
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ProceduralMessage, RecallExcludes, StoreOptions,
 };
 use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use async_trait::async_trait;
@@ -630,6 +630,37 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner
             .store_with_agent(
                 key, content, category, session_id, namespace, importance, agent_id,
+            )
+            .await
+    }
+
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("query={query}")),
+        );
+        self.inner
+            .recall_filtered_scoped(
+                excludes,
+                allowed_agent_ids,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
             )
             .await
     }
