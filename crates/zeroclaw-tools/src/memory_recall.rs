@@ -264,6 +264,35 @@ impl Tool for MemoryRecallTool {
             // ranked-recall regression.
             .min(POSTGRES_RECALL_CANDIDATE_CAP);
 
+        // Inclusion filters (category / namespace / key_prefix) are applied
+        // CLIENT-SIDE after the backend call, so asking the backend for
+        // exactly `limit` rows starves any filter over a sparse category: the
+        // 2026-11-20 prod measurement had `category=core` return 3 rows at
+        // limit=10 and 5 at limit=30 in a store holding 2,408 core rows,
+        // because recency is dominated by `sop` ledger writes. Widening the
+        // fetch before filtering restores `limit` as a floor on what the
+        // caller asked for, and the post-filter truncates back to `limit`.
+        //
+        // Bounded by the ranked-recall candidate ceiling: the widening must
+        // never reopen the seconds-scale ranked-recall regression.
+        let has_inclusion_filter = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .is_some()
+            || args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .is_some()
+            || args
+                .get("key_prefix")
+                .and_then(|v| v.as_str())
+                .is_some();
+        let fetch_limit = if has_inclusion_filter {
+            limit.saturating_mul(20).min(POSTGRES_RECALL_CANDIDATE_CAP)
+        } else {
+            limit
+        };
+
         // Prefix mode: list all entries whose key starts with the given prefix
         if let Some(prefix) = args.get("prefix").and_then(|v| v.as_str()) {
             let prefix = prefix.trim();
@@ -286,10 +315,12 @@ impl Tool for MemoryRecallTool {
             .unwrap_or("filtered");
         let skip_excludes = scope.eq_ignore_ascii_case("all");
         let recall_result = if skip_excludes {
-            self.memory.recall(query, limit, None, since, until).await
+            self.memory
+                .recall(query, fetch_limit, None, since, until)
+                .await
         } else {
             self.memory
-                .recall_filtered(query, limit, None, since, until, &self.excludes)
+                .recall_filtered(query, fetch_limit, None, since, until, &self.excludes)
                 .await
         };
 
@@ -313,6 +344,7 @@ impl Tool for MemoryRecallTool {
                     })
                     .filter(|e| namespace_f.map_or(true, |ns| e.namespace == ns))
                     .filter(|e| key_prefix_f.map_or(true, |kp| e.key.starts_with(kp)))
+                    .take(limit)
                     .collect();
                 if entries.is_empty() {
                     return Ok(ToolResult {
@@ -1188,6 +1220,25 @@ mod tests {
         let tool = MemoryRecallTool::new(mem);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
+    }
+
+    #[tokio::test]
+    async fn inclusion_filters_widen_the_fetch_before_filtering() {
+        // category/namespace/key_prefix are applied client-side, so asking the
+        // backend for exactly `limit` rows starves sparse categories (prod:
+        // 3 core rows at limit=10 in a store holding 2,408). The fetch must
+        // widen, and the post-filter must truncate back to `limit`.
+        let mem = LimitCaptureMemory::new();
+        let tool = MemoryRecallTool::new(mem.clone());
+        let _ = tool
+            .execute(json!({"query": "anything", "limit": 3, "category": "core"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *mem.last_limit.lock().unwrap(),
+            Some(60),
+            "a category filter must widen the backend fetch (3 x 20)"
+        );
     }
 
     #[test]
