@@ -1763,16 +1763,20 @@ impl PostgresMemory {
                 #[allow(clippy::cast_possible_wrap)]
                 let cap_i64 = cap as i64;
 
-                // The bind order the builders declare: query, session,
-                // [allowlist], result limit, cap, [since], [until],
-                // categories, then the three exclusion axes.
+                // The bind order the RANKED builders declare:
+                //   unscoped:     query, session, limit, cap, [since], [until], categories, axes
+                //   agent-scoped: query, session, limit, ALLOWLIST, cap, [since], [until], categories, axes
+                // The allowlist sits AFTER the result limit ($4 in the scoped
+                // shape): binding it before the limit pushed every subsequent
+                // parameter one slot out and killed the ranked path with
+                // "error serializing parameter 3" (v13, 2026-11-21).
                 let mut binds: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
                 binds.push(&query);
                 binds.push(&sid);
+                binds.push(&limit_i64);
                 if agent_scoped {
                     binds.push(&allowed);
                 }
-                binds.push(&limit_i64);
                 binds.push(&cap_i64);
                 if let Some(s) = since_ref {
                     binds.push(s);
