@@ -1096,6 +1096,50 @@ pub(super) fn quote_identifier(value: &str) -> String {
 /// a deep-position content rank. Keys stay unbounded (they are short).
 const RECALL_RANK_CONTENT_PREFIX_CHARS: usize = 4096;
 
+/// Which text-search parser a ranked-recall shape binds.
+///
+/// `Strict` is the historical conjunction: every token must match
+/// (`plainto_tsquery` cannot express OR at all). `Relaxed` is the OR fallback,
+/// used when the strict shape returns nothing for a multi-token query:
+/// `websearch_to_tsquery` honours the caller-built `token or token` string and
+/// can never raise a syntax error on user input — which is why the fallback
+/// binds a string we build rather than `to_tsquery` syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecallTsqueryParse {
+    Strict,
+    Relaxed,
+}
+
+impl RecallTsqueryParse {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Strict => "plainto_tsquery",
+            Self::Relaxed => "websearch_to_tsquery",
+        }
+    }
+}
+
+/// Build the OR-fallback input from an already-normalized query.
+///
+/// Tokens are the alphanumeric/underscore runs (punctuation contributes no
+/// lexeme, so punctuation-only fragments are dropped — an OR over them is
+/// still empty). Fewer than two tokens means there is nothing to relax: a
+/// one-token OR IS the same conjunction, so no fallback is built.
+fn tsquery_or_fallback_input(query: &str) -> Option<String> {
+    // Whitespace-split, then drop tokens that carry no lexeme at all. The
+    // punctuation AROUND a token is kept: `websearch_to_tsquery` ignores it,
+    // and stripping it would rewrite the caller's terms.
+    let tokens: Vec<&str> = query
+        .split_whitespace()
+        .filter(|token| token.chars().any(char::is_alphanumeric))
+        .collect();
+    if tokens.len() < 2 {
+        None
+    } else {
+        Some(tokens.join(" or "))
+    }
+}
+
 /// The recall score expression shared by `recall` and `recall_for_agents`.
 /// `$1` is the plainto_tsquery parameter; caller supplies the FROM alias
 /// (`m.`), which both call sites already use.
@@ -1106,14 +1150,16 @@ const RECALL_RANK_CONTENT_PREFIX_CHARS: usize = 4096;
 /// (server-proven 2026-11-18: every non-empty-query ranked recall died at
 /// parse with "trailing junk after numeric literal"). Newlines are valid SQL
 /// whitespace; the leading indentation below is too.
-fn recall_rank_expression() -> String {
+fn recall_rank_expression(parse: RecallTsqueryParse) -> String {
+    let tsq = parse.as_sql();
     format!(
-        "CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+        "LEAST(
+         CASE WHEN to_tsvector('simple', m.key) @@ {tsq}('simple', $1)
+           THEN ts_rank_cd(to_tsvector('simple', m.key), {tsq}('simple', $1), 32) * 2.0
            ELSE 0.0 END +
-         CASE WHEN to_tsvector('simple', left(m.content, {prefix})) @@ plainto_tsquery('simple', $1)
-           THEN ts_rank_cd(to_tsvector('simple', left(m.content, {prefix})), plainto_tsquery('simple', $1))
-           ELSE 0.0 END",
+         CASE WHEN to_tsvector('simple', left(m.content, {prefix})) @@ {tsq}('simple', $1)
+           THEN ts_rank_cd(to_tsvector('simple', left(m.content, {prefix})), {tsq}('simple', $1), 32)
+           ELSE 0.0 END, 1.0)",
         prefix = RECALL_RANK_CONTENT_PREFIX_CHARS,
     )
 }
@@ -1320,6 +1366,7 @@ fn ranked_recall_sql(
     agent_scoped: bool,
     since: bool,
     until: bool,
+    parse: RecallTsqueryParse,
 ) -> String {
     let cap_placeholder = if agent_scoped { 5 } else { 4 };
     let first_time_placeholder = cap_placeholder + 1;
@@ -1337,7 +1384,7 @@ fn ranked_recall_sql(
             SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id,
                    m.agent_id, m.namespace, m.importance, m.updated_at
             FROM {qualified_table} m
-            WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+            WHERE ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ {tsq}('simple', $1))
               AND {session_filter}{allowlist_filter}
               {time_filter}
             ORDER BY m.updated_at DESC
@@ -1351,7 +1398,8 @@ fn ranked_recall_sql(
         ORDER BY score DESC, m.updated_at DESC
         LIMIT $3
         ",
-        rank = recall_rank_expression(),
+        rank = recall_rank_expression(parse),
+        tsq = parse.as_sql(),
     )
 }
 
@@ -1646,6 +1694,7 @@ impl Memory for PostgresMemory {
                     false,
                     since_ref.is_some(),
                     until_ref.is_some(),
+                    RecallTsqueryParse::Strict,
                 );
 
                 #[allow(clippy::cast_possible_wrap)]
@@ -1672,7 +1721,50 @@ impl Memory for PostgresMemory {
                         (None, None) => client
                             .query(&stmt, &[&query, &sid, &limit_i64, &cap_i64, &categories])?,
                     };
-                    rows.iter()
+                    let entries = rows
+                        .iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()?;
+                    if !entries.is_empty() {
+                        return Ok(entries);
+                    }
+                    // OR relaxation: a multi-token query whose conjunction
+                    // matched nothing is retried as a disjunction, so one
+                    // absent token no longer collapses the whole search to a
+                    // silent empty (which callers read as "no such memory").
+                    // A single-token query has nothing to relax and returns
+                    // the empty result unchanged.
+                    let Some(or_query) = tsquery_or_fallback_input(&query) else {
+                        return Ok(entries);
+                    };
+                    let relaxed_stmt = ranked_recall_sql(
+                        &qualified_table,
+                        &qualified_agents,
+                        false,
+                        since_ref.is_some(),
+                        until_ref.is_some(),
+                        RecallTsqueryParse::Relaxed,
+                    );
+                    let relaxed_rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &cap_i64, &s, &u, &categories],
+                        )?,
+                        (Some(s), None) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &cap_i64, &s, &categories],
+                        )?,
+                        (None, Some(u)) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &cap_i64, &u, &categories],
+                        )?,
+                        (None, None) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &cap_i64, &categories],
+                        )?,
+                    };
+                    relaxed_rows
+                        .iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
                 })
@@ -2240,6 +2332,7 @@ impl Memory for PostgresMemory {
                     true,
                     since_ref.is_some(),
                     until_ref.is_some(),
+                    RecallTsqueryParse::Strict,
                 );
 
                 #[allow(clippy::cast_possible_wrap)]
@@ -2980,7 +3073,7 @@ mod tests {
 
     #[test]
     fn recall_rank_expression_bounds_content_and_keeps_key_arm_whole() {
-        let sql = recall_rank_expression();
+        let sql = recall_rank_expression(RecallTsqueryParse::Strict);
 
         // The content arm must rank over a BOUNDED prefix: the unbounded
         // `to_tsvector('simple', m.content)` re-parse per candidate row was
@@ -2998,7 +3091,7 @@ mod tests {
         assert!(
             sql.contains("to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)")
                 && sql.contains(
-                    "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0"
+                    "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1), 32) * 2.0"
                 ),
             "key rank arm must stay unbounded at 2.0 weight, got: {sql}"
         );
@@ -3015,7 +3108,7 @@ mod tests {
     /// intended separations regardless of how the whitespace is spelled.
     #[test]
     fn recall_rank_expression_joins_are_whitespace_separated() {
-        let sql = recall_rank_expression();
+        let sql = recall_rank_expression(RecallTsqueryParse::Strict);
         let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
 
         // The spaced joins (whitespace-normalized form): the intended token
@@ -3033,7 +3126,7 @@ mod tests {
             "the two rank arms must separate around the +, got: {sql:?}"
         );
         assert!(
-            normalized.contains("$1)) ELSE"),
+            normalized.contains("32) ELSE"),
             "the content arm's rank must be separated from its ELSE, got: {sql:?}"
         );
 
@@ -3216,7 +3309,7 @@ mod tests {
     fn ranked_recall_sql_bounds_the_candidate_stage_before_ranking() {
         // Unscoped shape (since-bound): the cap stage closes before the rank
         // expression appears.
-        let sql = ranked_recall_sql("mem.memories", "mem.agents", false, true, false);
+        let sql = ranked_recall_sql("mem.memories", "mem.agents", false, true, false, RecallTsqueryParse::Strict);
         let rank_at = sql
             .find("* 2.0")
             .expect("the key-arm rank weight must be present");
@@ -3268,7 +3361,7 @@ mod tests {
         // arm bounded by the 4096 prefix in both its predicate and its rank.
         assert!(
             sql.contains(
-                "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0",
+                "ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1), 32) * 2.0",
             ),
             "key rank arm must stay whole at 2.0 weight, got: {sql}"
         );
@@ -3307,7 +3400,7 @@ mod tests {
 
         // Agent-scoped shape (both time bounds): the allowlist predicate
         // rides INSIDE the stage; the cap and time bounds shift behind it.
-        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true);
+        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true, RecallTsqueryParse::Strict);
         let scoped_rank_at = scoped
             .find("* 2.0")
             .expect("the scoped shape carries the same rank expression");
@@ -3377,7 +3470,7 @@ mod tests {
     /// array binds after them (the LIMIT stays the outer $3).
     #[test]
     fn ranked_recall_sql_placeholder_layout_pins_cap_before_time_bounds() {
-        let unscoped = ranked_recall_sql("mem.memories", "mem.agents", false, true, true);
+        let unscoped = ranked_recall_sql("mem.memories", "mem.agents", false, true, true, RecallTsqueryParse::Strict);
         assert!(
             unscoped.contains("LIMIT $4"),
             "the unscoped candidate cap binds at $4, got: {unscoped}"
@@ -3396,7 +3489,7 @@ mod tests {
             "the result limit binds at $3 after the candidate join, got: {unscoped}"
         );
 
-        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true);
+        let scoped = ranked_recall_sql("mem.memories", "mem.agents", true, true, true, RecallTsqueryParse::Strict);
         assert!(
             scoped.contains("m.agent_id = ANY($4)"),
             "the allowlist binds at $4, got: {scoped}"
