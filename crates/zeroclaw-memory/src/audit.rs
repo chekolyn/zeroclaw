@@ -251,6 +251,26 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.list(category, session_id).await
     }
 
+
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose (the `list_limited` precedent
+        // directly below): the prefix must reach the backend's indexed range
+        // scan, not an unbounded full-store `list`.
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            session_id,
+            Some(&format!("prefix={prefix}")),
+        );
+        self.inner.list_prefixed(prefix, limit, session_id).await
+    }
+
     async fn list_limited(
         &self,
         category: Option<&MemoryCategory>,

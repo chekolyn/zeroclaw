@@ -531,6 +531,24 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.filter_recalled(entries)
     }
 
+
+    async fn list_prefixed(
+        &self,
+        prefix: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default compose (the `list_limited` precedent
+        // directly below): the prefix must reach the backend's indexed range
+        // scan; a compose here would ride the unbounded `list` and pay the
+        // full-store scan. The read-wall scan still sees every row returned.
+        let entries = self
+            .inner
+            .list_prefixed(prefix, limit, session_id)
+            .await?;
+        self.filter_recalled(entries)
+    }
+
     async fn list_limited(
         &self,
         category: Option<&MemoryCategory>,
