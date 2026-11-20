@@ -2370,7 +2370,51 @@ impl Memory for PostgresMemory {
                             &[&q, &sid, &limit_i64, &allowed, &cap_i64, &categories],
                         )?,
                     };
-                    rows.iter()
+                    let entries = rows
+                        .iter()
+                        .map(Self::row_to_entry)
+                        .collect::<Result<Vec<MemoryEntry>>>()?;
+                    if !entries.is_empty() {
+                        return Ok(entries);
+                    }
+                    // OR relaxation on the AGENT-SCOPED path too — this is the
+                    // path an agent's own recall takes, so wiring only the
+                    // unscoped shape leaves the fallback inert exactly where
+                    // agents exhaust their reads (2026-11-20 live finding: the
+                    // unscoped shape relaxed, agent-scoped did not).
+                    let Some(or_query) = tsquery_or_fallback_input(&q) else {
+                        return Ok(entries);
+                    };
+                    let relaxed_stmt = ranked_recall_sql(
+                        &qualified_table,
+                        &qualified_agents,
+                        true,
+                        since_ref.is_some(),
+                        until_ref.is_some(),
+                        RecallTsqueryParse::Relaxed,
+                    );
+                    let relaxed_rows = match (since_ref, until_ref) {
+                        (Some(s), Some(u)) => client.query(
+                            &relaxed_stmt,
+                            &[
+                                &or_query, &sid, &limit_i64, &allowed, &cap_i64, &s, &u, &categories,
+                            ],
+                        )?,
+                        (Some(s), None) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &s, &categories],
+                        )?,
+                        (None, Some(u)) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &u, &categories],
+                        )?,
+                        (None, None) => client.query(
+                            &relaxed_stmt,
+                            &[&or_query, &sid, &limit_i64, &allowed, &cap_i64, &categories],
+                        )?,
+                    };
+                    relaxed_rows
+                        .iter()
                         .map(Self::row_to_entry)
                         .collect::<Result<Vec<MemoryEntry>>>()
                 })
