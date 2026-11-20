@@ -1304,6 +1304,35 @@ impl Memory for NativeMemoryBinding {
             .await
     }
 
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // FORWARD, not the default: the memory tool's receiver IS this
+        // binding, so a missing forward resolves the trait default here and
+        // the exclusion push-down never reaches the backend (the
+        // list_limited_filtered trap, one layer up).
+        let actual = self.begin_operation();
+        actual
+            .recall_filtered_scoped(
+                excludes,
+                allowed_agent_ids,
+                query,
+                limit,
+                session_id,
+                since,
+                until,
+            )
+            .await
+    }
+
     async fn recall_for_agents(
         &self,
         allowed_agent_ids: &[&str],
@@ -9934,6 +9963,12 @@ mod native_memory_binding_tests {
     /// binding.
     struct ExportBindingProbe {
         windows: parking_lot::Mutex<Vec<(usize, usize, Option<String>, Option<String>)>>,
+        /// Counts calls that reached THIS probe's `recall_filtered_scoped`.
+        /// The binding's forward is the only thing that can produce a hit: the
+        /// trait default would call `recall_for_agents` instead, so a missing
+        /// forward reads as zero — which is exactly the regression the pin
+        /// must catch.
+        scoped_recalls: std::sync::atomic::AtomicUsize,
     }
 
     impl Attributable for ExportBindingProbe {
@@ -10036,6 +10071,21 @@ mod native_memory_binding_tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        async fn recall_filtered_scoped(
+            &self,
+            _excludes: &RecallExcludes,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.scoped_recalls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
     }
 
     /// The binding must FORWARD `list_limited_filtered` — the memory_export
@@ -10046,6 +10096,7 @@ mod native_memory_binding_tests {
     async fn native_memory_binding_forwards_list_limited_filtered() {
         let inner = Arc::new(ExportBindingProbe {
             windows: parking_lot::Mutex::new(Vec::new()),
+            scoped_recalls: std::sync::atomic::AtomicUsize::new(0),
         });
         let binding = NativeMemoryBinding::new(
             Arc::clone(&inner) as Arc<dyn Memory>,
@@ -10072,6 +10123,44 @@ mod native_memory_binding_tests {
                 Some("2027-01-01T00:00:00Z".to_string())
             )],
             "the binding must forward the window and the filter bounds verbatim"
+        );
+    }
+
+    /// The exclusion push-down only reaches Postgres if the binding forwards
+    /// `recall_filtered_scoped`: the memory tool's receiver IS this binding, so
+    /// a missing forward resolves the TRAIT DEFAULT here — which filters a
+    /// `limit * 2` fetch client-side and leaves the starvation untouched
+    /// (measured 2026-11-21: 9 rows for a limit-30 request, 0 for `fleet` at
+    /// limit 20). A default run never touches the probe's override, so a zero
+    /// count is the regression signal.
+    #[tokio::test]
+    async fn native_memory_binding_forwards_recall_filtered_scoped() {
+        let inner = Arc::new(ExportBindingProbe {
+            windows: parking_lot::Mutex::new(Vec::new()),
+            scoped_recalls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let binding = NativeMemoryBinding::new(
+            Arc::clone(&inner) as Arc<dyn Memory>,
+            Arc::new(SecurityPolicy::default()),
+        );
+        let excludes = RecallExcludes {
+            categories: vec!["sop".into()],
+            ..RecallExcludes::default()
+        };
+
+        let rows = binding
+            .recall_filtered_scoped(&excludes, &["agent-a"], "fleet", 20, None, None, None)
+            .await
+            .expect("the exclusion-aware recall forwards through the binding");
+
+        assert!(rows.is_empty());
+        assert_eq!(
+            inner
+                .scoped_recalls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the binding must forward recall_filtered_scoped — the trait default would have \
+             resolved here and silently kept the client-side starvation"
         );
     }
 }

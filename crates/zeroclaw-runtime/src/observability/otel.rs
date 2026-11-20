@@ -211,6 +211,20 @@ fn build_pipeline(
     })
 }
 
+/// Second-scale buckets for the memory-path histograms.
+///
+/// The default OTel boundaries are `[0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
+/// 1000, 2500, 5000, 7500, 10000]`, which read as SECONDS here (these
+/// instruments record seconds): every sample below five seconds lands in the
+/// single `(0, 5]` bucket, so `histogram_quantile` answers with interpolation,
+/// not measurement — p50 read 2.5 s and p95 4.75 s regardless of the real
+/// distribution (2026-11-21), and a decision was nearly taken on those
+/// numbers. These boundaries resolve the range that matters (10 ms – 8 s, the
+/// recall soft budget).
+const MEMORY_DURATION_BUCKETS_S: [f64; 11] = [
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0,
+];
+
 impl OtelObserver {
     /// Create an observer attached to the process-global OTel pipeline (see
     /// [`shared_pipeline`]). The instruments are per-observer; the exporters,
@@ -305,6 +319,7 @@ impl OtelObserver {
             .f64_histogram("zeroclaw.memory.recall.duration")
             .with_description("memory.recall duration in seconds")
             .with_unit("s")
+            .with_boundaries(MEMORY_DURATION_BUCKETS_S.to_vec())
             .build();
 
         let memory_store_count = meter

@@ -29,7 +29,7 @@ use crate::redact::{self, RedactCategory};
 use crate::threat::{self, Scope};
 use crate::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
-    ProceduralMessage, StoreOptions,
+    ProceduralMessage, RecallExcludes, StoreOptions,
 };
 use async_trait::async_trait;
 use zeroclaw_config::schema::MemoryPolicyConfig;
@@ -725,6 +725,32 @@ impl<M: Memory> Memory for ScannedMemory<M> {
                 key, &content, category, session_id, namespace, importance, agent_id,
             )
             .await
+    }
+
+
+    async fn recall_filtered_scoped(
+        &self,
+        excludes: &RecallExcludes,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .recall_filtered_scoped(
+                excludes,
+                allowed_agent_ids,
+                query,
+                Self::read_fetch_limit(limit),
+                session_id,
+                since,
+                until,
+            )
+            .await?;
+        self.filter_recalled_limited(entries, limit)
     }
 
     async fn recall_for_agents(
