@@ -86,9 +86,10 @@ mod outcome_telemetry {
         outcome: &'static str,
         reason: Option<&str>,
         elapsed: std::time::Duration,
+        rows: usize,
     ) {
         let meter = global::meter("zeroclaw");
-        let attrs = outcome_attrs(label, outcome, reason);
+        let attrs = outcome_attrs(label, outcome, reason, rows);
         meter
             .u64_counter("zeroclaw.memory.recall.outcome")
             .with_description(
@@ -123,17 +124,68 @@ mod outcome_telemetry {
         POD.get_or_init(|| std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))
     }
 
+    /// Bucket a returned-row count for use as a metric label.
+    ///
+    /// The plane knows how FAST a recall is and whether it failed; it has never
+    /// known whether the recall returned anything. That is the difference
+    /// between "the read path is healthy" and "memory is contributing": after
+    /// v19 refused to relax prose, recalls stopped failing and started
+    /// returning nothing, and no instrument could see the difference.
+    ///
+    /// Bucketed, never the raw count: a label per row count is unbounded
+    /// cardinality, and the question is a distribution shape, not an identity.
+    fn rows_bucket(rows: usize) -> &'static str {
+        match rows {
+            0 => "0",
+            1 => "1",
+            2..=5 => "2-5",
+            6..=20 => "6-20",
+            _ => "20+",
+        }
+    }
+
     /// The attribute set shared by every recall instrument.
-    fn outcome_attrs(label: &str, outcome: &'static str, reason: Option<&str>) -> Vec<KeyValue> {
-        let mut attrs = Vec::with_capacity(5);
+    fn outcome_attrs(
+        label: &str,
+        outcome: &'static str,
+        reason: Option<&str>,
+        rows: usize,
+    ) -> Vec<KeyValue> {
+        let mut attrs = Vec::with_capacity(6);
         attrs.push(KeyValue::new("recall", label.to_string()));
         attrs.push(KeyValue::new("outcome", outcome));
         if let Some(reason) = reason {
             attrs.push(KeyValue::new("reason", reason.to_string()));
         }
+        attrs.push(KeyValue::new("rows", rows_bucket(rows)));
         attrs.push(KeyValue::new("env", env_label()));
         attrs.push(KeyValue::new("pod", pod_label()));
         attrs
+    }
+
+    /// The returned-row bucket is the difference between "healthy" and
+    /// "contributing".
+    ///
+    /// The plane could measure recall latency and outcome but never whether a
+    /// recall RETURNED anything — so after v19 stopped relaxing prose, recalls
+    /// stopped failing and started returning nothing, and no instrument could
+    /// tell the difference. Bucketed on purpose: a label per row count is
+    /// unbounded cardinality, and the question is a distribution shape.
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn rows_bucket_is_bounded_and_monotonic() {
+        use crate::recall_budget::outcome_telemetry::rows_bucket_for_test;
+
+        assert_eq!(rows_bucket_for_test(0), "0");
+        assert_eq!(rows_bucket_for_test(1), "1");
+        assert_eq!(rows_bucket_for_test(2), "2-5");
+        assert_eq!(rows_bucket_for_test(5), "2-5");
+        assert_eq!(rows_bucket_for_test(6), "6-20");
+        assert_eq!(rows_bucket_for_test(20), "6-20");
+        assert_eq!(rows_bucket_for_test(21), "20+");
+        // A recall limit is clamped to the candidate cap, never unbounded: the
+        // top bucket must absorb it without inventing a new series.
+        assert_eq!(rows_bucket_for_test(100_000), "20+");
     }
 
     /// The instruments must be resolved from the global provider at RECORD
@@ -153,7 +205,7 @@ mod outcome_telemetry {
         use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
         // Record BEFORE any provider exists: the global meter is the no-op.
-        record("recall", "ok", None, std::time::Duration::from_millis(5));
+        record("recall", "ok", None, std::time::Duration::from_millis(5), 0);
 
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
@@ -161,7 +213,13 @@ mod outcome_telemetry {
             .build();
         opentelemetry::global::set_meter_provider(provider.clone());
 
-        record("recall", "degraded", Some("soft_budget"), std::time::Duration::from_secs(9));
+        record(
+            "recall",
+            "degraded",
+            Some("soft_budget"),
+            std::time::Duration::from_secs(9),
+            5,
+        );
         provider.force_flush().expect("flush");
 
         let metrics = exporter.get_finished_metrics().expect("exported metrics");
@@ -185,12 +243,18 @@ mod outcome_telemetry {
     }
 
     #[cfg(test)]
+    pub(crate) fn rows_bucket_for_test(rows: usize) -> &'static str {
+        rows_bucket(rows)
+    }
+
+    #[cfg(test)]
     pub(crate) fn attrs_for_test(
         label: &str,
         outcome: &'static str,
         reason: Option<&str>,
+        rows: usize,
     ) -> Vec<KeyValue> {
-        outcome_attrs(label, outcome, reason)
+        outcome_attrs(label, outcome, reason, rows)
     }
 }
 
@@ -201,6 +265,7 @@ mod outcome_telemetry {
         _outcome: &'static str,
         _reason: Option<&str>,
         _elapsed: std::time::Duration,
+        _rows: usize,
     ) {
     }
 }
@@ -284,7 +349,7 @@ impl BudgetedMemory {
                         })),
                     "memory recall completed within the soft budget"
                 );
-                outcome_telemetry::record(label, "ok", None, elapsed);
+                outcome_telemetry::record(label, "ok", None, elapsed, entries.len());
                 return Ok(entries);
             }
             // A real backend failure that did NOT consume the budget: the
@@ -295,6 +360,7 @@ impl BudgetedMemory {
                     "error",
                     Some(&degradation_reason(&error)),
                     elapsed,
+                    0,
                 );
                 return Err(error);
             }
@@ -352,6 +418,7 @@ impl BudgetedMemory {
                     "degraded",
                     Some(&reason),
                     elapsed + fallback_start.elapsed(),
+                    entries.len(),
                 );
                 Ok(entries)
             }
@@ -373,6 +440,7 @@ impl BudgetedMemory {
                     "error",
                     Some(&degradation_reason(&error)),
                     elapsed + fallback_start.elapsed(),
+                    0,
                 );
                 Err(error)
             }
@@ -393,6 +461,7 @@ impl BudgetedMemory {
                     "error",
                     Some("budget_exhausted"),
                     elapsed + fallback_start.elapsed(),
+                    0,
                 );
                 Err(anyhow::anyhow!(
                     "memory recall ({label}) exceeded the soft budget ({:?}) and its fallback budget",
@@ -432,7 +501,7 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration completed within the soft budget"
                 );
-                outcome_telemetry::record(label, "ok", None, elapsed);
+                outcome_telemetry::record(label, "ok", None, elapsed, entries.len());
                 Ok(entries)
             }
             // A real backend failure that did NOT consume the budget: it
@@ -443,6 +512,7 @@ impl BudgetedMemory {
                     "error",
                     Some(&degradation_reason(&error)),
                     elapsed,
+                    0,
                 );
                 Err(error)
             }
@@ -462,6 +532,7 @@ impl BudgetedMemory {
                     "error",
                     Some(&degradation_reason(&error)),
                     elapsed,
+                    0,
                 );
                 Err(error)
             }
@@ -477,7 +548,7 @@ impl BudgetedMemory {
                         })),
                     "memory enumeration exceeded the soft budget; failed bounded"
                 );
-                outcome_telemetry::record(label, "error", Some("soft_budget"), elapsed);
+                outcome_telemetry::record(label, "error", Some("soft_budget"), elapsed, 0);
                 Err(anyhow::anyhow!(
                     "memory enumeration ({label}) exceeded the soft budget ({:?})",
                     self.soft_timeout
