@@ -40,6 +40,10 @@ observability-otel = ["dep:opentelemetry"]
 
 [dev-dependencies]
 filetime = "0.2"
+# The recall instruments' export pin: a meter captured from the no-op global
+# provider before the SDK installs one is a NO-OP FOREVER if its instruments
+# are cached (the v18 production regression).
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 toml = "1.0"
