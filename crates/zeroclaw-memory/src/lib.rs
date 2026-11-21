@@ -133,6 +133,7 @@ fn build_postgres_memory(
     storage: &PostgresStorageConfig,
     category_namespaces: HashMap<String, String>,
     recall_soft_timeout_ms: u64,
+    default_excludes: RecallExcludes,
 ) -> anyhow::Result<postgres::PostgresMemory> {
     use postgres::PostgresMemory;
     let db_url = storage
@@ -151,7 +152,11 @@ fn build_postgres_memory(
         Some(recall_soft_timeout_ms),
         storage.pool_size,
     )?
-    .with_category_namespaces(category_namespaces))
+    .with_category_namespaces(category_namespaces)
+    // The operator's three axes become the store's default, so every recall
+    // shape that expresses no opinion inherits them — the injection path
+    // included, which is where the leak was measured.
+    .with_default_excludes(default_excludes))
 }
 
 #[cfg(not(feature = "memory-postgres"))]
@@ -159,6 +164,7 @@ fn build_postgres_memory(
     _storage: &PostgresStorageConfig,
     _category_namespaces: HashMap<String, String>,
     _recall_soft_timeout_ms: u64,
+    _default_excludes: RecallExcludes,
 ) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
@@ -812,6 +818,11 @@ fn build_memory_with_storage(
                     pg_cfg,
                     config.category_namespaces.clone(),
                     config.recall_soft_timeout_ms,
+                    RecallExcludes {
+                        namespaces: config.exclude_namespaces.clone(),
+                        categories: config.exclude_categories.clone(),
+                        key_prefixes: config.exclude_key_prefixes.clone(),
+                    },
                 )?,
                 &config.policy,
                 workspace_dir,
