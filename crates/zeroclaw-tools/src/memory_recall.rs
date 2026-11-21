@@ -335,15 +335,23 @@ impl Tool for MemoryRecallTool {
             .and_then(|v| v.as_str())
             .unwrap_or("filtered");
         let skip_excludes = scope.eq_ignore_ascii_case("all");
-        let recall_result = if skip_excludes {
-            self.memory
-                .recall(query, fetch_limit, None, since, until)
-                .await
+        // `scope="all"` states its intent as an EXPLICITLY EMPTY exclusion set,
+        // never as a bare `recall`. Bare `recall` used to mean "no excludes by
+        // construction", but the operator's axes are the store's default since
+        // v20, so the hatch silently started excluding — measured on prod
+        // 2026-11-21: `category="sop", scope="all"` returned "No memories
+        // found" while `prefix="sop_run_"` returned those same rows. Saying
+        // "exclude nothing" out loud cannot be re-broken by whichever default
+        // a backend adopts next.
+        let excludes = if skip_excludes {
+            RecallExcludes::default()
         } else {
-            self.memory
-                .recall_filtered(query, fetch_limit, None, since, until, &self.excludes)
-                .await
+            self.excludes.clone()
         };
+        let recall_result = self
+            .memory
+            .recall_filtered(query, fetch_limit, None, since, until, &excludes)
+            .await;
 
         match recall_result {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -1470,6 +1478,214 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("Rust"));
         assert!(!result.output.contains("SOP runbook"));
+    }
+
+    /// Records WHICH recall entry point the tool uses and with what excludes.
+    ///
+    /// The sqlite-backed hatch test kept passing after v20, because a bare
+    /// `recall` on sqlite carries no default excludes — the deployment did.
+    /// This pins the CALL SHAPE instead, so the hatch cannot regress on any
+    /// backend: `scope="all"` must arrive as `recall_filtered` with an EMPTY
+    /// set, never as a bare `recall`.
+    struct ExcludesRecordingMemory {
+        recorded: Arc<Mutex<Option<RecallExcludes>>>,
+        bare_recall_called: Arc<Mutex<bool>>,
+    }
+
+    fn recorded_entry(id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            principal_id: None,
+            id: id.into(),
+            key: id.into(),
+            content: content.into(),
+            category: MemoryCategory::Core,
+            timestamp: "2026-05-03T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ExcludesRecordingMemory {
+        fn name(&self) -> &str {
+            "excludes_recording"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            *self.bare_recall_called.lock().unwrap() = true;
+            Ok(vec![recorded_entry("bare", "bare recall row")])
+        }
+
+        async fn recall_filtered(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+            excludes: &RecallExcludes,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            *self.recorded.lock().unwrap() = Some(excludes.clone());
+            Ok(vec![recorded_entry("filtered", "filtered recall row")])
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ExcludesRecordingMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "ExcludesRecordingMemory"
+        }
+    }
+
+    fn recording_tool(
+        configured: RecallExcludes,
+    ) -> (
+        MemoryRecallTool,
+        Arc<Mutex<Option<RecallExcludes>>>,
+        Arc<Mutex<bool>>,
+    ) {
+        let recorded = Arc::new(Mutex::new(None));
+        let bare = Arc::new(Mutex::new(false));
+        let mem = Arc::new(ExcludesRecordingMemory {
+            recorded: Arc::clone(&recorded),
+            bare_recall_called: Arc::clone(&bare),
+        });
+        (
+            MemoryRecallTool::new_with_excludes(mem, configured),
+            recorded,
+            bare,
+        )
+    }
+
+    /// The prod defect, 2026-11-21: `category="sop", scope="all"` returned
+    /// "No memories found" while `prefix="sop_run_"` returned those same rows,
+    /// because the hatch called bare `recall` — which inherits the store's
+    /// operator axes since v20.
+    #[tokio::test]
+    async fn scope_all_sends_an_explicitly_empty_exclude_set() {
+        let configured = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            categories: vec!["sop".into()],
+            key_prefixes: vec!["sop_run_".into()],
+        };
+        let (tool, recorded, bare) = recording_tool(configured);
+        let result = tool.execute(json!({"scope": "all"})).await.unwrap();
+        assert!(result.success);
+
+        let seen = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recall_filtered must be called");
+        assert!(
+            seen.namespaces.is_empty() && seen.categories.is_empty() && seen.key_prefixes.is_empty(),
+            "scope=all must state 'exclude nothing', got: {seen:?}"
+        );
+        assert!(
+            !*bare.lock().unwrap(),
+            "scope=all must never fall back to a bare recall — that is how it inherited the store defaults"
+        );
+    }
+
+    /// The default scope still carries the configured axes (unchanged).
+    #[tokio::test]
+    async fn default_scope_still_carries_the_configured_excludes() {
+        let configured = RecallExcludes {
+            namespaces: vec!["telemetry".into()],
+            categories: vec!["sop".into()],
+            key_prefixes: Vec::new(),
+        };
+        let (tool, recorded, _bare) = recording_tool(configured.clone());
+        tool.execute(json!({})).await.unwrap();
+        let seen = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recall_filtered must be called");
+        assert_eq!(seen.namespaces, configured.namespaces);
+        assert_eq!(seen.categories, configured.categories);
     }
 
     #[tokio::test]
