@@ -835,6 +835,11 @@ fn build_memory_with_storage(
                 pg_cfg,
                 config.category_namespaces.clone(),
                 config.recall_soft_timeout_ms,
+                RecallExcludes {
+                    namespaces: config.exclude_namespaces.clone(),
+                    categories: config.exclude_categories.clone(),
+                    key_prefixes: config.exclude_key_prefixes.clone(),
+                },
             );
         }
     }
