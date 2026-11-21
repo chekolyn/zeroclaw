@@ -63,15 +63,7 @@ const FALLBACK_BUDGET_FLOOR: Duration = Duration::from_millis(1000);
 mod outcome_telemetry {
     use opentelemetry::KeyValue;
     use opentelemetry::global;
-    use opentelemetry::metrics::{Counter, Histogram};
-    use std::sync::OnceLock;
-
-    struct Instruments {
-        outcome: Counter<u64>,
-        duration: Histogram<f64>,
-    }
-
-    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+        use std::sync::OnceLock;
 
     /// The same bucket set as the runtime's `zeroclaw.memory.recall.duration`
     /// (`otel.rs`): explicit SECOND-scale buckets, because OTel's default
@@ -80,26 +72,37 @@ mod outcome_telemetry {
     const ATTEMPT_BUCKETS_S: [f64; 11] =
         [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0];
 
-    fn instruments() -> &'static Instruments {
-        INSTRUMENTS.get_or_init(|| {
-            let meter = global::meter("zeroclaw");
-            Instruments {
-                outcome: meter
-                    .u64_counter("zeroclaw.memory.recall.outcome")
-                    .with_description(
-                        "Memory recall attempts by outcome (ok | degraded | error) and failure class",
-                    )
-                    .build(),
-                duration: meter
-                    .f64_histogram("zeroclaw.memory.recall.attempt.duration")
-                    .with_description(
-                        "Caller-visible latency of a recall attempt, by shape and outcome",
-                    )
-                    .with_unit("s")
-                    .with_boundaries(ATTEMPT_BUCKETS_S.to_vec())
-                    .build(),
-            }
-        })
+    /// Resolve the instruments from the global provider AT RECORD TIME.
+    ///
+    /// Never cache them: `global::meter` returns the NO-OP meter until the
+    /// runtime installs its SDK provider, and a cached instrument built from
+    /// that meter stays a no-op for the life of the process. Production
+    /// proved it (v18, 2026-11-21): 36 per-turn injections, the counter
+    /// exported from v16/v17, and zero series after v18 — one recall during
+    /// boot had poisoned a `OnceLock`. The SDK caches instruments by
+    /// descriptor internally, so rebuilding per record costs a lookup.
+    pub(crate) fn record(
+        label: &str,
+        outcome: &'static str,
+        reason: Option<&str>,
+        elapsed: std::time::Duration,
+    ) {
+        let meter = global::meter("zeroclaw");
+        let attrs = outcome_attrs(label, outcome, reason);
+        meter
+            .u64_counter("zeroclaw.memory.recall.outcome")
+            .with_description(
+                "Memory recall attempts by outcome (ok | degraded | error) and failure class",
+            )
+            .build()
+            .add(1, &attrs);
+        meter
+            .f64_histogram("zeroclaw.memory.recall.attempt.duration")
+            .with_description("Caller-visible latency of a recall attempt, by shape and outcome")
+            .with_unit("s")
+            .with_boundaries(ATTEMPT_BUCKETS_S.to_vec())
+            .build()
+            .record(elapsed.as_secs_f64(), &attrs);
     }
 
     /// `ZEROCLAW_ENV`, read once. Without it a canary rollout and a prod
@@ -133,22 +136,52 @@ mod outcome_telemetry {
         attrs
     }
 
-    /// Count the attempt AND record its caller-visible latency.
+    /// The instruments must be resolved from the global provider at RECORD
+    /// time, never captured once from whatever meter existed at first call.
     ///
-    /// Paired on purpose: recording one without the other is how the plane
-    /// ended up with a duration histogram that no outcome could be compared
-    /// against (the histogram carries no shape label, the counter carried no
-    /// latency).
-    pub(crate) fn record(
-        label: &str,
-        outcome: &'static str,
-        reason: Option<&str>,
-        elapsed: std::time::Duration,
-    ) {
-        let attrs = outcome_attrs(label, outcome, reason);
-        let instruments = instruments();
-        instruments.outcome.add(1, &attrs);
-        instruments.duration.record(elapsed.as_secs_f64(), &attrs);
+    /// Production proved the difference (v18, 2026-11-21): 36 per-turn
+    /// injections on prod, `zeroclaw.memory.recall.outcome` exported from
+    /// v16/v17 — and zero series after v18, while the runtime's own metrics
+    /// (built eagerly, after the SDK provider was installed) kept flowing.
+    /// A `OnceLock` around instruments built from a meter resolved too early
+    /// is a no-op forever: the SDK's global provider is installed lazily by
+    /// the runtime, and one recall during boot poisons the cache for the
+    /// process lifetime.
+    #[test]
+    fn instruments_follow_the_global_provider_installed_later() {
+        use opentelemetry::KeyValue;
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+        // Record BEFORE any provider exists: the global meter is the no-op.
+        record("recall", "ok", None, std::time::Duration::from_millis(5));
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+
+        record("recall", "degraded", Some("soft_budget"), std::time::Duration::from_secs(9));
+        provider.force_flush().expect("flush");
+
+        let metrics = exporter.get_finished_metrics().expect("exported metrics");
+        let names: Vec<String> = metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .map(|m| m.name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "zeroclaw.memory.recall.outcome"),
+            "the outcome counter must reach the provider installed AFTER the first record: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "zeroclaw.memory.recall.attempt.duration"),
+            "the per-shape duration histogram must reach it too: {names:?}"
+        );
+        let _ = KeyValue::new("recall", "unused");
     }
 
     #[cfg(test)]
