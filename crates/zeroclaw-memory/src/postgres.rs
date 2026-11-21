@@ -556,6 +556,9 @@ pub struct PostgresMemory {
     /// The empty-query recall path is exempt: it is the indexed recent
     /// fallback itself.
     recall_soft_timeout: Option<Duration>,
+    /// The operator's three-axis excludes, applied to every recall that does
+    /// not carry an explicit set of its own (see [`resolve_recall_excludes`]).
+    default_excludes: RecallExcludes,
 }
 
 impl PostgresMemory {
@@ -624,6 +627,7 @@ impl PostgresMemory {
             category_namespaces: HashMap::new(),
             op_timeout,
             recall_soft_timeout,
+            default_excludes: RecallExcludes::default(),
         })
     }
 
@@ -635,6 +639,14 @@ impl PostgresMemory {
         category_namespaces: HashMap<String, String>,
     ) -> Self {
         self.category_namespaces = category_namespaces;
+        self
+    }
+
+    /// Install the operator's three-axis excludes as the store's default
+    /// (see [`resolve_recall_excludes`]).
+    #[must_use]
+    pub fn with_default_excludes(mut self, default_excludes: RecallExcludes) -> Self {
+        self.default_excludes = default_excludes;
         self
     }
 
@@ -1428,6 +1440,31 @@ fn normalize_tsquery_input(query: &str) -> String {
 /// excluded rows dominate this store (measured 2026-11-21: 51 of the newest
 /// 60 rows are `sop`/`telemetry`), so a post-filter over a `limit * 2` fetch
 /// returned 9 rows for a limit-30 request and zero for `fleet` at limit 20.
+/// Resolve the excludes a recall runs with.
+///
+/// The operator's three axes (`[memory] exclude_namespaces / exclude_categories
+/// / exclude_key_prefixes`) are the DEFAULT for every recall the store serves —
+/// not a per-call opt-in. `None` means "the caller expressed no opinion"; an
+/// explicitly EMPTY set means "no exclusions", which is the memory tool's
+/// `scope="all"` audit hatch. Conflating the two would silently close the
+/// hatch, so the distinction is carried in the type.
+///
+/// Why the default lives here and not at each call site: measured on prod
+/// (2026-11-21, Rocky's live probe), the per-turn memory injection calls bare
+/// `recall`, which carried `{}` on all three axes — a plain query returned a
+/// `sop:`-keyed run-state row as its FIRST hit, the exact class the operator
+/// configured out three weeks earlier. The agent TOOL was clean only because
+/// `recall_filtered_scoped` passes an explicit set.
+fn resolve_recall_excludes(
+    defaults: &RecallExcludes,
+    explicit: Option<RecallExcludes>,
+) -> RecallExcludes {
+    match explicit {
+        Some(own) => own,
+        None => defaults.clone(),
+    }
+}
+
 fn recall_exclude_predicate(first_placeholder: usize) -> String {
     let (ns, cats, keys) = (
         first_placeholder,
@@ -1730,13 +1767,16 @@ impl PostgresMemory {
     async fn recall_impl(
         &self,
         agent_scope: Option<Vec<String>>,
-        excludes: RecallExcludes,
+        excludes: Option<RecallExcludes>,
         query: &str,
         limit: usize,
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
+        // `None` = the caller expressed no opinion -> the operator's defaults;
+        // `Some(empty)` = an explicit "no exclusions" (the audit hatch).
+        let excludes = resolve_recall_excludes(&self.default_excludes, excludes);
         let pool = self.pool.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
@@ -1942,12 +1982,12 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // The memory tool's `scope="all"` audit hatch rides THIS path, so it
-        // stays exclusion-free by construction: excludes travel only through
-        // `recall_filtered_scoped`.
+        // No explicit set: the store applies the operator's defaults. An
+        // explicit EMPTY set still reaches `recall_filtered_scoped` untouched —
+        // that is the memory tool's `scope="all"` audit hatch.
         self.recall_impl(
             None,
-            RecallExcludes::default(),
+            None,
             query,
             limit,
             session_id,
@@ -1971,7 +2011,7 @@ impl Memory for PostgresMemory {
         }
         self.recall_impl(
             Some(allowed_agent_ids.iter().map(|s| (*s).to_string()).collect()),
-            RecallExcludes::default(),
+            None,
             query,
             limit,
             session_id,
@@ -2013,7 +2053,7 @@ impl Memory for PostgresMemory {
         };
         self.recall_impl(
             agent_scope,
-            excludes.clone(),
+            Some(excludes.clone()),
             query,
             limit,
             session_id,
@@ -3487,6 +3527,52 @@ mod tests {
         assert_eq!(bound_recall_query(&no_space).chars().count(), RECALL_QUERY_CHAR_BUDGET);
         // Short queries pass through untouched.
         assert_eq!(bound_recall_query("proj:pr-drain:lock"), "proj:pr-drain:lock");
+    }
+
+    /// The operator's three-axis excludes are the DEFAULT for every recall the
+    /// store serves — not a per-call opt-in.
+    ///
+    /// Prod evidence (2026-11-21, Rocky's live probe): the per-turn memory
+    /// injection calls bare `recall`, which bound `{}` for all three axes, so a
+    /// plain query returned a `sop:`-keyed run-state row as its FIRST hit — the
+    /// exact class `[memory] exclude_*` exists to keep out of recall. The agent
+    /// TOOL looked clean only because `recall_filtered_scoped` always carries an
+    /// explicit set.
+    ///
+    /// The three-valued distinction is the whole point: `None` (unset) inherits
+    /// the operator's defaults, `Some(empty)` is an explicit "no exclusions"
+    /// (the tool's `scope="all"` audit hatch), and `Some(own)` wins outright —
+    /// never merged, so a caller asking for one axis does not silently acquire
+    /// the others.
+    #[test]
+    fn default_excludes_apply_unless_the_caller_states_its_own() {
+        let defaults = RecallExcludes {
+            namespaces: vec!["telemetry".to_string()],
+            categories: vec!["sop".to_string()],
+            key_prefixes: vec!["user_msg_".to_string()],
+        };
+
+        let inherited = resolve_recall_excludes(&defaults, None);
+        assert_eq!(inherited.namespaces, vec!["telemetry".to_string()]);
+        assert_eq!(inherited.categories, vec!["sop".to_string()]);
+        assert_eq!(inherited.key_prefixes, vec!["user_msg_".to_string()]);
+
+        let hatch = resolve_recall_excludes(&defaults, Some(RecallExcludes::default()));
+        assert!(
+            hatch.namespaces.is_empty() && hatch.categories.is_empty() && hatch.key_prefixes.is_empty(),
+            "an explicit empty set is the audit hatch and must stay open"
+        );
+
+        let own = resolve_recall_excludes(
+            &defaults,
+            Some(RecallExcludes {
+                namespaces: Vec::new(),
+                categories: vec!["daily".to_string()],
+                key_prefixes: Vec::new(),
+            }),
+        );
+        assert_eq!(own.categories, vec!["daily".to_string()]);
+        assert!(own.namespaces.is_empty(), "a caller's axes are never merged with the defaults");
     }
 
     /// The 2026-11-21 plan defect, pinned structurally: the full-content FTS
