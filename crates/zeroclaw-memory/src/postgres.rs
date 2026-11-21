@@ -2765,6 +2765,182 @@ mod tests {
     /// and the plan serves it from `idx_memories_updated_at` (the backward
     /// scan) — the same live-test shape as the prefix-bound pins.
     #[test]
+    /// The server executes the exclude predicate — the gap that let v13 ship.
+    ///
+    /// Every exclusion assertion in this crate until now was a STRING pin on
+    /// the SQL. v13 proved what that is worth: the statement read correctly and
+    /// bound the allowlist into the result-limit slot, so every agent-scoped
+    /// recall died at `error serializing parameter 3` with the whole suite
+    /// green. An exclusion predicate has the same blind spot one layer down —
+    /// a placeholder off by one, or a predicate bound to an empty array, still
+    /// renders perfectly.
+    ///
+    /// So this runs against a real server and asserts the RESULT: three
+    /// excluded rows (one per axis) must be absent, the plain row present, and
+    /// an explicitly empty set must still reach all four — the audit hatch.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_recall_filtered_scoped_excludes_each_axis_server_side() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "exclaxes");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mem = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+
+        runtime.block_on(async {
+            // One row per exclusion axis, plus a plain row every axis keeps.
+            mem.store("plain-needle", "needle content alpha", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store(
+                "sop_run_needle",
+                "needle content bravo",
+                MemoryCategory::Custom("sop".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+            // Namespace is not on the public store path; the child test module
+            // reaches the same helper the store delegates to.
+            mem.store_with_agent(
+                "ns-needle",
+                "needle content charlie",
+                MemoryCategory::Custom("research".to_string()),
+                None,
+                Some("telemetry_sop"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let excludes = RecallExcludes {
+                namespaces: vec!["telemetry".to_string()],
+                categories: vec!["sop".to_string()],
+                key_prefixes: vec!["sop_run_".to_string()],
+            };
+
+            let filtered = mem
+                .recall_filtered_scoped(&excludes, &[], "needle", 20, None, None, None)
+                .await
+                .expect("the filtered shape must execute server-side");
+            let keys: Vec<&str> = filtered.iter().map(|e| e.key.as_str()).collect();
+            assert!(keys.contains(&"plain-needle"), "the kept row must survive: {keys:?}");
+            for excluded in ["sop_run_needle", "ns-needle"] {
+                assert!(
+                    !keys.contains(&excluded),
+                    "{excluded} is excluded by an axis and must not be recalled: {keys:?}"
+                );
+            }
+
+            // The audit hatch: an explicitly EMPTY set excludes nothing.
+            let hatch = mem
+                .recall_filtered_scoped(
+                    &RecallExcludes::default(),
+                    &[],
+                    "needle",
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("the hatch shape must execute server-side");
+            let hatch_keys: Vec<&str> = hatch.iter().map(|e| e.key.as_str()).collect();
+            for expected in ["plain-needle", "sop_run_needle", "ns-needle"] {
+                assert!(
+                    hatch_keys.contains(&expected),
+                    "scope=all must reach {expected}: {hatch_keys:?}"
+                );
+            }
+        });
+        drop(runtime);
+    }
+
+    /// The store's DEFAULT excludes reach the plain `recall` — the wiring v20
+    /// shipped and could not prove on prod.
+    ///
+    /// `recall` carries no excludes argument, so before v20 the per-turn
+    /// injection bound `{}` on every axis and ranked the operator's excluded
+    /// telemetry (measured on prod 2026-11-21: a `sop:`-keyed run-state row
+    /// came back as hit #1). The unit pin proves the three-valued resolution;
+    /// this proves the resolved set actually reaches the SQL and the rows.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_plain_recall_applies_the_stores_default_excludes() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "defexcl");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mem = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            // The operator's axes, as the backend factory installs them.
+            .with_default_excludes(RecallExcludes {
+                namespaces: vec!["telemetry".to_string()],
+                categories: vec!["sop".to_string()],
+                key_prefixes: vec!["sop_run_".to_string()],
+            })
+        });
+
+        runtime.block_on(async {
+            mem.store("plain-needle", "needle content alpha", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store(
+                "sop_run_needle",
+                "needle content bravo",
+                MemoryCategory::Custom("sop".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+            // No excludes argument: the store's defaults must apply.
+            let plain = mem.recall("needle", 20, None, None, None).await.unwrap();
+            let keys: Vec<&str> = plain.iter().map(|e| e.key.as_str()).collect();
+            assert!(keys.contains(&"plain-needle"), "the kept row must survive: {keys:?}");
+            assert!(
+                !keys.contains(&"sop_run_needle"),
+                "a bare recall must inherit the operator's excludes: {keys:?}"
+            );
+        });
+        drop(runtime);
+    }
+
     #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
     fn postgres_list_limited_respects_the_limit_and_serves_the_updated_at_index() {
         let database_url = postgres_test_url();
