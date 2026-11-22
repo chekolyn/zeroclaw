@@ -152,6 +152,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"is_mention_not_instruction",
         "min_count": 2,
     },
+    "rl-all-cooled-wait": {
+        "glob": "crates/zeroclaw-providers/src/reliable.rs",
+        "pattern": r"wait_out_all_provider_cooldowns",
+        "min_count": 5,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
