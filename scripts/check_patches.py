@@ -147,6 +147,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"MEMORY_LIST_DEFAULT_LIMIT",
         "min_count": 1,
     },
+    "threat-mention-guard": {
+        "glob": "crates/zeroclaw-memory/src/threat.rs",
+        "pattern": r"is_mention_not_instruction",
+        "min_count": 2,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
