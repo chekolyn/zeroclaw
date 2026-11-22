@@ -25,6 +25,23 @@ fn format_relative_score(score: Option<f64>, max_score: f64) -> String {
     })
 }
 
+/// Per-row content preview for the prefix-recall enumeration. A prefix
+/// listing is a FIND operation: keys identify, `memory_get` reads. The
+/// measured prod shape behind this cap (2026-11-22, patroni primary):
+/// `sop_run_*` rows average 104 KB (max 1.57 MB) — a head preview of a
+/// few hundred chars carries the identifying payload (sop_name, run_id,
+/// workflow) and nothing more belongs in an enumeration.
+const PREFIX_ROW_PREVIEW_CHARS: usize = 240;
+
+/// Total serialized output budget for the prefix-recall enumeration, in
+/// chars. Measured prod defect (cycle 11): `prefix="sop_run_", limit=100`
+/// built a 10,438,694-char output that the runtime's 50,000-char
+/// `truncate_tool_result` then discarded — the full build/serialize cost
+/// was paid for bytes the caller never received. Half the runtime cap, so
+/// the tool's own bound always binds first and the runtime truncator stays
+/// a last-resort invariant.
+const PREFIX_OUTPUT_BUDGET_CHARS: usize = 24_000;
+
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
     /// Three-axis exclude set sourced from `[memory] exclude_namespaces /
@@ -91,6 +108,23 @@ impl MemoryRecallTool {
         }
     }
 
+    /// Per-row content preview for the prefix-recall enumeration. A prefix
+    /// listing is a FIND operation: keys identify, `memory_get` reads. The
+    /// measured prod shape behind this cap (2026-11-22, patroni primary):
+    /// `sop_run_*` rows average 104 KB (max 1.57 MB) — a head preview of a
+    /// few hundred chars carries the identifying payload (sop_name,
+    /// run_id, workflow) and nothing more belongs in an enumeration.
+    const PREFIX_ROW_PREVIEW_CHARS: usize = 240;
+
+    /// Total serialized output budget for the prefix-recall enumeration,
+    /// in chars. Measured prod defect (cycle 11): `prefix="sop_run_",
+    /// limit=100` built a 10,438,694-char output that the runtime's
+    /// 50,000-char `truncate_tool_result` then discarded — the full
+    /// build/serialize cost was paid for bytes the caller never received.
+    /// Half the runtime cap, so the tool's own bound always binds first
+    /// and the runtime truncator stays a last-resort invariant.
+    const PREFIX_OUTPUT_BUDGET_CHARS: usize = 24_000;
+
     /// Handle prefix recall mode: list all entries whose key starts with `prefix`.
     async fn handle_prefix_recall(&self, prefix: &str, limit: usize) -> anyhow::Result<ToolResult> {
         // The enumeration rides `list_prefixed` — the prefix-pushed,
@@ -136,13 +170,42 @@ impl MemoryRecallTool {
             });
         }
 
+        // The OUTPUT byte budget (cycle 11): `list_prefixed` fetches full
+        // content per row — a 104 KB-average row shape turns `limit=100`
+        // into a 10.4 MB serialized output that the runtime's 50K truncator
+        // discarded after the full build cost was paid. The enumeration is
+        // a FIND operation: keys identify, `memory_get` reads. Each row
+        // renders as key + head preview, and the whole body stops at
+        // PREFIX_OUTPUT_BUDGET_CHARS with the withheld count disclosed.
+        // The cap applies HERE, at formatting time — deliberately AFTER the
+        // read-wall/audit wrappers have seen the full content, so no
+        // scan loses coverage to the preview.
         let mut output = format!("Found {} memories:\n", matched.len());
+        let mut used = output.chars().count();
+        let mut listed = 0usize;
         for entry in &matched {
-            let _ = writeln!(
-                output,
-                "- [{}] {}: {}",
-                entry.category, entry.key, entry.content
-            );
+            let mut line = format!("- [{}] {}: ", entry.category, entry.key);
+            if entry.content.chars().count() > PREFIX_ROW_PREVIEW_CHARS {
+                line.extend(entry.content.chars().take(PREFIX_ROW_PREVIEW_CHARS));
+                line.push('…');
+            } else {
+                line.push_str(&entry.content);
+            }
+            let line_chars = line.chars().count() + 1; // the trailing newline
+            if listed > 0 && used + line_chars > PREFIX_OUTPUT_BUDGET_CHARS {
+                let withheld = matched.len() - listed;
+                let _ = write!(
+                    output,
+                    "… output budget reached after {listed} of {} entries; {withheld} keys \
+                     withheld — narrow the prefix or lower the limit, and use memory_get for \
+                     the full content of a specific key.",
+                    matched.len()
+                );
+                break;
+            }
+            let _ = writeln!(output, "{line}");
+            used += line_chars;
+            listed += 1;
         }
         Ok(ToolResult {
             success: true,
@@ -645,6 +708,237 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("prefixed entry"));
+    }
+
+    /// Fake backend handing the tool a CONFIGURABLE row set from
+    /// `list_prefixed` — the payload-bomb harness. The prod shape it stands
+    /// in for (measured 2026-11-22 on the patroni primary): `sop_run_*` rows
+    /// average 104 KB of content (max 1.57 MB single row), so
+    /// `prefix="sop_run_", limit=100` built a 10.4 MB serialized tool output
+    /// that the runtime's 50K truncator then discarded — ~99.5 % of the
+    /// built bytes thrown away after the full cost was paid.
+    struct BloatedRowMemory {
+        rows: Mutex<Vec<MemoryEntry>>,
+    }
+
+    impl BloatedRowMemory {
+        fn new(rows: Vec<MemoryEntry>) -> Arc<Self> {
+            Arc::new(Self {
+                rows: Mutex::new(rows),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Memory for BloatedRowMemory {
+        fn name(&self) -> &str {
+            "bloated-rows"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn list_prefixed(
+            &self,
+            _prefix: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.rows.lock().unwrap().len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for BloatedRowMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "BloatedRowMemory"
+        }
+    }
+
+    fn bloated_run_row(i: usize, content_len: usize) -> MemoryEntry {
+        MemoryEntry {
+            principal_id: None,
+            id: format!("sop_run:run-{i:04}"),
+            key: format!("sop_run:run-{i:04}"),
+            content: "x".repeat(content_len),
+            category: MemoryCategory::Core,
+            timestamp: "2026-11-22T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    /// THE PAYLOAD-BOMB PIN (cycle 11): `prefix="sop_run_", limit=100` over
+    /// the measured 104 KB-per-row shape must produce a BOUNDED output the
+    /// tool itself guarantees — the runtime's `truncate_tool_result` cap is
+    /// downstream and must never be the only bound standing between an
+    /// enumeration and a multi-megabyte payload. The enumeration contract
+    /// is keys-identify / get-reads: every key listed before the budget cut
+    /// stays visible, and the cut is DISCLOSED with a count, never silent.
+    #[tokio::test]
+    async fn prefix_recall_output_is_byte_bounded_against_the_bloated_run_shape() {
+        let rows: Vec<MemoryEntry> = (0..100).map(|i| bloated_run_row(i, 104_000)).collect();
+        let mem = BloatedRowMemory::new(rows);
+        let tool =
+            MemoryRecallTool::new_with_excludes_and_budget(mem, RecallExcludes::default(), 2000);
+        let result = tool
+            .execute(json!({"prefix": "sop_run:", "limit": 100}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let out_len = result.output.chars().count();
+        assert!(
+            out_len <= PREFIX_OUTPUT_BUDGET_CHARS + 2_000,
+            "the prefix path must bound its own serialized output; got {out_len} chars — \
+             the pre-fix shape built 10.4 MB here and let the runtime truncate post hoc"
+        );
+        // Keys listed before the budget cut remain visible — keys are the
+        // enumeration's payload, the preview only decorates them.
+        assert!(result.output.contains("sop_run:run-0000"));
+        // The cut is disclosed, never silent.
+        assert!(
+            result.output.contains("output budget reached"),
+            "a budget cut must carry the withholding note, got: {}",
+            &result.output[..result.output.len().min(400)]
+        );
+    }
+
+    /// The measured WORST row (1,571,940 chars) must never reach the output
+    /// whole: the per-row preview caps one row's content regardless of how
+    /// much budget remains. Head-only preview + ellipsis; the full content
+    /// stays reachable via `memory_get` (recall to find, get to read).
+    #[tokio::test]
+    async fn prefix_recall_row_preview_caps_a_megabyte_row() {
+        let rows = vec![bloated_run_row(0, 1_571_940)];
+        let mem = BloatedRowMemory::new(rows);
+        let tool =
+            MemoryRecallTool::new_with_excludes_and_budget(mem, RecallExcludes::default(), 2000);
+        let result = tool
+            .execute(json!({"prefix": "sop_run:", "limit": 10}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let out_len = result.output.chars().count();
+        assert!(
+            out_len < 3_000,
+            "one 1.57 MB row must render as a bounded preview line; got {out_len} chars"
+        );
+        assert!(
+            result.output.contains('…'),
+            "a cut preview carries the ellipsis"
+        );
+        assert!(result.output.contains("sop_run:run-0000"));
+    }
+
+    /// A small, healthy enumeration renders EXACTLY as before — every row
+    /// whole, no withholding note. The budget must only bite oversized
+    /// payloads, not tax the common case.
+    #[tokio::test]
+    async fn prefix_recall_small_rows_render_whole_without_the_note() {
+        let rows: Vec<MemoryEntry> = (0..10).map(|i| bloated_run_row(i, 120)).collect();
+        let mem = BloatedRowMemory::new(rows);
+        let tool =
+            MemoryRecallTool::new_with_excludes_and_budget(mem, RecallExcludes::default(), 2000);
+        let result = tool
+            .execute(json!({"prefix": "sop_run:", "limit": 10}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains(&"x".repeat(120)),
+            "small content renders whole"
+        );
+        assert!(
+            !result.output.contains("output budget reached"),
+            "a listing that fits carries no withholding note"
+        );
+        assert_eq!(result.output.lines().count(), 11, "header + 10 whole rows");
     }
 
     /// Fake backend distinguishing `list` from `list_prefixed` so the tool's
