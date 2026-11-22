@@ -2485,6 +2485,49 @@ impl ReliableModelProvider {
         self.eligible_provider_count() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
+    /// The shortest remaining cooldown among the policy-eligible entries,
+    /// when EVERY one of them is inside a cooldown window — the all-cooled
+    /// wait's wait source (cycle 18). `None` when any eligible entry is
+    /// callable (the walk proceeds without a wait), when the skip-walk's
+    /// multi-candidate gate does not apply (`eligible_provider_count() <= 1`
+    /// — the single provider keeps its own in-loop wait), or when there is
+    /// no eligible entry at all. Expired windows are pruned on the way
+    /// through, matching `provider_cooldown_active`. The production chain
+    /// shares ONE cooldown key, so the one shared window is the answer;
+    /// heterogeneous chains return their minimum.
+    fn shortest_all_eligible_cooldown(&self) -> Option<(String, Duration)> {
+        if self.eligible_provider_count() <= 1 {
+            return None;
+        }
+        let now = Instant::now();
+        let mut cooldowns = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut shortest: Option<(String, Duration)> = None;
+        for entry in self
+            .model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+        {
+            match cooldowns.get(&entry.cooldown_key).copied() {
+                Some(deadline) if now < deadline => {
+                    let remaining = deadline - now;
+                    shortest = Some(match shortest {
+                        Some((key, current)) if current <= remaining => (key, current),
+                        _ => (entry.cooldown_key.clone(), remaining),
+                    });
+                }
+                Some(_) => {
+                    cooldowns.remove(&entry.cooldown_key);
+                    return None;
+                }
+                None => return None,
+            }
+        }
+        shortest
+    }
+
     /// Admit an entry with its configured retry budget, except for the exact
     /// stream-failed entry, which is skipped to avoid replaying it. Image
     /// replacement and semantic-empty (with budget) each permit one atomic
@@ -2750,6 +2793,60 @@ impl ReliableModelProvider {
         RateLimitWaitOutcome::Waited { waited_ms: wait }
     }
 
+    /// Wait out an all-cooled chain before the provider walk (cycle 18: the
+    /// cooldown walk must wait, not fail). When EVERY policy-eligible entry
+    /// sits inside a rate-limit cooldown at call entry, the walk below would
+    /// skip every candidate, consume zero attempts, and return the terminal
+    /// aggregate instantly — converting a ≤60 s transient into a dead turn
+    /// (prod 2026-11-22: 20 of 27 SOP run failures were this class). The
+    /// engine's own cooldown hint ("wait for provider cooldown or switch
+    /// provider") is honored here instead: sleep the SHORTEST remaining
+    /// window among the eligible entries, clamped by the per-call rate-limit
+    /// budget, then let the walk proceed — entries whose window expired are
+    /// attempted, the rest cooldown-skip exactly as before.
+    ///
+    /// Bounds: one wait per call, never more (the helper runs once, at walk
+    /// entry); the wait is deducted from the ledger so the call's total wait
+    /// never exceeds the budget; a zero remaining budget or a zero computed
+    /// wait skips the sleep and the walk fails as before — a genuine
+    /// all-providers-down error still surfaces. The wait is deterministic
+    /// (`min(window, budget)`), not the jittered curve: it must COVER the
+    /// shortest window or a shared-key chain would still skip everything,
+    /// and jittering below the window would reintroduce the instant failure.
+    async fn wait_out_all_provider_cooldowns(&self, failures: &mut FailureEvents) {
+        let Some((cooldown_key, shortest)) = self.shortest_all_eligible_cooldown() else {
+            return;
+        };
+        let ledger = &mut failures.rate_limit_wait;
+        if ledger.budget_remaining_ms == 0 {
+            return;
+        }
+        let wait = shortest.as_millis() as u64;
+        let wait = wait.min(ledger.budget_remaining_ms);
+        if wait == 0 {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": cooldown_key.as_str(),
+                    "wait_ms": wait,
+                    "budget_remaining_ms": ledger.budget_remaining_ms,
+                })),
+            "All model providers in rate-limit cooldown; waiting out the shortest window before the walk"
+        );
+        telemetry::emit_wait(
+            cooldown_key.as_str(),
+            WaitClass::RateLimit,
+            ShapedBy::Cooldown,
+            wait,
+        );
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        ledger.budget_remaining_ms -= wait;
+    }
+
     /// Record an invalid but HTTP-successful provider response. The retry
     /// loops use this as an ordinary failure so that exhaustion advances to
     /// fallback instead of returning a successful blank turn.
@@ -2876,6 +2973,9 @@ impl ModelProvider for ReliableModelProvider {
         // Each iteration: attempt one (model_provider, model) call. On success, return
         // immediately. On non-retryable error, break to next model_provider. On
         // retryable error, sleep with exponential backoff and retry.
+        // Cycle 18: an all-cooled chain waits out its shortest window here
+        // (budget-bounded) instead of failing with zero attempts.
+        self.wait_out_all_provider_cooldowns(&mut failures).await;
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if !Self::provider_allowed_for_turn(entry) {
@@ -3271,6 +3371,9 @@ impl ModelProvider for ReliableModelProvider {
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
+        // Cycle 18: an all-cooled chain waits out its shortest window here
+        // (budget-bounded) instead of failing with zero attempts.
+        self.wait_out_all_provider_cooldowns(&mut failures).await;
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if !Self::provider_allowed_for_turn(entry) {
@@ -3803,6 +3906,9 @@ impl ModelProvider for ReliableModelProvider {
 
         let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
+        // Cycle 18: an all-cooled chain waits out its shortest window here
+        // (budget-bounded) instead of failing with zero attempts.
+        self.wait_out_all_provider_cooldowns(&mut failures).await;
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if !Self::provider_allowed_for_turn(entry) {
@@ -4253,6 +4359,9 @@ impl ModelProvider for ReliableModelProvider {
 
         let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
+        // Cycle 18: an all-cooled chain waits out its shortest window here
+        // (budget-bounded) instead of failing with zero attempts.
+        self.wait_out_all_provider_cooldowns(&mut failures).await;
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if !Self::provider_allowed_for_turn(entry) {
@@ -16049,6 +16158,115 @@ mod tests {
         assert!(
             message.contains("rate_limit_cooldown"),
             "the shared-key siblings must cooldown-skip as today: {message}"
+        );
+    }
+
+    /// Cycle 18 (the cooldown walk must wait, not fail): with EVERY eligible
+    /// entry inside one shared cooldown window, the walk used to skip every
+    /// candidate, consume zero attempts, and return a terminal aggregate
+    /// instantly. The wrapper must instead wait out the shortest remaining
+    /// window (bounded by the per-call rate-limit budget) and let the walk
+    /// reach the recovered provider.
+    #[tokio::test]
+    async fn all_cooled_chain_waits_out_the_shortest_window_and_succeeds() {
+        let (calls, script) = timed_rate_limit_script(Vec::new());
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "family.test",
+            vec![
+                (
+                    "family.test",
+                    "family.test",
+                    "model-a",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-b",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2000,
+        );
+        // Seed the shared cooldown window directly: 400 ms remaining, so the
+        // walk starts with every eligible entry still cooling (the prod wave
+        // shape — another session's 429s cooled the chain before this call).
+        let deadline = Instant::now() + Duration::from_millis(400);
+        provider
+            .rate_limit_cooldowns
+            .lock()
+            .expect("cooldowns mutex")
+            .insert("family.test".to_string(), deadline);
+
+        let response = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("the all-cooled wait must let the walk reach the recovered provider");
+        assert_eq!(response, "recovered");
+        assert!(
+            !timed_call_log(&calls).is_empty(),
+            "the walk must attempt a provider after waiting out the window"
+        );
+    }
+
+    /// Cycle 18 companion pin: when the remaining window EXCEEDS the per-call
+    /// budget, the wrapper takes the budget-bounded wait and then surfaces the
+    /// all-down aggregate — never the full window (no hang), never a skipped
+    /// wait (the budget-bounded wait is observable in the elapsed time).
+    #[tokio::test]
+    async fn all_cooled_chain_beyond_the_budget_fails_promptly_after_one_bounded_wait() {
+        let (calls, script) = timed_rate_limit_script(Vec::new());
+        let mock = Arc::new(timed_rate_limit_mock(&calls, &script));
+        let provider = ReliableModelProvider::new_pinned_for_test(
+            "family.test",
+            vec![
+                (
+                    "family.test",
+                    "family.test",
+                    "model-a",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+                (
+                    "family.test",
+                    "family.test",
+                    "model-b",
+                    Arc::clone(&mock) as Arc<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2000,
+        )
+        .with_provider_rate_limit_budget_ms(250);
+        // A 30 s remaining window against a 250 ms budget: the wait clamps to
+        // the budget, the walk below still finds every entry cooling, and the
+        // all-down aggregate surfaces.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        provider
+            .rate_limit_cooldowns
+            .lock()
+            .expect("cooldowns mutex")
+            .insert("family.test".to_string(), deadline);
+
+        let started = Instant::now();
+        let error = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("a window beyond the budget must still surface the all-down failure");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the budget-bounded wait must be taken before failing, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the failure must stay prompt — never wait out the full 30 s window, elapsed {elapsed:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("rate_limit_cooldown"),
+            "the aggregate must carry the cooldown-skip events: {message}"
         );
     }
 
