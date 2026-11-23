@@ -157,6 +157,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"wait_out_all_provider_cooldowns",
         "min_count": 5,
     },
+    "gateway-scope-hatch": {
+        "glob": "crates/zeroclaw-gateway/src/api.rs",
+        "pattern": r"RecallExcludes",
+        "min_count": 4,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
