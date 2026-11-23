@@ -27394,6 +27394,224 @@ mod tests {
         ctx
     }
 
+    /// A memory that RECORDS which recall-shaped entry point a handler chose.
+    /// The excludes decision lives in the backend — bare `recall` resolves
+    /// the store defaults, the explicit-set shapes carry the caller's
+    /// opinion — so the RPC plane's leak question is a question about the
+    /// handler's entry-point choice, and this fake makes that choice the
+    /// assertion instead of an inference from code shape.
+    struct RecordingMemory {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Default for RecordingMemory {
+        fn default() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RecordingMemory {
+        fn record(&self, name: &'static str) {
+            self.calls.lock().unwrap().push(name);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingMemory {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::None)
+        }
+        fn alias(&self) -> &str {
+            "recording"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::memory_traits::Memory for RecordingMemory {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall");
+            Ok(Vec::new())
+        }
+
+        async fn recall_filtered(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+            _excludes: &zeroclaw_api::memory_traits::RecallExcludes,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall_filtered");
+            Ok(Vec::new())
+        }
+
+        async fn recall_filtered_scoped(
+            &self,
+            _excludes: &zeroclaw_api::memory_traits::RecallExcludes,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall_filtered_scoped");
+            Ok(Vec::new())
+        }
+
+        async fn recall_namespaced(
+            &self,
+            _namespace: &str,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall_namespaced");
+            Ok(Vec::new())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall_for_agents");
+            Ok(Vec::new())
+        }
+
+        async fn recall_for_principal(
+            &self,
+            _scope: &zeroclaw_api::memory_traits::PrincipalScope,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.record("recall_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// The RPC `memory/search` shared plane must ride the backend's BARE
+    /// `recall` — the one entry point whose store default IS the operator's
+    /// three-axis excludes (v20 wiring). Any other entry point expresses a
+    /// caller opinion — an explicit set (`recall_filtered`), an agent scope
+    /// (`recall_for_agents`), a namespace shape (`recall_namespaced`) — and
+    /// could silently serve the rows the operator configured out. The
+    /// recording fake makes the entry-point choice the assertion; live prod
+    /// probes on 2026-11-23 (cycle 21) measured the same shape end to end.
+    #[tokio::test]
+    async fn memory_search_shared_plane_rides_bare_recall() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut ctx, _sessions, _memory) = memory_isolation_ctx(&tmp);
+        let recorder = Arc::new(RecordingMemory::default());
+        // Swap the fixture's store for the recorder: the fixture context is
+        // uniquely owned here (its memory handle's only other ref lives in
+        // `ctx.memory`), so the swap is in-place through the Arc.
+        if let Some(unwrapped) = Arc::get_mut(&mut ctx) {
+            unwrapped.memory =
+                Some(Arc::clone(&recorder) as Arc<dyn zeroclaw_api::memory_traits::Memory>);
+        } else {
+            panic!("the fixture context must be uniquely owned to swap its memory");
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        // An unbound dispatcher: the owner-less operator the legacy local
+        // path serves — the connection shape that resolves plane-absent to
+        // the SHARED plane (`memory_plane`'s `None` owner arm).
+        let dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+
+        dispatcher
+            .handle_memory_search(&json!({"query": "needle", "limit": 10}))
+            .await
+            .expect("the shared-plane search succeeds on the recording store");
+
+        assert_eq!(
+            recorder.calls(),
+            vec!["recall"],
+            "the shared-plane memory/search must ride bare recall (the store-default \
+             excludes shape); any other entry point expresses a caller opinion and \
+             could leak excluded rows"
+        );
+    }
+
     /// A principal entitled to one agent cannot name another agent's memory.
     #[tokio::test]
     async fn memory_agent_parameter_is_bound_by_the_agent_selector() {

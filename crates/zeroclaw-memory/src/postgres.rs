@@ -2941,6 +2941,163 @@ mod tests {
         drop(runtime);
     }
 
+    /// The store's DEFAULT excludes reach `recall_for_agents` — the shape the
+    /// whole per-agent wrapper chain rides (`AgentScopedMemory::recall` →
+    /// category-refill → `inner.recall_for_agents`), and therefore the shape
+    /// the RPC `memory/search` agent path and the gateway `/api/memory`
+    /// `agent=` path serve. The plain-recall pin above proves the injection
+    /// path; this proves the agent-scoped path, which had no live-tier pin
+    /// until the cycle-21 sweep (live-probed on prod 2026-11-23: both
+    /// surfaces returned zero excluded rows — this pin keeps it that way).
+    ///
+    /// Each axis is seeded as an agent-ATTRIBUTED row — the allowlist filter
+    /// `m.agent_id = ANY($n)` never passes unattributed rows, so the
+    /// exclusion question only arises for attributed ones — and the axes are
+    /// isolated: the category row carries an unprefixed key (category must
+    /// catch it, never key text), the prefix row carries a `core` category
+    /// (the prefix must catch it alone), the namespace row carries a `core`
+    /// category under `telemetry_sop`. The empty-allowlist leg (which
+    /// delegates to plain `recall`) and the explicit-empty hatch leg are
+    /// pinned on the same seed set.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_recall_for_agents_applies_the_stores_default_excludes() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "agexcl");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mem = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            // The operator's axes, as the backend factory installs them.
+            .with_default_excludes(RecallExcludes {
+                namespaces: vec!["telemetry".to_string()],
+                categories: vec!["sop".to_string()],
+                key_prefixes: vec!["sop_run_".to_string()],
+            })
+        });
+
+        runtime.block_on(async {
+            let agent = mem.ensure_agent_uuid("agexcl_agent").await.unwrap();
+            mem.store_with_agent(
+                "plain_needle",
+                "needle content alpha",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent),
+            )
+            .await
+            .unwrap();
+            // The CATEGORY axis alone: an unprefixed key under category `sop`.
+            mem.store_with_agent(
+                "sop_cat_needle",
+                "needle content bravo",
+                MemoryCategory::Custom("sop".to_string()),
+                None,
+                None,
+                None,
+                Some(&agent),
+            )
+            .await
+            .unwrap();
+            // The KEY-PREFIX axis alone: a `core` row whose key is prefixed.
+            mem.store_with_agent(
+                "sop_run_needle",
+                "needle content charlie",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent),
+            )
+            .await
+            .unwrap();
+            // The NAMESPACE-PREFIX axis alone: a `core` row in `telemetry_sop`.
+            mem.store_with_agent(
+                "ns_telemetry_needle",
+                "needle content delta",
+                MemoryCategory::Core,
+                None,
+                Some("telemetry_sop"),
+                None,
+                Some(&agent),
+            )
+            .await
+            .unwrap();
+
+            // The agent-scoped shape with an allowlist: the defaults must
+            // exclude all three axes server-side.
+            let scoped = mem
+                .recall_for_agents(&[&agent], "needle", 20, None, None, None)
+                .await
+                .unwrap();
+            let keys: Vec<&str> = scoped.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["plain_needle"],
+                "the attributed recall must inherit the operator's excludes: {keys:?}"
+            );
+
+            // The empty-allowlist leg delegates to plain `recall`: same
+            // resolution, one code path deeper.
+            let delegated = mem
+                .recall_for_agents(&[], "needle", 20, None, None, None)
+                .await
+                .unwrap();
+            let keys: Vec<&str> = delegated.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["plain_needle"],
+                "the empty-allowlist delegation must inherit the operator's excludes: {keys:?}"
+            );
+
+            // The hatch: an explicitly EMPTY set reaches the agent-scoped
+            // shape untouched — every seeded row is recallable again.
+            let hatch = mem
+                .recall_filtered_scoped(
+                    &RecallExcludes::default(),
+                    &[&agent],
+                    "needle",
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut keys: Vec<&str> = hatch.iter().map(|e| e.key.as_str()).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    "ns_telemetry_needle",
+                    "plain_needle",
+                    "sop_cat_needle",
+                    "sop_run_needle"
+                ],
+                "the explicit-empty hatch must open on the agent-scoped shape too: {keys:?}"
+            );
+        });
+        drop(runtime);
+    }
+
     #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
     fn postgres_list_limited_respects_the_limit_and_serves_the_updated_at_index() {
         let database_url = postgres_test_url();
