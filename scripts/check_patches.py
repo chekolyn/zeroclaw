@@ -167,6 +167,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"postgres_recall_for_agents_applies_the_stores_default_excludes",
         "min_count": 1,
     },
+    "memory-stats-route": {
+        "glob": "crates/zeroclaw-gateway/src/api.rs",
+        "pattern": r"handle_api_memory_stats",
+        "min_count": 3,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
