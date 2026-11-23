@@ -1320,6 +1320,43 @@ pub async fn handle_api_memory_delete(
     }
 }
 
+/// GET /api/memory/stats — the memory store's read-side telemetry surface.
+///
+/// The store-growth breaker's live-count path (cycle 22): `gov/cb_008`
+/// reads this route to report `{total_keys, retention_candidates}` from
+/// the LIVE store instead of the retired-sqlite fossil audit. The route is
+/// deliberately STORE-WIDE (`state.mem`, the install-wide backend) — an
+/// `agent` scope would resolve the per-agent wrapper chain, whose
+/// `AgentScopedMemory`/`BudgetedMemory` hops do not forward `stats` (the
+/// trait default would serve empty telemetry as if the store were empty),
+/// and the breaker's subject is the store as a whole. The numbers are
+/// plain `COUNT(*)` aggregates — no row contents cross this surface (the
+/// read-wall applies to entries; totals are not entries).
+pub async fn handle_api_memory_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.mem.stats().await {
+        Ok(stats) => Json(serde_json::json!({
+            "total_keys": stats.total_rows,
+            "by_category": stats.by_category.into_iter().collect::<std::collections::BTreeMap<String, u64>>(),
+            "superseded_rows": stats.superseded_rows,
+            "pinned_rows": stats.pinned_rows,
+            "bytes": stats.bytes,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Memory stats failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// Query parameters for `GET /api/cost`. When `agent` is set, the
 /// returned summary filters to records attributed to that alias.
 #[derive(Debug, Deserialize)]
@@ -2362,6 +2399,7 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+    use zeroclaw_api::memory_traits::MemoryStats;
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2385,6 +2423,9 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct MockMemory {
         entries: Vec<MemoryEntry>,
+        /// The stats surface the count route serves; `None` = the trait
+        /// default (empty telemetry). Only the stats-route test sets it.
+        stats: Option<MemoryStats>,
     }
 
     #[async_trait]
@@ -2436,6 +2477,10 @@ pub(crate) mod tests {
 
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(self.entries.len())
+        }
+
+        async fn stats(&self) -> anyhow::Result<MemoryStats> {
+            Ok(self.stats.clone().unwrap_or_default())
         }
 
         async fn health_check(&self) -> bool {
@@ -2607,7 +2652,10 @@ pub(crate) mod tests {
         entries: Vec<MemoryEntry>,
     ) -> AppState {
         AppState {
-            mem: Arc::new(MockMemory { entries }),
+            mem: Arc::new(MockMemory {
+                entries,
+                stats: None,
+            }),
             ..test_state(config)
         }
     }
@@ -2872,6 +2920,62 @@ pub(crate) mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    // ── The store-growth breaker's live-count surface (cycle 22) ─────
+    //
+    // `gov/cb_008` reports the LIVE store's totals through this route —
+    // the honest count replaces the retired-sqlite fossil audit (the
+    // breaker reported `not_applicable` on every non-sqlite backend since
+    // the guard landed, which silenced the only growth detector).
+
+    #[tokio::test]
+    async fn handle_api_memory_stats_reports_the_seeded_totals_and_composition() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let mut state = test_state(config);
+        state.mem = Arc::new(MockMemory {
+            entries: Vec::new(),
+            stats: Some(MemoryStats {
+                total_rows: 99,
+                by_category: vec![
+                    ("core".to_string(), 2),
+                    ("daily".to_string(), 6),
+                    ("sop".to_string(), 86),
+                ],
+                superseded_rows: 0,
+                pinned_rows: 0,
+                bytes: 0,
+            }),
+        });
+
+        let response = handle_api_memory_stats(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["total_keys"], 99);
+        assert_eq!(json["by_category"]["sop"], 86);
+        assert_eq!(json["by_category"]["core"], 2);
+        assert_eq!(json["by_category"]["daily"], 6);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_stats_requires_the_bearer_token() {
+        let state = AppState {
+            pairing: Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+            ..test_state(zeroclaw_config::schema::Config::default())
+        };
+
+        let response = handle_api_memory_stats(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── The scope=all audit hatch over HTTP ──────────────────────────

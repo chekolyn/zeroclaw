@@ -1,7 +1,7 @@
 //! PostgreSQL-backed memory implementation.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, RecallExcludes,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, RecallExcludes,
     normalize_recent_recall_query,
 };
 use anyhow::{Context, Result};
@@ -1610,6 +1610,25 @@ fn list_limited_cap(limit: usize) -> usize {
     limit.min(zeroclaw_api::memory_traits::MEMORY_LIST_MAX_LIMIT)
 }
 
+/// The store-growth breaker's composition query (cycle 22): one row per
+/// present `category` with its row count, deterministic order. COLUMN-SAFE
+/// BY CONTRACT: the boot DDL guarantees `category` (with the
+/// id/key/content/timestamps) — `pinned` and `superseded_by` exist on the
+/// prod store only as out-of-band columns, and referencing them here would
+/// fail every fresh postgres deployment the way the `namespace` fixture
+/// class does. The row-shape fields of [`MemoryStats`]
+/// (`superseded_rows`/`pinned_rows`/`bytes`) therefore stay 0 — honestly
+/// unmeasured, not zero-valued observations.
+fn stats_by_category_sql(qualified_table: &str) -> String {
+    format!(
+        "
+        SELECT category, COUNT(*) FROM {qualified_table}
+        GROUP BY category
+        ORDER BY category
+        "
+    )
+}
+
 /// Parse an RFC 3339 export bound into a `TIMESTAMPTZ` instant. The bound
 /// The filtered, windowed export projection behind
 /// [`PostgresMemory::list_limited_filtered`]: the shared listing
@@ -2469,6 +2488,41 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn stats(&self) -> Result<MemoryStats> {
+        let pool = self.pool.get().clone();
+        let qualified_table = self.qualified_table.clone();
+
+        run_on_os_thread(self.op_timeout, move || -> Result<MemoryStats> {
+            pool.with(|client| {
+                let total_stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
+                let total: i64 = client.query_one(&total_stmt, &[])?.get(0);
+                let rows = client.query(&stats_by_category_sql(&qualified_table), &[])?;
+                let mut by_category = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let count: i64 = row.get(1);
+                    by_category.push((
+                        row.get::<_, String>(0),
+                        u64::try_from(count)
+                            .context("PostgreSQL returned a negative category count")?,
+                    ));
+                }
+                Ok(MemoryStats {
+                    total_rows: u64::try_from(total)
+                        .context("PostgreSQL returned a negative memory count")?,
+                    by_category,
+                    // Honestly unmeasured (see `stats_by_category_sql`): the
+                    // boot DDL does not guarantee these columns and the
+                    // bytes aggregate would force a full TOAST read — the
+                    // payload-bomb class this program exists to close.
+                    superseded_rows: 0,
+                    pinned_rows: 0,
+                    bytes: 0,
+                })
+            })
+        })
+        .await
+    }
+
     async fn health_check(&self) -> bool {
         let pool = self.pool.get().clone();
         run_on_os_thread(self.op_timeout, move || {
@@ -2719,6 +2773,34 @@ mod tests {
         assert!(
             sql.contains("($2::TEXT IS NULL OR m.session_id = $2)"),
             "the session placeholder invariant matches list, got: {sql}"
+        );
+    }
+
+    /// The store-growth breaker's count surface (cycle 22): the stats
+    /// composition query is column-safe. The boot DDL guarantees only
+    /// `category` (+ the id/key/content/timestamps) — `pinned` and
+    /// `superseded_by` exist on the prod store as out-of-band columns and
+    /// would fail every fresh deployment the way the `namespace` fixture
+    /// class does. The grouping is the composition the breaker reports;
+    /// the total rides the existing COUNT(*) shape.
+    #[test]
+    fn stats_by_category_sql_is_column_safe_and_groups_by_category() {
+        let sql = stats_by_category_sql("mem.memories");
+        assert!(
+            sql.contains("SELECT category, COUNT(*) FROM mem.memories"),
+            "the composition query counts every row grouped by category, got: {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY category"),
+            "one row per category, got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY category"),
+            "deterministic order — the report is diffable across runs, got: {sql}"
+        );
+        assert!(
+            !sql.contains("pinned") && !sql.contains("superseded_by"),
+            "column-safe: referencing the prod-only out-of-band columns would fail every fresh postgres deployment, got: {sql}"
         );
     }
 
@@ -5105,6 +5187,84 @@ mod tests {
                     "{label}: a session-less recall must admit everything (session_id is a conversation-scope axis, never a visibility gate)"
                 );
             }
+        });
+    }
+
+    /// The store-growth breaker's live-count contract (cycle 22): `stats()`
+    /// reports the LIVE store's total and per-category composition — the
+    /// numbers the gateway count route serves to `gov/cb_008`, replacing the
+    /// retired-sqlite fossil audit. The postgres override was the trait
+    /// DEFAULT (empty stats) before this change — the route would have read
+    /// 0 forever.
+    ///
+    /// RED baseline: `PostgresMemory` implemented no `stats` override; the
+    /// call resolved the trait default and returned `MemoryStats::default()`
+    /// (total_rows 0, empty by_category) against a non-empty store.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_stats_reports_the_live_totals_and_category_composition() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "statsroute");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                // Production shape: the namespace/importance columns ride the
+                // pgvector column setup, so the fixture needs it enabled.
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let seeds: [(&str, MemoryCategory); 5] = [
+                ("stats:core:a", MemoryCategory::Core),
+                ("stats:core:b", MemoryCategory::Core),
+                ("stats:daily", MemoryCategory::Daily),
+                ("stats:sop:a", MemoryCategory::Custom("sop".into())),
+                ("stats:sop:b", MemoryCategory::Custom("sop".into())),
+            ];
+            for (key, category) in seeds {
+                memory.store(key, "stats probe row", category, None).await.unwrap();
+            }
+
+            let stats = memory
+                .stats()
+                .await
+                .unwrap_or_else(|e| panic!("the stats override must succeed: {e}"));
+            assert_eq!(
+                stats.total_rows, 5,
+                "the total is the LIVE row count, not the trait-default zero"
+            );
+            let composition: Vec<(String, u64)> = stats.by_category.clone();
+            assert!(
+                composition.contains(&("core".to_string(), 2)),
+                "the composition carries the per-category counts, got: {composition:?}"
+            );
+            assert!(
+                composition.contains(&("sop".to_string(), 2)),
+                "the sop class — the breaker's retention-relevant class — is countable, got: {composition:?}"
+            );
+            assert!(
+                composition.contains(&("daily".to_string(), 1)),
+                "got: {composition:?}"
+            );
+            assert_eq!(
+                composition.len(),
+                3,
+                "one row per present category, got: {composition:?}"
+            );
         });
     }
 
