@@ -650,6 +650,58 @@ impl PostgresMemory {
         self
     }
 
+    /// Backend-native retention prune (the native-hygiene patch): one
+    /// parameterized DELETE per armed arm from the closed-set plan
+    /// (`crate::hygiene::retention_prune_arms`), against the configured
+    /// table. Deliberately an INHERENT method called only at the backend's
+    /// construction site — not a `Memory` trait method — so no wrapper chain
+    /// (Scanned/Audited/AgentScoped/…) is ever asked to forward a maintenance
+    /// delete it has no business re-routing, and no wrapper's missing
+    /// forward can silently skip the prune (the trait-default compose trap).
+    ///
+    /// Runs on a dedicated OS thread (the `postgres-memory-init` precedent:
+    /// the synchronous client panics on a Tokio runtime thread, and the
+    /// construction site may be one). Each statement rides the pool's bounded
+    /// session (`statement_timeout = op_timeout`). No `pinned` predicate: the
+    /// boot DDL does not create the column and `row_to_entry` hardcodes
+    /// `pinned = false` — a predicate on it would be a lie (measured
+    /// 2026-11-23: zero non-zero `pinned` rows on the prod store).
+    pub fn prune_retention_arms(
+        &self,
+        arms: &[crate::hygiene::RetentionArm],
+    ) -> Result<Vec<(&'static str, u64)>> {
+        if arms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let arms = arms.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("postgres-memory-retention".to_string())
+            .spawn(move || {
+                let result = pool.with(|client| {
+                    arms.iter()
+                        .map(|arm| {
+                            let stmt = retention_prune_sql(&qualified_table, arm.use_created_at);
+                            let cutoff =
+                                Utc::now() - chrono::Duration::days(i64::from(arm.retention_days));
+                            let deleted = client.execute(&stmt, &[&arm.category, &cutoff])?;
+                            Ok((
+                                arm.category,
+                                u64::try_from(deleted)
+                                    .context("PostgreSQL returned a negative delete count")?,
+                            ))
+                        })
+                        .collect::<Result<Vec<(&'static str, u64)>>>()
+                });
+                let _ = tx.send(result);
+            })
+            .context("failed to spawn the postgres retention prune thread")?;
+        rx.recv()
+            .context("the postgres retention prune thread died without a result")?
+    }
+
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
@@ -1627,6 +1679,24 @@ fn stats_by_category_sql(qualified_table: &str) -> String {
         ORDER BY category
         "
     )
+}
+
+/// The backend-native retention DELETE (one per armed arm). Parameterized by
+/// contract: the category rides `$1` from the closed-set `&'static str` plan
+/// (no name is ever interpolated), the age cutoff rides `$2` as a real
+/// `TIMESTAMPTZ` instant. COLUMN-SAFE by the same law as
+/// [`stats_by_category_sql`]: only the boot-DDL-guaranteed `category` and
+/// `created_at`/`updated_at` are referenced — `pinned` is deliberately
+/// absent (the column is out-of-band on prod and hardcoded `false` in
+/// `row_to_entry`; a predicate on it would be a lie, and the operator's
+/// ratified-window decision owns the age-only semantics).
+fn retention_prune_sql(qualified_table: &str, use_created_at: bool) -> String {
+    let age_column = if use_created_at {
+        "created_at"
+    } else {
+        "updated_at"
+    };
+    format!("DELETE FROM {qualified_table} WHERE category = $1 AND {age_column} < $2")
 }
 
 /// Parse an RFC 3339 export bound into a `TIMESTAMPTZ` instant. The bound
@@ -2802,6 +2872,408 @@ mod tests {
             !sql.contains("pinned") && !sql.contains("superseded_by"),
             "column-safe: referencing the prod-only out-of-band columns would fail every fresh postgres deployment, got: {sql}"
         );
+    }
+
+    /// The retention-prune DELETE is parameterized and column-safe: the
+    /// category arrives as `$1` (a closed-set `&'static str` from
+    /// `hygiene::retention_prune_arms`, never interpolated), the age column
+    /// is one of the two boot-DDL-guaranteed timestamps, and `pinned` is
+    /// deliberately ABSENT from the postgres arm — the boot DDL does not
+    /// create the column (the namespace-fixture class) and `row_to_entry`
+    /// hardcodes `pinned = false`, so a predicate trusting it would be a
+    /// lie. Measured 2026-11-23: zero non-zero `pinned` rows exist on the
+    /// prod store; the operator's ratification of each window owns the
+    /// age-only semantics from there.
+    #[test]
+    fn retention_prune_sql_is_parameterized_and_column_safe() {
+        let sql = retention_prune_sql("mem.memories", false);
+        assert!(
+            sql.contains("DELETE FROM mem.memories WHERE category = $1 AND updated_at < $2"),
+            "the armed category and the age cutoff are bind parameters, got: {sql}"
+        );
+        assert!(
+            !sql.contains("pinned"),
+            "the postgres arm must not predicate on the out-of-band/hardcoded-false pinned column, got: {sql}"
+        );
+        let core_sql = retention_prune_sql("mem.memories", true);
+        assert!(
+            core_sql.contains("AND created_at < $2"),
+            "core prunes by first-write age, got: {core_sql}"
+        );
+        assert!(
+            !sql.contains("sop") && !core_sql.contains("sop"),
+            "no category name is interpolated into the SQL — the plan's closed set rides $1, got: {sql}"
+        );
+    }
+
+    /// The backend-native prune removes EXACTLY the aged rows of the armed
+    /// categories — and nothing else. An unarmed category (conversation
+    /// here), the `sop` audit-trail class, and fresh rows of armed
+    /// categories all survive; core keys on `created_at` (first write), the
+    /// other categories on `updated_at` (last write), the sqlite contract
+    /// carried over verbatim.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_retention_prune_removes_exactly_the_aged_rows_of_the_armed_categories() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "retprune");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mem = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+
+        runtime.block_on(async {
+            mem.store("daily_old", "stale daily", MemoryCategory::Daily, None)
+                .await
+                .unwrap();
+            mem.store("daily_fresh", "fresh daily", MemoryCategory::Daily, None)
+                .await
+                .unwrap();
+            mem.store(
+                "conv_old",
+                "old conversation",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+            mem.store("core_old", "obsolete core", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("core_updated", "touched core", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store(
+                "sop_audit_row",
+                "the audit trail must survive every retention window",
+                MemoryCategory::Custom("sop".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        // Age the fixture rows with the schema admin (outside the runtime —
+        // the nested-block_on panic class).
+        schema
+            .admin
+            .batch_execute(&format!(
+                "UPDATE {qualified_table} SET created_at = NOW() - interval '60 days',
+                        updated_at = NOW() - interval '60 days'
+                 WHERE key IN ('daily_old', 'core_old', 'conv_old');
+                 UPDATE {qualified_table} SET created_at = NOW() - interval '60 days'
+                 WHERE key = 'core_updated';",
+            ))
+            .expect("seeding the aged retention fixture must succeed");
+
+        let mut cfg = zeroclaw_config::schema::MemoryConfig::default();
+        cfg.daily_retention_days = 1;
+        cfg.core_retention_days = 1;
+        let arms = crate::hygiene::retention_prune_arms(&cfg);
+        let categories: Vec<&str> = arms.iter().map(|a| a.category).collect();
+        assert_eq!(
+            categories,
+            vec!["daily", "core"],
+            "only the armed categories may execute: {arms:?}"
+        );
+
+        let counts = mem
+            .prune_retention_arms(&arms)
+            .expect("the backend-native prune must execute");
+        assert_eq!(
+            counts,
+            vec![("daily", 1_u64), ("core", 2_u64)],
+            "per-arm deleted counts: 1 aged daily, core prunes BOTH the aged-first-write row and the recent-update row (created_at keying)"
+        );
+
+        runtime.block_on(async {
+            assert!(
+                mem.get("daily_old").await.unwrap().is_none(),
+                "the aged daily row must be pruned"
+            );
+            assert!(
+                mem.get("daily_fresh").await.unwrap().is_some(),
+                "the fresh daily row must survive"
+            );
+            assert!(
+                mem.get("conv_old").await.unwrap().is_some(),
+                "conversation is UNARMED here — its rows must survive"
+            );
+            assert!(
+                mem.get("core_old").await.unwrap().is_none(),
+                "the aged core row must be pruned"
+            );
+            assert!(
+                mem.get("core_updated").await.unwrap().is_none(),
+                "core prunes by created_at: a recent update does not rescue an old first write"
+            );
+            assert!(
+                mem.get("sop_audit_row").await.unwrap().is_some(),
+                "the sop audit-trail class must survive every retention arm"
+            );
+        });
+        drop(runtime);
+    }
+
+    /// The zero-knob posture at the backend: an empty arm plan constructs no
+    /// SQL and deletes nothing. This is the shipped posture — every
+    /// retention knob at 0 until the operator ratifies a window.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_retention_prune_with_zero_arms_touches_nothing() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "retzero");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mem = runtime.block_on(async {
+            PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+
+        runtime.block_on(async {
+            mem.store("daily_a", "kept daily", MemoryCategory::Daily, None)
+                .await
+                .unwrap();
+            mem.store(
+                "conv_b",
+                "kept conversation",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+            mem.store(
+                "sop_c",
+                "kept sop audit row",
+                MemoryCategory::Custom("sop".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        schema
+            .admin
+            .batch_execute(&format!(
+                "UPDATE {qualified_table} SET created_at = NOW() - interval '400 days',
+                        updated_at = NOW() - interval '400 days';",
+            ))
+            .expect("aging every fixture row must succeed");
+
+        let counts = mem
+            .prune_retention_arms(&[])
+            .expect("an empty arm plan is a no-op");
+        assert!(
+            counts.is_empty(),
+            "an empty plan reports zero arms: {counts:?}"
+        );
+
+        runtime.block_on(async {
+            for key in ["daily_a", "conv_b", "sop_c"] {
+                assert!(
+                    mem.get(key).await.unwrap().is_some(),
+                    "every row must survive the zero-knob posture ({key})"
+                );
+            }
+        });
+        // The sync admin COUNT runs OUTSIDE the runtime — the sync postgres
+        // client's connection pump block_ons internally and panics on a
+        // runtime thread (the nested-runtime panic class the pgvector fixture
+        // pins).
+        let remaining: i64 = schema
+            .admin
+            .query_one(&format!("SELECT COUNT(*) FROM {qualified_table}"), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining, 3, "the store must be byte-count identical");
+        drop(runtime);
+    }
+
+    /// The WIRING pins: `create_memory_with_storage_and_routes` runs the
+    /// backend-native prune on the configured postgres backend at
+    /// construction. With every knob at 0 (the shipped posture) the store is
+    /// untouched; with a window ratified the aged rows of that category go.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn create_path_runs_the_backend_retention_prune_zero_knob_and_ratified_window() {
+        let database_url = postgres_test_url();
+        let mut schema = TestSchema::create(&database_url, "retwire");
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        // Boot the store once so the fixture table exists, then seed via the
+        // admin connection.
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                PostgresMemory::new(
+                    "ci",
+                    &database_url,
+                    &schema.name,
+                    "memories",
+                    Some(5),
+                    None,
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            });
+            drop(runtime);
+        }
+        let qualified_table = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("memories")
+        );
+        let qualified_agents = format!(
+            "{}.{}",
+            quote_identifier(&schema.name),
+            quote_identifier("agents")
+        );
+        schema
+            .admin
+            .batch_execute(&format!(
+                "INSERT INTO {qualified_table} (id, key, content, category, created_at, updated_at, agent_id)
+                 VALUES ('seed_old', 'wire_daily_old', 'aged beyond any window', 'daily',
+                         NOW() - interval '60 days', NOW() - interval '60 days',
+                         (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                        ('seed_fresh', 'wire_daily_fresh', 'inside every window', 'daily', NOW(), NOW(),
+                         (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                        ('seed_sop', 'wire_sop_row', 'the audit trail', 'sop',
+                         NOW() - interval '400 days', NOW() - interval '400 days',
+                         (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1));",
+            ))
+            .expect("seeding the wiring fixture must succeed");
+
+        let storage_cfg = zeroclaw_config::schema::PostgresStorageConfig {
+            db_url: Some(database_url.clone()),
+            schema: schema.name.clone(),
+            table: "memories".to_string(),
+            vector_enabled: true,
+            ..zeroclaw_config::schema::PostgresStorageConfig::default()
+        };
+
+        // Leg 1 — the shipped zero-knob posture: nothing is deleted.
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut cfg = zeroclaw_config::schema::MemoryConfig::default();
+            cfg.backend = "postgres".to_string();
+            let _memory = runtime
+                .block_on(async {
+                    crate::create_memory_with_storage_and_routes(
+                        &cfg,
+                        &[],
+                        zeroclaw_config::schema::ActiveStorage::Postgres(&storage_cfg),
+                        workspace.path(),
+                        None,
+                        None,
+                    )
+                })
+                .expect("the create path must build the postgres backend");
+            drop(runtime);
+
+            let still_there: i64 = schema
+                .admin
+                .query_one(&format!("SELECT COUNT(*) FROM {qualified_table}"), &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                still_there, 3,
+                "the zero-knob create path must prune NOTHING (shipped posture)"
+            );
+        }
+
+        // Leg 2 — a ratified window: the aged daily row goes, everything
+        // else — including the 400-day-old sop audit row — stays.
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut cfg = zeroclaw_config::schema::MemoryConfig::default();
+            cfg.backend = "postgres".to_string();
+            cfg.daily_retention_days = 30;
+            let _memory = runtime
+                .block_on(async {
+                    crate::create_memory_with_storage_and_routes(
+                        &cfg,
+                        &[],
+                        zeroclaw_config::schema::ActiveStorage::Postgres(&storage_cfg),
+                        workspace.path(),
+                        None,
+                        None,
+                    )
+                })
+                .expect("the create path must build the postgres backend");
+            drop(runtime);
+
+            let keys: Vec<String> = schema
+                .admin
+                .query(
+                    &format!("SELECT key FROM {qualified_table} ORDER BY key"),
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["wire_daily_fresh", "wire_sop_row"],
+                "the ratified window deletes exactly the aged daily row; the sop audit row survives its 400-day age: {keys:?}"
+            );
+        }
     }
 
     /// The listing read pushes the bound into storage: `LIMIT $3` binds the
