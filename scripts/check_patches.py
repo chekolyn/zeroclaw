@@ -162,6 +162,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"RecallExcludes",
         "min_count": 4,
     },
+    "non-tool-recall-pins": {
+        "glob": "crates/zeroclaw-memory/src/postgres.rs",
+        "pattern": r"postgres_recall_for_agents_applies_the_stores_default_excludes",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
