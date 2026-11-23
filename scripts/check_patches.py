@@ -172,6 +172,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"handle_api_memory_stats",
         "min_count": 3,
     },
+    "memory-pg-retention": {
+        "glob": "crates/zeroclaw-memory/src/hygiene.rs",
+        "pattern": r"cannot_express_the_sop_class",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
