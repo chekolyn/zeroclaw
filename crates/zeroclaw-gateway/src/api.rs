@@ -93,6 +93,18 @@ pub struct MemoryQuery {
     /// etc.). Omit for the install-wide view.
     #[serde(default)]
     pub agent: Option<String>,
+    /// The recall scope. `all` (case-insensitive) opens the audit hatch:
+    /// the recall runs with an EXPLICITLY EMPTY exclusion set — the same
+    /// three-valued contract the memory tool's `scope="all"` carries
+    /// (`None` = the store's configured axes; `Some(empty)` = exclude
+    /// nothing; `Some(own)` = wins outright). The handler states the hatch
+    /// through `recall_filtered` with an empty set, NEVER a bare `recall`:
+    /// bare `recall` resolves `None` → the store's axes, which is exactly
+    /// how the tool's hatch broke under v20 (fork `f1128fb65a`). Absent or
+    /// any other value keeps the default behaviour (the store's configured
+    /// axes). Recency/list mode (no query) is unaffected.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1141,7 +1153,30 @@ pub async fn handle_api_memory_list(
         let query = params.query.as_deref().unwrap_or("");
         let since = params.since.as_deref();
         let until = params.until.as_deref();
-        match mem.recall(query, 50, None, since, until).await {
+        // `scope=all` is the audit hatch over HTTP: an EXPLICITLY EMPTY
+        // exclusion set through `recall_filtered` — never a bare `recall`.
+        // Bare `recall` resolves `None` → the store's configured axes (the
+        // v20 default), which is exactly how the tool's hatch broke before
+        // its own fix (f1128fb65a): saying "exclude nothing" out loud
+        // cannot be re-broken by whichever default a backend adopts next.
+        let recall_result = if params
+            .scope
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("all"))
+        {
+            mem.recall_filtered(
+                query,
+                50,
+                None,
+                since,
+                until,
+                &zeroclaw_api::memory_traits::RecallExcludes::default(),
+            )
+            .await
+        } else {
+            mem.recall(query, 50, None, since, until).await
+        };
+        match recall_result {
             Ok(entries) => {
                 let entries = match params.category.as_deref() {
                     Some(cat) => entries
@@ -2793,6 +2828,7 @@ pub(crate) mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                scope: None,
             }),
         )
         .await
@@ -2824,6 +2860,7 @@ pub(crate) mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                scope: None,
             }),
         )
         .await
@@ -2835,6 +2872,380 @@ pub(crate) mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    // ── The scope=all audit hatch over HTTP ──────────────────────────
+    //
+    // The memory tool's `scope="all"` audit hatch (restored in v22, fork
+    // f1128fb65a) had NO in-pod HTTP surface: this route carried no scope
+    // parameter, so the contract's fourth cell stayed SQL-plane. The route
+    // now carries the param with the tool's EXACT semantics: `scope=all`
+    // states its intent as an EXPLICITLY EMPTY exclusion set through
+    // `recall_filtered` — never a bare `recall`, which resolves `None` →
+    // the store's configured axes (the v20 hatch break).
+
+    /// The deployed store's three-valued exclude resolution, modeled as a
+    /// double: plain `recall` resolves `None` → the operator's configured
+    /// axes (the store default — the v20 design), so the excluded class is
+    /// withheld; `recall_filtered` with an EMPTY set is the explicit
+    /// "exclude nothing" (`Some(empty)` wins outright); a non-empty set
+    /// filters by it. This is `resolve_recall_excludes` + the exclude
+    /// predicate as the route's callers see them, and it records WHICH
+    /// entry point each call took so the call shape is pinned, not inferred.
+    struct HatchScopeMemory {
+        entries: Vec<MemoryEntry>,
+        /// The operator's category axis the deployed store defaults to.
+        default_excluded_categories: Vec<String>,
+        /// Which recall entry point each call took, in order.
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl HatchScopeMemory {
+        fn filtered_by(
+            &self,
+            excludes: &zeroclaw_api::memory_traits::RecallExcludes,
+        ) -> Vec<MemoryEntry> {
+            self.entries
+                .iter()
+                .filter(|e| {
+                    !excludes
+                        .categories
+                        .iter()
+                        .any(|c| c == &e.category.to_string())
+                })
+                .filter(|e| {
+                    !excludes
+                        .namespaces
+                        .iter()
+                        .any(|ns| e.namespace.starts_with(ns.as_str()))
+                })
+                .filter(|e| {
+                    !excludes
+                        .key_prefixes
+                        .iter()
+                        .any(|kp| e.key.starts_with(kp.as_str()))
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Memory for HatchScopeMemory {
+        fn name(&self) -> &str {
+            "hatch-scope"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.calls.lock().unwrap().push("recall");
+            // None → the operator's axes (the store default), applied.
+            Ok(
+                self.filtered_by(&zeroclaw_api::memory_traits::RecallExcludes {
+                    namespaces: Vec::new(),
+                    categories: self.default_excluded_categories.clone(),
+                    key_prefixes: Vec::new(),
+                }),
+            )
+        }
+
+        async fn recall_filtered(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+            excludes: &zeroclaw_api::memory_traits::RecallExcludes,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            let empty = excludes.categories.is_empty()
+                && excludes.namespaces.is_empty()
+                && excludes.key_prefixes.is_empty();
+            self.calls.lock().unwrap().push(if empty {
+                "recall_filtered:empty"
+            } else {
+                "recall_filtered:own"
+            });
+            Ok(self.filtered_by(excludes))
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for HatchScopeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "HatchScopeMemory"
+        }
+    }
+
+    fn hatch_entry(key: &str, category: MemoryCategory) -> MemoryEntry {
+        MemoryEntry {
+            principal_id: None,
+            id: format!("entry-{key}"),
+            key: key.to_string(),
+            content: format!("content of {key}"),
+            category,
+            timestamp: "2026-11-22T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn hatch_state(entries: Vec<MemoryEntry>) -> (Arc<HatchScopeMemory>, AppState) {
+        let mem = Arc::new(HatchScopeMemory {
+            entries,
+            default_excluded_categories: vec!["sop".to_string()],
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let state = AppState {
+            mem: mem.clone(),
+            ..test_state(config)
+        };
+        (mem, state)
+    }
+
+    #[tokio::test]
+    async fn api_memory_scope_all_opens_the_audit_hatch() {
+        let (mem, state) = hatch_state(vec![
+            hatch_entry("core_fact", MemoryCategory::Core),
+            hatch_entry("sop_run_1", MemoryCategory::Custom("sop".into())),
+        ]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("*".into()),
+                category: Some("sop".into()),
+                since: None,
+                until: None,
+                agent: None,
+                scope: Some("all".into()),
+            }),
+        )
+        .await
+        .into_response();
+        let json = response_json(response).await;
+        let keys: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries list")
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .collect();
+
+        assert!(
+            keys.contains(&"sop_run_1"),
+            "scope=all must reach the row the default scope excludes, got: {keys:?}"
+        );
+        // The call shape is the hatch itself: recall_filtered with an
+        // EXPLICITLY EMPTY set — the exact shape the tool's v22 fix pinned.
+        let calls = mem.calls();
+        assert_eq!(
+            calls,
+            vec!["recall_filtered:empty"],
+            "scope=all must state 'exclude nothing' through recall_filtered, never a bare recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_memory_default_scope_stays_the_configured_axes() {
+        let (mem, state) = hatch_state(vec![
+            hatch_entry("core_fact", MemoryCategory::Core),
+            hatch_entry("sop_run_1", MemoryCategory::Custom("sop".into())),
+        ]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("*".into()),
+                category: Some("sop".into()),
+                since: None,
+                until: None,
+                agent: None,
+                scope: None,
+            }),
+        )
+        .await
+        .into_response();
+        let json = response_json(response).await;
+        let keys: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries list")
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .collect();
+
+        assert!(
+            keys.is_empty(),
+            "the default scope must keep withholding the excluded class, got: {keys:?}"
+        );
+        // The default arm's call shape is UNCHANGED: a plain `recall` (the
+        // store resolves None → its configured axes). A fix that flipped the
+        // default to the hatch would fail here.
+        assert_eq!(
+            mem.calls(),
+            vec!["recall"],
+            "the default scope must ride plain recall exactly as before the scope param"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_memory_scope_all_is_case_insensitive() {
+        let (_mem, state) = hatch_state(vec![hatch_entry(
+            "sop_run_1",
+            MemoryCategory::Custom("sop".into()),
+        )]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("*".into()),
+                category: Some("sop".into()),
+                since: None,
+                until: None,
+                agent: None,
+                scope: Some("ALL".into()),
+            }),
+        )
+        .await
+        .into_response();
+        let json = response_json(response).await;
+        let keys: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries list")
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .collect();
+        assert!(
+            keys.contains(&"sop_run_1"),
+            "the hatch matches the tool's eq_ignore_ascii_case semantics, got: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_memory_unknown_scope_value_behaves_as_default() {
+        let (mem, state) = hatch_state(vec![hatch_entry(
+            "sop_run_1",
+            MemoryCategory::Custom("sop".into()),
+        )]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("*".into()),
+                category: Some("sop".into()),
+                since: None,
+                until: None,
+                agent: None,
+                scope: Some("nonsense".into()),
+            }),
+        )
+        .await
+        .into_response();
+        let json = response_json(response).await;
+        let keys: Vec<&str> = json["entries"]
+            .as_array()
+            .expect("entries list")
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "anything but scope=all is the default (the tool's unwrap_or semantics), got: {keys:?}"
+        );
+        assert_eq!(mem.calls(), vec!["recall"]);
     }
 
     #[tokio::test]
