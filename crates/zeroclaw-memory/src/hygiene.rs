@@ -42,6 +42,112 @@ struct HygieneState {
     last_report: HygieneReport,
 }
 
+/// One retention arm: a category, its age window in days, and which
+/// timestamp measures the age. Produced ONLY by [`retention_prune_arms`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionArm {
+    /// The storage-level category spelling. `&'static str` deliberately: the
+    /// closed set below is the only legal source, and a config-map-derived
+    /// `String` cannot be smuggled in without a visible redesign.
+    pub category: &'static str,
+    /// Delete rows strictly older than this many days. Zero-day arms are
+    /// never produced (the builder skips them).
+    pub retention_days: u32,
+    /// `core` prunes by first-write age (`created_at`); the other armed
+    /// categories by last-write age (`updated_at`) — the sqlite contract,
+    /// carried to every backend verbatim.
+    pub use_created_at: bool,
+}
+
+/// The closed retention-arm plan: the ONLY bridge between the retention
+/// config and any delete. Built exclusively from the three named config
+/// fields (plus the policy map's overrides for THOSE three names); the
+/// category set is a fixed trio of `&'static str` literals, so a
+/// `retention_days_by_category`-style map can never introduce an arm for
+/// `category=sop` — the SOP audit trail is recall-excluded evidence the
+/// fusion panel ruled to keep indefinitely, and it must never be silently
+/// deleted by a retention change. Pinned by
+/// `retention_prune_arms_is_the_closed_three_category_set` and
+/// `retention_prune_arms_cannot_express_the_sop_class`.
+pub fn retention_prune_arms(config: &MemoryConfig) -> Vec<RetentionArm> {
+    if !config.hygiene_enabled {
+        return Vec::new();
+    }
+    let enforcer = PolicyEnforcer::new(&config.policy);
+    let conversation_days = enforcer.retention_days_for_category(
+        &crate::traits::MemoryCategory::Conversation,
+        config.conversation_retention_days,
+    );
+    let daily_days = enforcer.retention_days_for_category(
+        &crate::traits::MemoryCategory::Daily,
+        config.daily_retention_days,
+    );
+    let core_days = enforcer.retention_days_for_category(
+        &crate::traits::MemoryCategory::Core,
+        config.core_retention_days,
+    );
+
+    let mut arms = Vec::new();
+    // Three named blocks, never an iteration: adding a category means
+    // editing THIS function (review-visible) and failing the closed-set pin.
+    if conversation_days > 0 {
+        arms.push(RetentionArm {
+            category: "conversation",
+            retention_days: conversation_days,
+            use_created_at: false,
+        });
+    }
+    if daily_days > 0 {
+        arms.push(RetentionArm {
+            category: "daily",
+            retention_days: daily_days,
+            use_created_at: false,
+        });
+    }
+    if core_days > 0 {
+        arms.push(RetentionArm {
+            category: "core",
+            retention_days: core_days,
+            use_created_at: true,
+        });
+    }
+    arms
+}
+
+/// Run the backend-native retention prune against the CONFIGURED postgres
+/// backend (the native-hygiene patch). The workspace hygiene pass below is
+/// SQLite/file-scoped by construction — `prune_category_rows` opens
+/// `<workspace>/memory/brain.db` and no-ops when absent, so on a postgres
+/// deployment every row arm was silently inert. This runs the SAME closed-set
+/// arm plan against the live backend, once per backend construction (boot).
+/// With every retention knob at 0 (the shipped posture) the plan is empty and
+/// no DELETE is built; each window is enabled only by an explicit config
+/// value. The 12-hour `run_if_due` cadence gate does NOT throttle this: the
+/// prune is idempotent and rides an indexed delete per armed category.
+#[cfg(feature = "memory-postgres")]
+pub fn prune_configured_postgres_backend(
+    config: &MemoryConfig,
+    backend: &crate::postgres::PostgresMemory,
+) -> Result<Vec<(&'static str, u64)>> {
+    let arms = retention_prune_arms(config);
+    if arms.is_empty() {
+        return Ok(Vec::new());
+    }
+    backend.prune_retention_arms(&arms)
+}
+
+fn prune_reported_rows(workspace_dir: &Path, arms: &[RetentionArm], category: &str) -> Result<u64> {
+    match arms.iter().find(|arm| arm.category == category) {
+        None => Ok(0),
+        Some(arm) => prune_category_rows(
+            workspace_dir,
+            arm.retention_days,
+            arm.category,
+            arm.use_created_at,
+        ),
+    }
+}
+
 /// Run memory/session hygiene if the cadence window has elapsed.
 /// This function is intentionally best-effort: callers should log and continue on failure.
 pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
@@ -53,20 +159,12 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Use policy engine for per-category retention overrides.
-    let enforcer = PolicyEnforcer::new(&config.policy);
-    let conversation_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Conversation,
-        config.conversation_retention_days,
-    );
-    let daily_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Daily,
-        config.daily_retention_days,
-    );
-    let core_retention = enforcer.retention_days_for_category(
-        &crate::traits::MemoryCategory::Core,
-        config.core_retention_days,
-    );
+    // The retention arms are the single home for the retention windows: the
+    // closed-set builder resolves the three named knobs (with their policy
+    // overrides) and BOTH consumers — the workspace SQLite prune here and
+    // the backend-native prune at backend construction — execute only what
+    // it emits.
+    let arms = retention_prune_arms(config);
 
     let mut report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
@@ -76,14 +174,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
-        pruned_conversation_rows: prune_category_rows(
-            workspace_dir,
-            conversation_retention,
-            "conversation",
-            false,
-        )?,
-        pruned_daily_rows: prune_category_rows(workspace_dir, daily_retention, "daily", false)?,
-        pruned_core_rows: prune_category_rows(workspace_dir, core_retention, "core", true)?,
+        pruned_conversation_rows: prune_reported_rows(workspace_dir, &arms, "conversation")?,
+        pruned_daily_rows: prune_reported_rows(workspace_dir, &arms, "daily")?,
+        pruned_core_rows: prune_reported_rows(workspace_dir, &arms, "core")?,
     };
     let budget_report = compact_budget_rows(workspace_dir, config)?;
     report.pruned_daily_rows += budget_report.daily_rows;
@@ -1113,5 +1206,104 @@ mod tests {
                 0o666
             );
         }
+    }
+
+    #[test]
+    fn retention_prune_arms_default_posture_is_zero_arms() {
+        let cfg = default_cfg();
+        assert!(
+            retention_prune_arms(&cfg).is_empty(),
+            "the shipped defaults must arm no retention window: {:?}",
+            retention_prune_arms(&cfg)
+        );
+    }
+
+    #[test]
+    fn retention_prune_arms_is_the_closed_three_category_set() {
+        let mut cfg = default_cfg();
+        cfg.conversation_retention_days = 7;
+        cfg.daily_retention_days = 14;
+        cfg.core_retention_days = 90;
+        // The exact hazard the panel ruled on: a `retention_days_by_category`
+        // map that names `sop` (or any custom category) must be structurally
+        // unreachable from the arm plan.
+        cfg.policy
+            .retention_days_by_category
+            .insert("sop".to_string(), 7);
+        cfg.policy
+            .retention_days_by_category
+            .insert("telemetry".to_string(), 3);
+
+        let arms = retention_prune_arms(&cfg);
+        let categories: Vec<&str> = arms.iter().map(|a| a.category).collect();
+        assert_eq!(
+            categories,
+            vec!["conversation", "daily", "core"],
+            "the arm plan is a closed trio; a fourth (or map-derived) arm fails here: {arms:?}"
+        );
+        assert_eq!(arms[0].retention_days, 7);
+        assert_eq!(arms[1].retention_days, 14);
+        assert_eq!(arms[2].retention_days, 90);
+        assert!(!arms[0].use_created_at);
+        assert!(!arms[1].use_created_at);
+        assert!(arms[2].use_created_at);
+    }
+
+    #[test]
+    fn retention_prune_arms_cannot_express_the_sop_class() {
+        // The standalone sop pin: an operator may set ANY map keys they like —
+        // no arm may ever carry a category outside the closed trio, and an
+        // sop-named key must not conjure an arm from a zero global knob.
+        let mut cfg = default_cfg();
+        cfg.policy
+            .retention_days_by_category
+            .insert("sop".to_string(), 30);
+        cfg.policy
+            .retention_days_by_category
+            .insert("sop_run".to_string(), 14);
+        assert!(
+            retention_prune_arms(&cfg).is_empty(),
+            "an sop-only policy map must arm nothing"
+        );
+    }
+
+    #[test]
+    fn retention_prune_arms_honors_the_policy_override_only_for_named_categories() {
+        let mut cfg = default_cfg();
+        cfg.conversation_retention_days = 30;
+        cfg.daily_retention_days = 9;
+        cfg.policy
+            .retention_days_by_category
+            .insert("daily".to_string(), 3);
+        cfg.policy
+            .retention_days_by_category
+            .insert("sop".to_string(), 7);
+
+        let arms = retention_prune_arms(&cfg);
+        let daily = arms
+            .iter()
+            .find(|a| a.category == "daily")
+            .expect("a set daily knob must arm the daily category");
+        assert_eq!(
+            daily.retention_days, 3,
+            "the policy override applies to the NAMED categories"
+        );
+        assert!(
+            arms.iter().all(|a| a.category != "sop"),
+            "the sop map key must never become an arm: {arms:?}"
+        );
+    }
+
+    #[test]
+    fn retention_prune_arms_disabled_hygiene_yields_no_arms() {
+        let mut cfg = default_cfg();
+        cfg.hygiene_enabled = false;
+        cfg.conversation_retention_days = 7;
+        cfg.daily_retention_days = 7;
+        cfg.core_retention_days = 7;
+        assert!(
+            retention_prune_arms(&cfg).is_empty(),
+            "hygiene_enabled = false must close every window"
+        );
     }
 }

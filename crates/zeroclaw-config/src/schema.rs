@@ -13044,13 +13044,13 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Delete conversation rows older than this many days from the memory store (the configured backend). Age is measured by `updated_at` (last write time). 0 = keep forever. Ships at 0: each window is enabled only by an explicit value after deciding what it may delete; the `sop` audit-trail category is never pruned by retention.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
-    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Delete daily memory rows older than this many days from the memory store (the configured backend). Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub daily_retention_days: u32,
-    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+    /// Delete core memory rows older than this many days from the memory store (the configured backend). Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at`, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
@@ -13663,7 +13663,11 @@ fn default_purge_after_days() -> u32 {
     30
 }
 fn default_conversation_retention_days() -> u32 {
-    30
+    // 0 = keep forever. The retention prune is backend-native; a non-zero
+    // default would arm a DELETE on every deployment that does not name the
+    // knob, so every window ships closed and is opened by an explicit
+    // operator-set value (the ratified-window posture).
+    0
 }
 fn default_zero_retention() -> u32 {
     0
@@ -34918,7 +34922,9 @@ default_temperature = 0.7
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
-        assert_eq!(m.conversation_retention_days, 30);
+        // 0 = keep forever: the retention prune is backend-native, so every
+        // window ships closed and opens only by explicit operator config.
+        assert_eq!(m.conversation_retention_days, 0);
         assert_eq!(m.search_mode, SearchMode::Hybrid);
     }
 
@@ -35567,7 +35573,9 @@ default_temperature = 0.7
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
-        assert_eq!(parsed.memory.conversation_retention_days, 30);
+        // 0 = keep forever: the retention prune is backend-native, so every
+        // window ships closed and opens only by explicit operator config.
+        assert_eq!(parsed.memory.conversation_retention_days, 0);
         // Temperature migrated onto the primary model_provider entry
         assert!(
             (parsed

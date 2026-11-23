@@ -813,21 +813,50 @@ fn build_memory_with_storage(
         };
         #[cfg(feature = "memory-postgres")]
         {
-            return wrap_scanned_and_audit(
-                build_postgres_memory(
-                    pg_cfg,
-                    config.category_namespaces.clone(),
-                    config.recall_soft_timeout_ms,
-                    RecallExcludes {
-                        namespaces: config.exclude_namespaces.clone(),
-                        categories: config.exclude_categories.clone(),
-                        key_prefixes: config.exclude_key_prefixes.clone(),
-                    },
-                )?,
-                &config.policy,
-                workspace_dir,
-                config.audit_enabled,
-            );
+            let pg = build_postgres_memory(
+                pg_cfg,
+                config.category_namespaces.clone(),
+                config.recall_soft_timeout_ms,
+                RecallExcludes {
+                    namespaces: config.exclude_namespaces.clone(),
+                    categories: config.exclude_categories.clone(),
+                    key_prefixes: config.exclude_key_prefixes.clone(),
+                },
+            )?;
+            // Backend-native retention prune (the native-hygiene patch): the
+            // workspace hygiene pass above is SQLite/file-scoped by
+            // construction, so its row arms were silently inert on a postgres
+            // deployment. The SAME closed-set arm plan now runs against the
+            // CONFIGURED backend, once per boot, at the one site that holds
+            // the concrete handle. With every retention knob at 0 (the
+            // shipped posture) the plan is empty and no DELETE is built.
+            match hygiene::prune_configured_postgres_backend(config, &pg) {
+                Ok(counts) if counts.is_empty() => {}
+                Ok(counts) => {
+                    let summary = counts
+                        .iter()
+                        .map(|(category, deleted)| format!("{category}={deleted}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"arms": counts})),
+                        &format!("memory retention prune (postgres): {summary}")
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "postgres retention prune skipped"
+                    );
+                }
+            }
+            return wrap_scanned_and_audit(pg, &config.policy, workspace_dir, config.audit_enabled);
         }
         #[cfg(not(feature = "memory-postgres"))]
         {
