@@ -11,6 +11,7 @@ pub mod executor;
 pub mod graph;
 pub mod metrics;
 pub mod procedural_memory;
+pub mod restore_drive;
 pub mod route;
 pub mod rundata;
 pub mod schema;

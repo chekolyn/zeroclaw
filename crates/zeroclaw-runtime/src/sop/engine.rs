@@ -137,6 +137,13 @@ pub struct SopEngine {
     /// still write different records, so the store refuses the second write
     /// as a conflict instead of accepting it as a retry of the first.
     writer_id: String,
+    /// Runs the restore-drive leg found unresumable because their SOP
+    /// definition was not loaded at boot (the init-container may still be
+    /// copying the SOP directory). The leg skips them instead of fast-failing,
+    /// and the FIRST maintenance tick that still cannot find the definition
+    /// fast-fails the run — one deferred look, no loops. Process-local like
+    /// `headless_drivers`; a new boot re-runs the leg's own discovery.
+    resume_deferred_absent: std::collections::HashSet<String>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -171,6 +178,9 @@ pub struct MaintenanceSummary {
     pub settled_orphaned_runs: usize,
     /// `Running` runs reaped by the stuck-run timeout.
     pub reaped_stuck_runs: usize,
+    /// Restored runs fast-failed this pass because their SOP definition was
+    /// still absent after the restore-drive leg's one deferred look.
+    pub fast_failed_unresumable: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -207,6 +217,120 @@ pub enum OrphanedRunSettlement {
     /// Execution authority rejected the next step before its target ran.
     /// Settled `Cancelled`: the driver stopped without executing that step.
     ExecutionRejected,
+}
+
+/// Why a restored run could not be resumed at its persisted step. The
+/// fail-closed guards of the boot-time restore-drive leg: a run is never
+/// resumed against a wrong step, and a crash-looping run is never resumed
+/// without bound. Returned typed by
+/// [`SopEngine::resume_action_for_run`] so the leg can classify each
+/// failure without string matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeActionError {
+    /// The run's SOP definition is not loaded in this engine. Stage 2 defers
+    /// the run once (the init-container may still be copying the SOP
+    /// directory); the first maintenance tick that still cannot find the
+    /// definition fast-fails the run.
+    SopAbsent { sop_name: String },
+    /// The loaded definition no longer matches the persisted run at the
+    /// count level: the persisted `current_step` has no matching step, or the
+    /// persisted `total_steps` disagrees with the loaded step count. The
+    /// run's in-flight work is discarded (fail-closed into discard, the
+    /// disclosed residual): resuming a semantically-drifted step is the worse
+    /// failure.
+    DefinitionChanged {
+        run_id: String,
+        current_step: u32,
+        persisted_total_steps: u32,
+        loaded_step_count: u32,
+    },
+    /// The progress-grounded resume budget is exhausted: at least
+    /// [`RESUME_BUDGET_LIMIT`] `resumed` audit events with no landed step
+    /// result (`step_results[].completed_at`) between them. The pod is
+    /// crash-looping without the run making progress; resuming again would
+    /// feed the zombie.
+    ResumeBudgetExhausted {
+        run_id: String,
+        resumes_since_growth: u32,
+        budget: u32,
+    },
+    /// The run is not a live `Running` run. Parked classes
+    /// (`WaitingApproval`/`PausedCheckpoint`) ride the parked replay, and
+    /// `Pending` rides maintenance's gated-pend retry — driving either from
+    /// the leg would double-drive it. `None` status: the run is not active in
+    /// this engine at all.
+    NotResumableHere {
+        run_id: String,
+        status: Option<SopRunStatus>,
+    },
+    /// A store read failed while validating resume-ability. Fail closed: a
+    /// budget that cannot be read is not a budget that passed.
+    Store { context: String },
+}
+
+impl std::fmt::Display for ResumeActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SopAbsent { sop_name } => {
+                write!(
+                    f,
+                    "SOP '{sop_name}' is not loaded; the run cannot be resumed"
+                )
+            }
+            Self::DefinitionChanged {
+                run_id,
+                current_step,
+                persisted_total_steps,
+                loaded_step_count,
+            } => write!(
+                f,
+                "SOP definition changed for run {run_id}: persisted step {current_step} of \
+                 {persisted_total_steps} does not match the loaded definition \
+                 ({loaded_step_count} steps)"
+            ),
+            Self::ResumeBudgetExhausted {
+                run_id,
+                resumes_since_growth,
+                budget,
+            } => write!(
+                f,
+                "resume budget exhausted for run {run_id}: {resumes_since_growth} resumes with \
+                 no landed step result between them (budget {budget})"
+            ),
+            Self::NotResumableHere { run_id, status } => match status {
+                Some(status) => {
+                    write!(
+                        f,
+                        "run {run_id} is {status}, not a Running run; not resumable here"
+                    )
+                }
+                None => write!(
+                    f,
+                    "run {run_id} is not active in this engine; not resumable here"
+                ),
+            },
+            Self::Store { context } => {
+                write!(
+                    f,
+                    "run store read failed while validating resume-ability: {context}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResumeActionError {}
+
+/// The resume budget: the maximum number of `resumed` audit events counted
+/// since a run's last step-result growth before the leg fast-fails the run
+/// instead of resuming it again. Three consecutive fruitless resumes mean the
+/// pod is crash-looping without the run progressing — the unkillable-zombie
+/// class the budget exists to bound.
+pub const RESUME_BUDGET_LIMIT: u32 = 3;
+
+/// Downcast an error to the typed [`ResumeActionError`], if it is one.
+pub fn resume_action_error(err: &anyhow::Error) -> Option<&ResumeActionError> {
+    err.downcast_ref::<ResumeActionError>()
 }
 
 /// Canonical pending terminal writes, retained across daemon generations.
@@ -498,6 +622,7 @@ impl SopEngine {
             decision_models: HashMap::new(),
             run_revisions: parking_lot::Mutex::new(HashMap::new()),
             writer_id: uuid::Uuid::new_v4().to_string(),
+            resume_deferred_absent: std::collections::HashSet::new(),
         }
     }
 
@@ -6224,6 +6349,12 @@ impl SopEngine {
         // Before the heartbeat, so a run that settles this pass releases its
         // claim instead of having it renewed once more.
         let settled_orphaned_runs = self.retry_pending_orphan_settlements();
+        // The restore-drive leg's one deferred look: a run whose SOP definition
+        // was absent at boot gets this pass to still be absent-or-not, then the
+        // unresumable class fast-fails here instead of wedging a lane. Runs
+        // BEFORE the stuck-run reaper, so a fast-failed run's lane frees this
+        // pass rather than after the reap window.
+        let fast_failed_unresumable = self.fast_fail_deferred_resume_absents();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let reaped_stuck_runs = self.reap_stuck_running_runs();
@@ -6237,8 +6368,66 @@ impl SopEngine {
             finalized_step_budget_failures,
             settled_orphaned_runs,
             reaped_stuck_runs,
+            fast_failed_unresumable,
             timeout_actions,
         }
+    }
+
+    /// The restore-drive leg's one deferred look for absent-SOP runs: a run
+    /// deferred at boot because its SOP definition was not loaded is
+    /// fast-failed here if the definition is STILL absent (the unresumable
+    /// class graduates to fast-reap at the first maintenance tick, freeing the
+    /// lane at boot+interval instead of at +`stuck_run_timeout_secs`). A
+    /// definition that IS loaded now clears the deferral and leaves the run
+    /// for the next boot's restore drive (no mid-flight reload happens in this
+    /// engine, so this arm is the honest no-loop exit, not a recovery path).
+    fn fast_fail_deferred_resume_absents(&mut self) -> usize {
+        let deferred = self.take_deferred_resume_absent();
+        let mut fast_failed = 0usize;
+        for run_id in deferred {
+            let Some(run) = self.active_runs.get(&run_id) else {
+                // Already gone (terminal elsewhere): the deferral clears with
+                // the run.
+                continue;
+            };
+            if run.status != SopRunStatus::Running {
+                // Parked/pending classes are not the restore-drive leg's to
+                // fail; leave them to their owners.
+                continue;
+            }
+            if self.sop_is_loaded(&run.sop_name) {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": run.sop_name,
+                        })),
+                    "SOP restore-drive: the deferred run's SOP definition is loaded; the \
+                     deferral clears and the run waits for the next boot's restore drive"
+                );
+                continue;
+            }
+            match self.finish_run(
+                &run_id,
+                SopRunStatus::Failed,
+                Some(super::restore_drive::FAST_REAP_SOP_ABSENT_REASON.to_string()),
+            ) {
+                Ok(_) => fast_failed += 1,
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": e.to_string(),
+                        })),
+                    "SOP restore-drive: failed to fast-fail a deferred absent-SOP run; it stays \
+                     active for the stuck-run reaper"
+                ),
+            }
+        }
+        fast_failed
     }
 
     /// Before a maintenance retry of a terminal write, adopt the stored record
@@ -6823,6 +7012,229 @@ impl SopEngine {
     /// Ordered event/ledger history for a run (from the durable store).
     pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
         self.store.list_events(run_id)
+    }
+
+    /// Whether a headless driver currently owns `run_id`'s lease. Read-only
+    /// pre-check for the restore-drive leg: a refused pre-check must mint no
+    /// `resumed` event and no clock bump, so the leg consults this BEFORE the
+    /// resume mark. Never hold a lease taken for a pre-check across the
+    /// spawn — a held lease makes the spawn's own lease acquisition fail and
+    /// the run is then settled as undriven.
+    pub(crate) fn is_headless_driver_leased(&self, run_id: &str) -> bool {
+        self.headless_drivers.contains(run_id)
+    }
+
+    /// Record that `run_id`'s SOP definition was not loaded at restore time,
+    /// deferring its unresumable fast-fail to the first maintenance tick (the
+    /// init-container may still be copying the SOP directory). One deferred
+    /// look: the tick's consumer either finds the definition loaded (the
+    /// deferral clears, the run is left for the next boot's restore drive) or
+    /// fast-fails the run.
+    pub(crate) fn defer_resume_absent(&mut self, run_id: &str) {
+        self.resume_deferred_absent.insert(run_id.to_string());
+    }
+
+    /// Drain the deferred-absent set (the maintenance tick's one deferred
+    /// look). Empty when the leg deferred nothing.
+    pub(crate) fn take_deferred_resume_absent(&mut self) -> Vec<String> {
+        self.resume_deferred_absent.drain().collect()
+    }
+
+    /// Whether the SOP definition `sop_name` is loaded in this engine.
+    pub(crate) fn sop_is_loaded(&self, sop_name: &str) -> bool {
+        self.sops.iter().any(|sop| sop.name == sop_name)
+    }
+
+    /// Build the action that resumes a restored run at its PERSISTED step.
+    ///
+    /// This is the boot-time restore-drive leg's construction half. The run
+    /// row is the complete context carrier: the SOP is resolved by name, the
+    /// step resolved BY NUMBER at the persisted `current_step` (never a
+    /// vector index — step numbers are not required to be contiguous), the
+    /// input-schema pre-check runs exactly as the live start path runs it, and
+    /// the built `ExecuteStep` carries the engine's execution witness. The
+    /// construction mirrors `clear_waiting_gate`'s post-gate shape — a
+    /// `Running` run is past its gate by construction, so the action is built
+    /// directly via `execute_step_action` rather than re-running
+    /// `resolve_step_action`, whose gated arm would re-park an already
+    /// approved step.
+    ///
+    /// Fail-closed guards (each a typed [`ResumeActionError`]): the SOP
+    /// definition must be loaded, the definition identity must still match the
+    /// persisted run (count-level), and the progress-grounded resume budget
+    /// (R5) must not be exhausted.
+    pub fn resume_action_for_run(
+        &mut self,
+        run_id: &str,
+    ) -> std::result::Result<SopRunAction, ResumeActionError> {
+        // The status guard: only a live `Running` run is this leg's input. A
+        // parked run rides the parked replay, a `Pending` run rides
+        // maintenance's gated-pend retry, and an unknown run is not active.
+        let run = match self.active_runs.get(run_id) {
+            Some(run) if run.status == SopRunStatus::Running => run.clone(),
+            Some(run) => {
+                return Err(ResumeActionError::NotResumableHere {
+                    run_id: run_id.to_string(),
+                    status: Some(run.status),
+                });
+            }
+            None => {
+                return Err(ResumeActionError::NotResumableHere {
+                    run_id: run_id.to_string(),
+                    status: None,
+                });
+            }
+        };
+        let sop = match self.sops.iter().find(|sop| sop.name == run.sop_name) {
+            Some(sop) => sop.clone(),
+            None => {
+                return Err(ResumeActionError::SopAbsent {
+                    sop_name: run.sop_name.clone(),
+                });
+            }
+        };
+        // Definition identity, count-level: the persisted current_step must
+        // name a step the loaded definition still has, and the persisted
+        // total_steps must agree with the loaded step count. A promotion that
+        // moved the SOP's steps between the roll's clone states fails closed
+        // here — the run's in-flight work is discarded rather than resumed
+        // against a semantically-drifted step (the disclosed residual).
+        let loaded_step_count = u32::try_from(sop.steps.len()).unwrap_or(u32::MAX);
+        if run.total_steps != loaded_step_count
+            || !sop.steps.iter().any(|step| step.number == run.current_step)
+        {
+            return Err(ResumeActionError::DefinitionChanged {
+                run_id: run_id.to_string(),
+                current_step: run.current_step,
+                persisted_total_steps: run.total_steps,
+                loaded_step_count,
+            });
+        }
+        // R5, the progress-grounded resume budget: `resumed` events counted
+        // since the run's last step-result growth (the ROW floor,
+        // `step_results[].completed_at`).
+        let resumes_since_growth =
+            self.resumes_since_last_step_growth(&run)
+                .map_err(|e| ResumeActionError::Store {
+                    context: format!("list_events for {run_id}: {e}"),
+                })?;
+        if resumes_since_growth >= RESUME_BUDGET_LIMIT {
+            return Err(ResumeActionError::ResumeBudgetExhausted {
+                run_id: run_id.to_string(),
+                resumes_since_growth,
+                budget: RESUME_BUDGET_LIMIT,
+            });
+        }
+        let step = self.resolve_sop_step(&sop, run.current_step).map_err(|_| {
+            ResumeActionError::DefinitionChanged {
+                run_id: run_id.to_string(),
+                current_step: run.current_step,
+                persisted_total_steps: run.total_steps,
+                loaded_step_count,
+            }
+        })?;
+        // The input-schema pre-check, exactly as the live start path runs it:
+        // a schema-invalid start fails the run at construction, not mid-drive.
+        // The input is sourced from the row — `step_input_value`, the same
+        // primitive the live path pipes.
+        let input = step_input_value(&run, step.number);
+        if let Some(failed) = self
+            .schema_input_failure_action(run_id, &step, &input)
+            .map_err(|e| ResumeActionError::Store {
+                context: format!("schema pre-check for {run_id}: {e}"),
+            })?
+        {
+            return Ok(failed);
+        }
+        let context = format_step_context(&sop, &run, &step, &self.config);
+        // A `Running` run is past its gate by construction (a gated step parks
+        // before it runs), so the action is built via `execute_step_action`
+        // directly — the `clear_waiting_gate` post-gate shape — never through
+        // `resolve_step_action`, whose gated arm would re-park an approved
+        // step. The witness is captured from this engine's execution
+        // capability, exactly as the live path captures it.
+        let decided_mode = run.decided_mode;
+        let sop = sop_for_run(&sop, decided_mode);
+        Ok(execute_step_action(
+            self.execution_capability.as_ref(),
+            &sop,
+            &step,
+            run_id.to_string(),
+            context,
+        ))
+    }
+
+    /// The run's `resumed` audit-event count since its last step-result
+    /// growth. The growth floor is the run ROW's `step_results[].completed_at`
+    /// (in-row, persisted, precise — `record_step_result` appends no event, so
+    /// there is no step-completion event stream to read). With no landed step
+    /// result at all, every `resumed` event counts. A `resumed` event whose
+    /// own timestamp cannot be parsed is not countable (logged, skipped).
+    fn resumes_since_last_step_growth(&self, run: &SopRun) -> Result<u32, StoreError> {
+        let floor = run
+            .step_results
+            .iter()
+            .filter_map(|result| result.completed_at.as_deref())
+            .filter_map(parse_iso8601_secs)
+            .max();
+        let events = self.store.list_events(&run.run_id)?;
+        let count = events
+            .iter()
+            .filter(|event| event.kind == "resumed")
+            .filter(|event| match (parse_iso8601_secs(&event.ts), floor) {
+                // Strictly after the growth: "since" the last step result.
+                (Some(ts), Some(floor)) => ts > floor,
+                // No growth yet: every resume since the run started counts.
+                (Some(_), None) => true,
+                // An unparseable event timestamp is not countable evidence.
+                (None, _) => false,
+            })
+            .count();
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Mark a run as resumed: bump its progress clock (`last_progress_at` to
+    /// now, so the stuck-run reaper's idle window restarts at the resume) and
+    /// append the `resumed` audit event (`actor="boot-restore"`,
+    /// `reason="pod-restart"`) as ONE atomic store outcome. The event is built
+    /// as a `SopEventRecord` directly — `record_transition_event` hard-codes
+    /// `actor: None` and cannot carry the boot-restore identity.
+    ///
+    /// The write is revision-guarded like every run write: the mark's record
+    /// carries a BUMPED revision (one past what this engine last read or
+    /// wrote), so a same-revision JSON-differing write from a second writer is
+    /// refused as a `RevisionConflict`, and a stale copy is refused as
+    /// `StaleRevision`. A refused mark persists nothing — the caller must not
+    /// spawn a driver for a run whose resume was never marked.
+    pub fn mark_resumed_with_event(&mut self, run_id: &str) -> Result<()> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "resumed".to_string(),
+            actor: Some("boot-restore".to_string()),
+            reason: Some("pod-restart".to_string()),
+            payload: ::serde_json::json!({
+                "sop_name": run.sop_name,
+                "current_step": run.current_step,
+                "total_steps": run.total_steps,
+                "trigger": "boot-restore",
+            }),
+        };
+        // ONE atomic store outcome: the progress-clock bump (`persisted_run`
+        // re-stamps `last_progress_at` to now at a BUMPED revision — a
+        // JSON-differing write at the same revision cannot land) and the audit
+        // row. The event is built as a `SopEventRecord` directly:
+        // `record_transition_event` hard-codes `actor: None` and cannot carry
+        // the boot-restore identity.
+        self.persist_active_with_gate_event(run_id, &event)?;
+        self.metrics.record_resume(&run.sop_name);
+        Ok(())
     }
 
     /// EPIC G (broker quorum): record an approver's vote on a still-waiting gate as
@@ -20195,5 +20607,628 @@ type = "manual"
         assert_eq!(finished[0].run_id, "r-done");
         assert_eq!(finished[0].status, SopRunStatus::Completed);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── The restore-drive resume construction (C6) ──────────────────
+
+    /// A three-step Auto SOP — the resume fixtures' shape.
+    fn three_step_sop(name: &str) -> Sop {
+        let mut sop = test_sop(name, SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps.push(SopStep {
+            number: 3,
+            title: "Step three".into(),
+            body: "Do step three".into(),
+            ..SopStep::default()
+        });
+        sop
+    }
+
+    /// An engine with a real execution capability, the way managed startup
+    /// builds engines: the resumed action's witness is minted from it.
+    fn capable_engine(store: Arc<dyn SopRunStore>, sops: Vec<Sop>) -> SopEngine {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = crate::live_config_authority::LiveConfigAuthority::new(config);
+        engine_with_sops(sops)
+            .with_store(store)
+            .with_execution_capability(authority.execution_capability())
+    }
+
+    fn resumed_event_record(run_id: &str, ts: &str) -> SopEventRecord {
+        SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: ts.to_string(),
+            kind: "resumed".to_string(),
+            actor: Some("boot-restore".to_string()),
+            reason: Some("pod-restart".to_string()),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn step_one_completed(output: &str, completed_at: &str) -> SopStepResult {
+        SopStepResult {
+            step_number: 1,
+            status: SopStepStatus::Completed,
+            output: output.into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some(completed_at.into()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// The restored run resumes at its PERSISTED step: the action is an
+    /// `ExecuteStep` for step 2, the context carries step 1's output (the
+    /// context-handoff pin), and the action carries the execution witness —
+    /// production rejects a witness-less action into `ExecutionRejected`, so
+    /// a default-engine test would pass while the capability path fails.
+    #[test]
+    fn resume_action_for_run_builds_a_witnessed_execute_step_at_the_persisted_step() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop = three_step_sop("resumable");
+        let mut engine_a = capable_engine(store.clone(), vec![sop.clone()]);
+        let action = engine_a.start_run("resumable", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a
+            .advance_step(
+                &run_id,
+                step_one_completed("step-one-output-marker", &now_iso8601()),
+            )
+            .unwrap();
+
+        let mut engine_b = capable_engine(store.clone(), vec![sop]);
+        engine_b.restore_runs();
+        let action = engine_b.resume_action_for_run(&run_id).unwrap();
+        match action {
+            SopRunAction::ExecuteStep {
+                step,
+                context,
+                execution_witness,
+                ..
+            } => {
+                assert_eq!(step.number, 2, "the resume targets the persisted step");
+                assert!(
+                    context.contains("step-one-output-marker"),
+                    "the context hands step 1's output to the resumed step:\n{context}"
+                );
+                assert!(
+                    execution_witness.is_some(),
+                    "the resumed action carries the execution witness"
+                );
+            }
+            other => panic!("expected a witnessed ExecuteStep at step 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_action_for_run_refuses_an_absent_sop() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine_a = capable_engine(store.clone(), vec![three_step_sop("gone")]);
+        let action = engine_a.start_run("gone", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let mut engine_b = capable_engine(store.clone(), vec![three_step_sop("other")]);
+        engine_b.restore_runs();
+        let err = engine_b.resume_action_for_run(&run_id).unwrap_err();
+        assert_eq!(
+            err,
+            ResumeActionError::SopAbsent {
+                sop_name: "gone".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resume_action_for_run_refuses_a_changed_definition() {
+        let store = Arc::new(InMemoryRunStore::new());
+        // Arm 1: the SOP was promoted with a shorter step list.
+        let mut engine_a = capable_engine(store.clone(), vec![three_step_sop("drifted")]);
+        let action = engine_a.start_run("drifted", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a
+            .advance_step(&run_id, step_one_completed("one", &now_iso8601()))
+            .unwrap();
+
+        let mut engine_b = capable_engine(
+            store.clone(),
+            vec![test_sop(
+                "drifted",
+                SopExecutionMode::Auto,
+                SopPriority::Normal,
+            )],
+        );
+        engine_b.restore_runs();
+        let err = engine_b.resume_action_for_run(&run_id).unwrap_err();
+        assert_eq!(
+            err,
+            ResumeActionError::DefinitionChanged {
+                run_id: run_id.clone(),
+                current_step: 2,
+                persisted_total_steps: 3,
+                loaded_step_count: 2,
+            },
+            "a step-count drift is refuse-closed"
+        );
+
+        // Arm 2: the persisted step no longer exists in the loaded definition
+        // (a renumbered promotion leaves the persisted number out of bounds).
+        let mut out_of_bounds = engine_b.active_runs()[&run_id].clone();
+        out_of_bounds.current_step = 9;
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        let mut persisted =
+            PersistedRun::new(out_of_bounds, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = stored.revision + 1;
+        store.save_run(&persisted).unwrap();
+        let mut engine_c = capable_engine(store.clone(), vec![three_step_sop("drifted")]);
+        engine_c.restore_runs();
+        let err = engine_c.resume_action_for_run(&run_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ResumeActionError::DefinitionChanged {
+                    current_step: 9,
+                    ..
+                }
+            ),
+            "an out-of-bounds persisted step is refuse-closed, got {err}"
+        );
+    }
+
+    #[test]
+    fn resume_action_for_run_refuses_parked_and_pending_runs() {
+        let store = Arc::new(InMemoryRunStore::new());
+        // A supervised SOP parks at step 1: WaitingApproval is the parked
+        // replay's class, never the leg's input.
+        let mut gated = three_step_sop("gated");
+        gated.execution_mode = SopExecutionMode::Supervised;
+        let mut engine_a = capable_engine(store.clone(), vec![gated.clone()]);
+        let parked = engine_a.start_run("gated", manual_event()).unwrap();
+        let run_id = match &parked {
+            SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
+            other => panic!("a supervised run parks for approval, got {other:?}"),
+        };
+        let err = engine_a.resume_action_for_run(&run_id).unwrap_err();
+        assert_eq!(
+            err,
+            ResumeActionError::NotResumableHere {
+                run_id: run_id.clone(),
+                status: Some(SopRunStatus::WaitingApproval),
+            }
+        );
+
+        // PausedCheckpoint and Pending are equally not the leg's input.
+        let live = engine_a.get_run(&run_id).unwrap().clone();
+        for (suffix, status) in [
+            ("paused", SopRunStatus::PausedCheckpoint),
+            ("pending", SopRunStatus::Pending),
+        ] {
+            let mut row = live.clone();
+            row.run_id = format!("{run_id}-{suffix}");
+            row.status = status;
+            rewrite_row_for_test(store.as_ref(), row);
+        }
+        let mut engine_b = capable_engine(store.clone(), vec![gated]);
+        engine_b.restore_runs();
+        for suffix in ["paused", "pending"] {
+            let err = engine_b
+                .resume_action_for_run(&format!("{run_id}-{suffix}"))
+                .unwrap_err();
+            assert!(
+                matches!(err, ResumeActionError::NotResumableHere { .. }),
+                "a {suffix} run is not resumable here, got {err}"
+            );
+        }
+    }
+
+    fn rewrite_row_for_test(store: &dyn SopRunStore, run: SopRun) {
+        let revision = store
+            .load_run(&run.run_id)
+            .ok()
+            .flatten()
+            .map(|stored| stored.revision + 1)
+            .unwrap_or(0);
+        let mut persisted = PersistedRun::new(run, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = revision;
+        store.save_run(&persisted).unwrap();
+    }
+
+    /// The resume budget's counting basis is the ROW floor: three `resumed`
+    /// events with no `step_results[].completed_at` after them exhaust the
+    /// budget, while the same three all-time resumes with a landed step result
+    /// after the last of them leave the run resumable — a run that keeps
+    /// landing step results across restarts must not spend a budget it keeps
+    /// refilling.
+    #[test]
+    fn resume_budget_counts_resumed_events_since_the_row_growth_floor() {
+        // Exhausted: the last growth predates every resume event.
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine_a = capable_engine(store.clone(), vec![three_step_sop("budgeted")]);
+        let action = engine_a.start_run("budgeted", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a
+            .advance_step(&run_id, step_one_completed("one", "2026-01-01T00:00:01Z"))
+            .unwrap();
+        drop(engine_a);
+        for i in 1..=RESUME_BUDGET_LIMIT {
+            store
+                .append_event(&resumed_event_record(
+                    &run_id,
+                    &format!("2026-01-02T00:00:{i:02}Z"),
+                ))
+                .unwrap();
+        }
+        let mut engine_b = capable_engine(store.clone(), vec![three_step_sop("budgeted")]);
+        engine_b.restore_runs();
+        let err = engine_b.resume_action_for_run(&run_id).unwrap_err();
+        assert_eq!(
+            err,
+            ResumeActionError::ResumeBudgetExhausted {
+                run_id: run_id.clone(),
+                resumes_since_growth: 3,
+                budget: RESUME_BUDGET_LIMIT,
+            }
+        );
+
+        // Still resumable: a step result landed AFTER the third resume, so
+        // the progress-grounded count resets — all-time counting would
+        // fast-fail this healthy run.
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine_a = capable_engine(store.clone(), vec![three_step_sop("progressing")]);
+        let action = engine_a.start_run("progressing", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a
+            .advance_step(&run_id, step_one_completed("one", "2026-01-03T00:00:00Z"))
+            .unwrap();
+        drop(engine_a);
+        for i in 1..=RESUME_BUDGET_LIMIT {
+            store
+                .append_event(&resumed_event_record(
+                    &run_id,
+                    &format!("2026-01-02T00:00:{i:02}Z"),
+                ))
+                .unwrap();
+        }
+        let mut engine_b = capable_engine(store.clone(), vec![three_step_sop("progressing")]);
+        engine_b.restore_runs();
+        assert!(
+            engine_b.resume_action_for_run(&run_id).is_ok(),
+            "a run that landed a step result after its last resume stays resumable"
+        );
+    }
+
+    /// A schema-invalid resume fails the run AT CONSTRUCTION, exactly as the
+    /// live start path does — never mid-drive. The invalidity arises between
+    /// the dispatch and the resume: the SOP was promoted with an input schema
+    /// on the current step (a same-count edit the count-level identity check
+    /// cannot see), so the row-sourced piped input no longer validates.
+    #[test]
+    fn resume_action_for_run_fails_a_schema_invalid_start_at_construction() {
+        let store = Arc::new(InMemoryRunStore::new());
+        // Engine A dispatches step 2 against the schema-less definition.
+        let mut engine_a = capable_engine(store.clone(), vec![three_step_sop("schema-gated")]);
+        let action = engine_a.start_run("schema-gated", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a
+            .advance_step(
+                &run_id,
+                step_one_completed("prose, not an object", &now_iso8601()),
+            )
+            .unwrap();
+        drop(engine_a);
+
+        // The promotion added an input schema to step 2; the step count is
+        // unchanged, so the definition-identity check passes and the
+        // input-schema pre-check is the guard that fires.
+        let mut promoted = three_step_sop("schema-gated");
+        promoted.steps[1].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine_b = capable_engine(store.clone(), vec![promoted]);
+        engine_b.restore_runs();
+        let action = engine_b.resume_action_for_run(&run_id).unwrap();
+        assert!(
+            matches!(action, SopRunAction::Failed { .. }),
+            "the schema-invalid resume fails at construction, got {action:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Failed);
+        assert!(
+            stored
+                .run
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("schema")),
+            "the failure names the schema validation: {:?}",
+            stored.run.failure_reason
+        );
+    }
+
+    // ── The resume mark (C6 Task 2.2) ────────────────────────────────
+
+    /// The mark restarts the reaper's progress clock: a restored run marked at
+    /// boot is NOT reaped within the stuck-run timeout of the mark, while the
+    /// same run unmarked IS (the pre-C6 behavior pin).
+    #[test]
+    fn mark_resumed_with_event_restarts_the_reaper_clock() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut config = SopConfig::default();
+        config.stuck_run_timeout_secs = 60;
+        let sop_a = three_step_sop("marked");
+        let sop_b = three_step_sop("unmarked");
+        let mut seed = engine_with_config_sops(config.clone(), vec![sop_a.clone(), sop_b.clone()])
+            .with_store(store.clone());
+        let marked = seed.start_run("marked", manual_event()).unwrap();
+        let unmarked = seed.start_run("unmarked", manual_event()).unwrap();
+        let marked_id = extract_run_id(&marked).to_string();
+        let unmarked_id = extract_run_id(&unmarked).to_string();
+        drop(seed);
+
+        // The crash left both rows with an ancient progress clock.
+        for run_id in [&marked_id, &unmarked_id] {
+            let stored = store.load_run(run_id).unwrap().unwrap();
+            let mut persisted = PersistedRun::new(
+                stored.run,
+                "2020-01-01T00:00:00Z".to_string(),
+                SopTriggerSource::Manual,
+            );
+            persisted.revision = stored.revision + 1;
+            store.save_run(&persisted).unwrap();
+        }
+
+        let mut engine =
+            engine_with_config_sops(config, vec![sop_a, sop_b]).with_store(store.clone());
+        engine.restore_runs();
+        engine.mark_resumed_with_event(&marked_id).unwrap();
+        let summary = engine.run_maintenance_tick();
+
+        let marked_row = store.load_run(&marked_id).unwrap().unwrap();
+        assert_eq!(
+            marked_row.run.status,
+            SopRunStatus::Running,
+            "the marked run is not reaped: its progress clock restarted"
+        );
+        let unmarked_row = store.load_run(&unmarked_id).unwrap().unwrap();
+        assert_eq!(
+            unmarked_row.run.status,
+            SopRunStatus::Failed,
+            "the unmarked run is reaped exactly as pre-C6"
+        );
+        assert_eq!(
+            unmarked_row.run.failure_reason.as_deref(),
+            Some("stuck-run timeout")
+        );
+        assert_eq!(summary.reaped_stuck_runs, 1);
+    }
+
+    /// A store wrapper whose `save_run_with_event` always fails: the mark
+    /// persists NOTHING — neither the clock bump nor the audit row (one
+    /// atomic store outcome, no partial state).
+    struct FailMarkStore {
+        inner: InMemoryRunStore,
+    }
+    impl SopRunStore for FailMarkStore {
+        fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.save_run(r)
+        }
+        fn save_run_with_event(
+            &self,
+            _r: &PersistedRun,
+            _e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend(
+                "injected save_run_with_event failure".into(),
+            ))
+        }
+        fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
+        }
+        fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_active_runs()
+        }
+        fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+        fn load_run(&self, id: &str) -> Result<Option<PersistedRun>, StoreError> {
+            self.inner.load_run(id)
+        }
+        fn last_terminal_completed_at(&self, s: &str) -> Result<Option<String>, StoreError> {
+            self.inner.last_terminal_completed_at(s)
+        }
+        fn try_claim_run(
+            &self,
+            id: &str,
+            s: &str,
+            p: usize,
+            g: usize,
+        ) -> Result<Option<ClaimToken>, StoreError> {
+            self.inner.try_claim_run(id, s, p, g)
+        }
+        fn renew_claim_for_restore(&self, id: &str, s: &str) -> Result<ClaimToken, StoreError> {
+            self.inner.renew_claim_for_restore(id, s)
+        }
+        fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(s)
+        }
+        fn heartbeat_claim(&self, t: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.heartbeat_claim(t)
+        }
+        fn release_claim(&self, t: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.release_claim(t)
+        }
+        fn expired_claims(&self, n: &str) -> Result<Vec<ClaimToken>, StoreError> {
+            self.inner.expired_claims(n)
+        }
+        fn append_event(&self, e: &SopEventRecord) -> Result<u64, StoreError> {
+            self.inner.append_event(e)
+        }
+        fn list_events(&self, id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+            self.inner.list_events(id)
+        }
+        fn save_proposal(&self, p: &ProposalRecord) -> Result<(), StoreError> {
+            self.inner.save_proposal(p)
+        }
+        fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+            self.inner.load_proposal(id)
+        }
+        fn list_proposals(
+            &self,
+            status: Option<ProposalStatus>,
+        ) -> Result<Vec<ProposalRecord>, StoreError> {
+            self.inner.list_proposals(status)
+        }
+        fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+            self.inner.prune(policy)
+        }
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+        fn backend(&self) -> &'static str {
+            "fail-mark-test"
+        }
+    }
+
+    #[test]
+    fn mark_resumed_with_event_is_one_atomic_store_outcome() {
+        // Failure arm: a failed mark writes neither the clock nor the event.
+        let store = Arc::new(FailMarkStore {
+            inner: InMemoryRunStore::new(),
+        });
+        let mut engine = capable_engine(store.clone(), vec![three_step_sop("atomic")]);
+        let action = engine.start_run("atomic", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let before = store.load_run(&run_id).unwrap().unwrap();
+        assert!(engine.mark_resumed_with_event(&run_id).is_err());
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision, "no revision moved");
+        assert_eq!(
+            after.last_progress_at, before.last_progress_at,
+            "the clock did not move on a failed mark"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "resumed"),
+            "no resumed row landed on a failed mark"
+        );
+
+        // Success arm: one write lands both, at a BUMPED revision, with the
+        // boot-restore event carrying its actor and reason.
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut engine = capable_engine(store.clone(), vec![three_step_sop("atomic-ok")]);
+        let action = engine.start_run("atomic-ok", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let before = store.load_run(&run_id).unwrap().unwrap();
+        engine.mark_resumed_with_event(&run_id).unwrap();
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(
+            after.revision,
+            before.revision + 1,
+            "the mark carries a BUMPED revision"
+        );
+        assert!(
+            after.last_progress_at.as_str() >= before.last_progress_at.as_str(),
+            "the mark's clock is not older than the pre-mark stamp"
+        );
+        let resumed = store
+            .list_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "resumed")
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].actor.as_deref(), Some("boot-restore"));
+        assert_eq!(resumed[0].reason.as_deref(), Some("pod-restart"));
+    }
+
+    /// The mark is revision-guarded: a stale copy's mark is refused
+    /// (`StaleRevision`) and a same-revision JSON-differing mark is refused
+    /// (`RevisionConflict`); neither rewinds the stored row.
+    #[test]
+    fn mark_resumed_with_event_is_refused_by_the_revision_guard() {
+        // Arm 1 (stale): another writer moves the row past this engine's next
+        // stamp; the mark is refused and the stored row is not rewound.
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(crate::sop::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut engine = capable_engine(store.clone(), vec![three_step_sop("guarded")]);
+        let action = engine.start_run("guarded", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let seen = store.load_run(&run_id).unwrap().unwrap().revision;
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        let mut newer =
+            PersistedRun::new(stored.run.clone(), now_iso8601(), SopTriggerSource::Manual);
+        newer.revision = seen + 2;
+        newer.writer = Some("another-engine".into());
+        store.save_run(&newer).unwrap();
+
+        let err = engine.mark_resumed_with_event(&run_id).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<StoreError>(),
+                Some(StoreError::StaleRevision { .. })
+            ),
+            "a stale mark is refused as StaleRevision, got {err:?}"
+        );
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.revision, seen + 2, "the stored row was not rewound");
+
+        // Arm 2 (same-revision, JSON-differing): another writer lands exactly
+        // the revision this engine would stamp next, with different content;
+        // the mark is refused and the other writer's content stands.
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(crate::sop::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut engine = capable_engine(store.clone(), vec![three_step_sop("conflicted")]);
+        let action = engine.start_run("conflicted", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let seen = store.load_run(&run_id).unwrap().unwrap().revision;
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        let mut conflicting =
+            PersistedRun::new(stored.run.clone(), now_iso8601(), SopTriggerSource::Manual);
+        conflicting.revision = seen + 1;
+        conflicting.writer = Some("another-engine".into());
+        conflicting.run.current_step = 1;
+        store.save_run(&conflicting).unwrap();
+
+        let err = engine.mark_resumed_with_event(&run_id).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<StoreError>(),
+                Some(StoreError::RevisionConflict { .. })
+            ),
+            "a same-revision JSON-differing mark is refused as RevisionConflict, got {err:?}"
+        );
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.run.current_step, 1, "the stored row was not rewound");
+    }
+
+    /// The resume counter counts a durably-marked resume (the metrics leg of
+    /// Task 3.3).
+    #[test]
+    fn the_resume_counter_counts_a_marked_resume() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let metrics = Arc::new(SopMetricsCollector::new());
+        let mut engine = engine_with_sops(vec![three_step_sop("counted")])
+            .with_store(store)
+            .with_metrics(metrics.clone());
+        let action = engine.start_run("counted", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine.mark_resumed_with_event(&run_id).unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["global"]["resumes"], 1);
+        assert_eq!(snapshot["per_sop"]["counted"]["resumes"], 1);
     }
 }

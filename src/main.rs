@@ -10739,6 +10739,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // terminal write too; see `SopDriverTeardown::unsettled_runs`.
             let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
             let mut carried_sop_settlements = None;
+            // The C6 restore-drive leg fires on the FIRST generation with an
+            // SOP engine: a deployment that boots with the SOP runtime
+            // disabled and enables it on a later reload generation gets its
+            // leg on THAT generation; a reload generation that already had an
+            // engine never re-runs it (the reload teardown owns those runs'
+            // settle semantics).
+            let mut sop_resume_leg_pending = true;
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -10876,6 +10883,34 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                     None
                 };
+                // C6 restore-drive leg: the runs `restore_runs` rehydrated get
+                // their drivers HERE, before `spawn_sop_maintenance` (its
+                // interval's first tick fires immediately and runs the
+                // stuck-run reaper — the pre-C6 fate of every restored run)
+                // and before the MQTT listener admits new activations. Boot
+                // order: engine build → restore → **restore-drive** →
+                // maintenance/channels. The leg marks each resumed run (the
+                // reaper's idle window restarts at the mark) and spawns its
+                // driver staggered; unresumable classes fail closed at boot.
+                // FIRST GENERATION WITH AN SOP ENGINE only — never inside
+                // `build_sop_engine`, which runs per generation AND per agent
+                // turn, and never on a reload generation that already had an
+                // engine.
+                if sop_resume_leg_pending {
+                    if let (Some(engine), Some(supervisor)) =
+                        (sop_engine.as_ref(), sop_driver_supervisor.as_ref())
+                    {
+                        sop_resume_leg_pending = false;
+                        zeroclaw_runtime::sop::restore_drive::drive_restored_runs(
+                            std::sync::Arc::clone(engine),
+                            &supervisor.drivers,
+                            current_config.clone(),
+                            sop_audit.clone(),
+                            Some(authority.execution_capability()),
+                        )
+                        .await;
+                    }
+                }
                 let sop_maintenance = spawn_sop_maintenance(
                     &current_config,
                     sop_engine.as_ref(),
@@ -16260,6 +16295,7 @@ fn spawn_sop_maintenance(
                             "timed_out": report.maintenance.timed_out,
                             "reaped_claims": report.maintenance.reaped_claims,
                             "reaped_stuck_runs": report.maintenance.reaped_stuck_runs,
+                            "fast_failed_unresumable": report.maintenance.fast_failed_unresumable,
                             "pruned_runs": report.maintenance.pruned_runs,
                             "cron_started": report.cron_started,
                             "cron_skipped": report.cron_skipped,

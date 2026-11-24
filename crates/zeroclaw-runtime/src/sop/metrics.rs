@@ -34,6 +34,9 @@ struct MetricCounters {
     timeout_auto_approvals: u64,
     /// EPIC G: deterministic `kind = capability` steps executed via the registry.
     capability_executed: u64,
+    /// Boot-time restore-drive resumes (the `resumed` audit events the leg
+    /// marked). The pod-restart recovery counter.
+    resumes: u64,
 }
 
 // ── RunSnapshot ────────────────────────────────────────────────
@@ -445,6 +448,28 @@ impl SopMetricsCollector {
         resolve_from_counters(&wc, metric_name)
     }
 
+    /// Record a boot-time restore-drive resume for `sop_name`. Call after the
+    /// resume mark's atomic store write has landed — a resume that was never
+    /// durably marked never counts.
+    pub fn record_resume(&self, sop_name: &str) {
+        let Ok(mut state) = self.inner.write() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_resume"
+            );
+            return;
+        };
+        state.global.counters.resumes += 1;
+        state
+            .per_sop
+            .entry(sop_name.to_string())
+            .or_default()
+            .counters
+            .resumes += 1;
+    }
+
     /// Return a full snapshot of collector state for health/debug purposes.
     pub fn snapshot(&self) -> serde_json::Value {
         let Ok(state) = self.inner.read() else {
@@ -648,6 +673,7 @@ fn counters_to_json(sop: &SopCounters) -> serde_json::Value {
         "steps_skipped": c.steps_skipped,
         "human_approvals": c.human_approvals,
         "timeout_auto_approvals": c.timeout_auto_approvals,
+        "resumes": c.resumes,
         "recent_runs_depth": sop.recent_runs.len(),
     })
 }
