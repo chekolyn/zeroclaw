@@ -177,6 +177,11 @@ PROBE_REGISTRY: dict = {
         "pattern": r"cannot_express_the_sop_class",
         "min_count": 1,
     },
+    "shell-scalar-exempt": {
+        "glob": "crates/zeroclaw-config/src/policy.rs",
+        "pattern": r"is_static_safe_scalar_expansion",
+        "min_count": 3,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt

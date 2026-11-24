@@ -3160,9 +3160,21 @@ fn contains_unquoted_input_redirect(command: &str, dialect: ShellDialect) -> boo
     contains_unquoted_char(&safe, '<', dialect)
 }
 
-/// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
+/// The `$`-forms whose expansion is statically safe in every quote state:
+/// `$?` (exit status), `$$` (PID), `$!` (last background PID). POSIX
+/// defines each as a small non-negative integer, so the result can never
+/// split words, glob, or carry an injection payload. `next` is the
+/// character following the `$`. Every other form (`$VAR`, `${…}`, `$(…)`,
+/// `$#`, `$*`, `$@`, …) stays guarded.
+fn is_static_safe_scalar_expansion(next: char) -> bool {
+    matches!(next, '?' | '$' | '!')
+}
+
+/// Detect unquoted shell variable expansions like `$HOME`, `$1`, `${VAR}`.
 /// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
-/// treated as literals and therefore ignored.
+/// treated as literals and therefore ignored. The statically-safe scalar
+/// special parameters (`$?`, `$$`, `$!` — see
+/// [`is_static_safe_scalar_expansion`]) are exempt in every quote state.
 fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
@@ -3219,6 +3231,12 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
         let Some(next) = chars.get(i + 1).copied() else {
             continue;
         };
+        if is_static_safe_scalar_expansion(next) {
+            // `$?`/`$$`/`$!`: statically safe in any quote state — skip
+            // this `$` and keep scanning; the tail char is an ordinary
+            // character to the quote machine.
+            continue;
+        }
         if next.is_ascii_alphanumeric()
             || matches!(
                 next,
@@ -3345,6 +3363,17 @@ fn contains_unmodeled_shell_word_expansion(command: &str, dialect: ShellDialect)
                     }
                     '$' if chars.peek().is_some_and(|next| matches!(*next, '\'' | '"')) => {
                         return true;
+                    }
+                    '$' if chars
+                        .peek()
+                        .is_some_and(|next| is_static_safe_scalar_expansion(*next)) =>
+                    {
+                        // `$?`/`$$`/`$!` expand to a small non-negative
+                        // integer (see `is_static_safe_scalar_expansion`).
+                        // Consume the scalar tail with the `$` so the
+                        // unquoted-`?` glob rule below never sees the
+                        // expansion's own `?`.
+                        let _ = chars.next();
                     }
                     // Parentheses participate in extended-glob syntax in
                     // supported configurable shells such as ksh. Even when
@@ -8906,6 +8935,91 @@ mod tests {
     fn command_injection_dollar_brace_unquoted_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${HOME}"));
+    }
+
+    // The statically-safe scalar special parameters — `$?` (exit status),
+    // `$$` (PID), `$!` (last background PID) — always expand to a small
+    // non-negative integer: no word splitting, no globbing, no injection
+    // surface. They are allowed in every quote state; every other
+    // `$`-form stays guarded. The measured dominant denial class on the
+    // deployed SOP plane was the `echo "EXIT=$?"` idiom.
+    #[test]
+    fn command_injection_exit_status_expansion_in_double_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo \"EXIT=$?\""));
+    }
+
+    #[test]
+    fn command_injection_exit_status_expansion_unquoted_in_later_segment_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo a; echo EXIT=$?"));
+    }
+
+    #[test]
+    fn command_injection_pid_expansions_in_double_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo a; echo \"RC=$!\"; echo \"PID=$$\""));
+    }
+
+    #[test]
+    fn command_injection_pid_expansions_unquoted_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo PID=$$; echo RC=$!"));
+    }
+
+    #[test]
+    fn command_injection_exit_status_expansion_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '$?'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_var_double_quoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo \"$HOME\""));
+    }
+
+    #[test]
+    fn command_injection_dollar_paren_double_quoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo \"$(date)\""));
+    }
+
+    #[test]
+    fn command_injection_hash_expansion_double_quoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo \"COUNT=$#\""));
+    }
+
+    #[test]
+    fn command_injection_last_background_pid_still_blocked_on_windows_cmd() {
+        // cmd.exe delayed expansion makes a bare `!` unmodeled regardless
+        // of the `$` context (`!var!`), so the Windows dialect keeps the
+        // denial; the scalar exemption is a POSIX-plane carve-out.
+        let p = default_policy();
+        assert!(!p.is_command_allowed_for_shell("echo RC=$!", ShellDialect::WindowsCmd));
+    }
+
+    #[test]
+    fn validate_command_execution_accepts_exit_status_expansion_end_to_end() {
+        let p = default_policy();
+        assert!(
+            p.validate_command_execution("echo \"EXIT=$?\"", false)
+                .is_ok(),
+            "the statically-safe `$?` expansion must pass the full validation path"
+        );
+    }
+
+    #[test]
+    fn validate_command_execution_still_rejects_parameter_expansion_end_to_end() {
+        let p = default_policy();
+        let err = p
+            .validate_command_execution("echo \"${HOME}\"", false)
+            .expect_err("`$VAR`/`${VAR}` forms must stay rejected");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
     }
 
     #[test]
