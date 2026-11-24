@@ -7374,6 +7374,18 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
 
     let _ = write!(ctx, "\nCurrent step: **{}**\n{}\n", step.title, step.body);
 
+    if let Some(schema) = step
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.output.as_ref())
+    {
+        let _ = writeln!(
+            ctx,
+            "\nOutput contract: the `output` you report via sop_advance MUST be a JSON object matching this schema (never prose): {}",
+            serde_json::to_string(schema).unwrap_or_else(|_| schema.to_string())
+        );
+    }
+
     if !step.suggested_tools.is_empty() {
         let _ = write!(
             ctx,
@@ -13208,6 +13220,78 @@ mod tests {
                 "step prompt for {name:?} must be recognised: {ctx:?}"
             );
         }
+    }
+
+    /// The SOP-run fixture for the context-formatting tests below: a running
+    /// one-step-in run over a `test_sop` of the same name.
+    fn context_run(sop_name: &str) -> SopRun {
+        SopRun {
+            run_id: "run-001".into(),
+            sop_name: sop_name.into(),
+            initiating_agent: None,
+            memory_owner: None,
+            trigger_event: manual_event(),
+            frame_marker_id: "marker-001".into(),
+            status: SopRunStatus::Running,
+            current_step: 1,
+            total_steps: 2,
+            started_at: now_iso8601(),
+            completed_at: None,
+            failure_reason: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A step that declares an output schema must surface that contract in the
+    /// step context. The agent composes the `sop_advance` output itself, and a
+    /// schema the context never renders is rejected on sight — measured
+    /// 2026-11-24 on prod: 38 `step_schema_reject`s / 24h, every one a prose
+    /// output against a declared object schema the agent could not see (the
+    /// `- output:` bullet is parsed away and never reaches the step body).
+    #[test]
+    fn step_context_declares_a_rendered_output_schema() {
+        let mut sop = test_sop(
+            "schema-context",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        let run = context_run("schema-context");
+        let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
+        assert!(
+            ctx.contains("Output contract"),
+            "the contract must be named: {ctx:?}"
+        );
+        assert!(
+            ctx.contains("\"required\":[\"ok\"]"),
+            "the schema body must be rendered: {ctx:?}"
+        );
+        assert!(
+            ctx.contains("sop_advance"),
+            "the reporting mechanism must be named: {ctx:?}"
+        );
+    }
+
+    /// A schema-less step's context carries no output contract: the addition
+    /// must not grow every existing step's prompt.
+    #[test]
+    fn step_context_omits_the_output_contract_without_a_declared_schema() {
+        let sop = test_sop("plain-context", SopExecutionMode::Auto, SopPriority::Normal);
+        let run = context_run("plain-context");
+        let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
+        assert!(
+            !ctx.contains("Output contract"),
+            "no declared schema, no contract: {ctx:?}"
+        );
     }
 
     // ── Get run (active + finished) ─────────────────────
