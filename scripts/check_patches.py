@@ -182,6 +182,16 @@ PROBE_REGISTRY: dict = {
         "pattern": r"is_static_safe_scalar_expansion",
         "min_count": 3,
     },
+    "sop-restore-drive": {
+        "glob": "crates/zeroclaw-runtime/src/sop/restore_drive.rs",
+        "pattern": r"SOP restore-drive:",
+        "min_count": 3,
+    },
+    "sop-restore-drive-wiring": {
+        "glob": "src/main.rs",
+        "pattern": r"restore_drive::drive_restored_runs",
+        "min_count": 1,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
