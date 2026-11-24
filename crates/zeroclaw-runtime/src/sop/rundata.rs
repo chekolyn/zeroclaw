@@ -75,14 +75,36 @@ impl RunData {
     }
 }
 
-/// Parse a model step's raw output text into a JSON value.
+/// A parsed step output plus, when the enum-tiny prose recovery fired, the
+/// vocabulary token the object was reconstructed from — the observability
+/// handle the engine turns into a `step_output_recovered` audit row.
+pub(crate) struct ParsedStepOutput {
+    pub value: Value,
+    pub recovered_enum_token: Option<String>,
+}
+
+/// Parse a model step's raw output text into a JSON value, reporting the
+/// enum-tiny prose recovery when it fired.
 ///
 /// Exact JSON remains the first and schema-independent path. Fuzzy recovery is
 /// deliberately limited to outputs with a declared schema: trigger payloads and
 /// other raw strings must not lose their surrounding instructions just because
 /// they contain a JSON example. A recovered candidate must be the only complete
 /// object/array in the text and satisfy the declared output schema.
-pub(crate) fn parse_step_output_value(raw: &str, output_schema: Option<&Value>) -> Value {
+///
+/// The third rung is the enum-tiny prose recovery: when the declared schema is
+/// exactly one required string-enum property and the raw text (which carried no
+/// JSON container at all) contains exactly one DISTINCT vocabulary token, the
+/// object is reconstructed from that token — see [`enum_tiny_prose_recovery`].
+/// Every other shape fails closed to the raw string, byte-for-byte.
+pub(crate) fn parse_step_output_value_detailed(
+    raw: &str,
+    output_schema: Option<&Value>,
+) -> ParsedStepOutput {
+    let fallback = || ParsedStepOutput {
+        value: Value::String(raw.into()),
+        recovered_enum_token: None,
+    };
     let trimmed = raw.trim();
 
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -95,22 +117,137 @@ pub(crate) fn parse_step_output_value(raw: &str, output_schema: Option<&Value>) 
             && let Ok(unwrapped) = serde_json::from_str::<Value>(inner.trim())
             && super::schema::validate_value(schema, &unwrapped).is_ok()
         {
-            return unwrapped;
+            return ParsedStepOutput {
+                value: unwrapped,
+                recovered_enum_token: None,
+            };
         }
-        return value;
+        return ParsedStepOutput {
+            value,
+            recovered_enum_token: None,
+        };
     }
 
     let Some(schema) = output_schema else {
-        return Value::String(raw.into());
+        return fallback();
     };
     let Some(candidate) = unique_embedded_container(trimmed) else {
-        return Value::String(raw.into());
+        return match enum_tiny_prose_recovery(schema, trimmed) {
+            Some((value, token)) => ParsedStepOutput {
+                value,
+                recovered_enum_token: Some(token),
+            },
+            None => fallback(),
+        };
     };
     if super::schema::validate_value(schema, &candidate).is_ok() {
-        candidate
+        ParsedStepOutput {
+            value: candidate,
+            recovered_enum_token: None,
+        }
     } else {
-        Value::String(raw.into())
+        fallback()
     }
+}
+
+/// The enum-tiny prose recovery: the observed `step_schema_reject` class is a
+/// step whose declared output schema is exactly one required string-enum
+/// property (the deploy-executor's entry-class and verdict steps) answered in
+/// prose that names the chosen value but never wraps it in JSON. When the raw
+/// text carries exactly one DISTINCT vocabulary token, the declared object is
+/// reconstructed from that token.
+///
+/// Fail-closed on everything else: zero vocabulary tokens, two or more
+/// DISTINCT tokens (an ambiguous answer), a schema that is not enum-tiny, or
+/// any extractable JSON container (the container rungs above own those
+/// outputs) — all keep the raw string byte-for-byte. The matching rule is
+/// whole-token over the ASCII vocabulary charset `[A-Za-z0-9_]`
+/// (see [`vocabulary_tokens`]), case-insensitive against the declared enum
+/// values, and the reconstructed value is spelled exactly as the schema's
+/// enum declares it.
+fn enum_tiny_prose_recovery(schema: &Value, text: &str) -> Option<(Value, String)> {
+    let (prop, variants) = enum_tiny_property(schema)?;
+    let mut matched: Option<&str> = None;
+    for token in vocabulary_tokens(text) {
+        let lowered = token.to_ascii_lowercase();
+        let Some(entry) = variants
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|variant| variant.to_ascii_lowercase() == lowered)
+        else {
+            continue;
+        };
+        if let Some(previous) = matched {
+            if previous != entry {
+                // Two distinct vocabulary values in one answer is ambiguous.
+                return None;
+            }
+        } else {
+            matched = Some(entry);
+        }
+    }
+    let token = matched?;
+    let value = serde_json::json!({ prop: token });
+    super::schema::validate_value(schema, &value).ok()?;
+    Some((value, token.to_string()))
+}
+
+/// The enum-tiny output shape: `type: "object"` with exactly one property
+/// that is both required and a string enum. Computed from the schema's
+/// serde value — never by string-matching the schema text. Anything else
+/// (extra properties, a non-enum property type, several required keys, a
+/// bare string-enum without the object wrapper) is not enum-tiny.
+fn enum_tiny_property(schema: &Value) -> Option<(&str, &[Value])> {
+    let object = schema.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("object") {
+        return None;
+    }
+    let required = object.get("required")?.as_array()?;
+    if required.len() != 1 {
+        return None;
+    }
+    let required_key = required[0].as_str()?;
+    let properties = object.get("properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let (name, property) = properties.iter().next()?;
+    if name != required_key {
+        return None;
+    }
+    let property = property.as_object()?;
+    if property.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    let variants = property.get("enum")?.as_array()?;
+    if variants.is_empty() || variants.iter().any(|variant| !variant.is_string()) {
+        return None;
+    }
+    Some((name.as_str(), variants))
+}
+
+/// Maximal runs of the ASCII vocabulary charset `[A-Za-z0-9_]`. Underscore
+/// joins stay one token (`not_ahead`); every other byte — space, punctuation,
+/// quotes, backticks, hyphens, non-ASCII letters — delimits. Whole-token
+/// equality is the match rule: `own` must not match inside `shown` or
+/// `owner`, and `rejected` is not `reject` (a miss falls back to the
+/// reject-and-retry path; a wrong hit would pipe a fabricated value
+/// downstream, which is strictly worse).
+fn vocabulary_tokens(text: &str) -> Vec<&str> {
+    let is_token_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let bytes = text.bytes().chain(std::iter::once(0));
+    for (index, byte) in bytes.enumerate() {
+        if is_token_byte(byte) {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(begin) = start.take() {
+            tokens.push(&text[begin..index]);
+        }
+    }
+    tokens
 }
 
 /// Return one complete embedded JSON object or array. Advancing past a parsed
@@ -161,7 +298,7 @@ mod tests {
         let payload = r#"{"head_sha":"abc"}"#;
         let raw = serde_json::to_string(payload).unwrap();
 
-        let value = parse_step_output_value(&raw, Some(&schema));
+        let value = parse_step_output_value_detailed(&raw, Some(&schema)).value;
 
         assert_eq!(value["head_sha"], "abc");
     }
@@ -171,7 +308,7 @@ mod tests {
         let payload = r#"{"head_sha":"abc"}"#;
         let raw = serde_json::to_string(payload).unwrap();
 
-        let value = parse_step_output_value(&raw, None);
+        let value = parse_step_output_value_detailed(&raw, None).value;
 
         assert_eq!(value, Value::String(payload.to_string()));
     }
@@ -186,7 +323,7 @@ mod tests {
         let payload = r#"{"head_sha":"abc"}"#;
         let raw = serde_json::to_string(payload).unwrap();
 
-        let value = parse_step_output_value(&raw, Some(&schema));
+        let value = parse_step_output_value_detailed(&raw, Some(&schema)).value;
 
         assert_eq!(value, Value::String(payload.to_string()));
     }
@@ -214,7 +351,7 @@ mod tests {
             ```json\n{\n  \"status\": \"ok\",\n  \"word_count\": 738\n}\n```\n\n\
             Summary: the run stopped safely at Step 1.";
         let schema = json!({"type": "object", "required": ["status", "word_count"]});
-        let value = parse_step_output_value(raw, Some(&schema));
+        let value = parse_step_output_value_detailed(raw, Some(&schema)).value;
         assert_eq!(value["status"], "ok");
         assert_eq!(value["word_count"], 738);
     }
@@ -224,7 +361,7 @@ mod tests {
         let raw = "```\n{\"outcome\": \"stopped\"}\n```";
         let schema = json!({"type": "object", "required": ["outcome"]});
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema))["outcome"],
+            parse_step_output_value_detailed(raw, Some(&schema)).value["outcome"],
             "stopped"
         );
     }
@@ -234,7 +371,7 @@ mod tests {
         let raw = "Here is the result: {\"preferences_loaded\": true} — done.";
         let schema = json!({"type": "object", "required": ["preferences_loaded"]});
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema))["preferences_loaded"],
+            parse_step_output_value_detailed(raw, Some(&schema)).value["preferences_loaded"],
             Value::Bool(true)
         );
     }
@@ -243,7 +380,7 @@ mod tests {
     fn braces_inside_strings_do_not_unbalance_extraction() {
         let raw = "note: {\"summary\": \"contains a } brace and { another\"} tail";
         let schema = json!({"type": "object", "required": ["summary"]});
-        let value = parse_step_output_value(raw, Some(&schema));
+        let value = parse_step_output_value_detailed(raw, Some(&schema)).value;
         assert_eq!(value["summary"], "contains a } brace and { another");
     }
 
@@ -252,7 +389,7 @@ mod tests {
         let raw = "I could not complete the extraction step.";
         let schema = json!({"type": "object"});
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema)),
+            parse_step_output_value_detailed(raw, Some(&schema)).value,
             Value::String(raw.into())
         );
     }
@@ -266,7 +403,7 @@ mod tests {
         });
 
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema)),
+            parse_step_output_value_detailed(raw, Some(&schema)).value,
             json!([{"approved": true}])
         );
     }
@@ -277,7 +414,7 @@ mod tests {
         let schema = json!({"type": "object", "required": ["approved"]});
 
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema)),
+            parse_step_output_value_detailed(raw, Some(&schema)).value,
             Value::String(raw.into())
         );
     }
@@ -288,7 +425,7 @@ mod tests {
         let schema = json!({"type": "string"});
 
         assert_eq!(
-            parse_step_output_value(raw, Some(&schema)),
+            parse_step_output_value_detailed(raw, Some(&schema)).value,
             Value::String(raw.into())
         );
     }
@@ -298,9 +435,218 @@ mod tests {
         let raw = "Use this example: {\"approved\":true}";
 
         assert_eq!(
-            parse_step_output_value(raw, None),
+            parse_step_output_value_detailed(raw, None).value,
             Value::String(raw.into())
         );
+    }
+
+    // The deploy-executor entry-class shape (its SOP step 2's `- output:`
+    // bullet) — the enum-tiny shape the prose rung targets.
+    fn enum_tiny_schema(prop: &str, variants: &[&str]) -> Value {
+        json!({
+            "type": "object",
+            "required": [prop],
+            "properties": {
+                prop: {"type": "string", "enum": variants}
+            }
+        })
+    }
+
+    #[test]
+    fn enum_tiny_prose_with_one_vocabulary_token_recovers_the_object() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "I compared the three candidate classes and the best fit for this deploy is own.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, json!({"entry_class": "own"}));
+        assert_eq!(parsed.recovered_enum_token.as_deref(), Some("own"));
+    }
+
+    #[test]
+    fn enum_tiny_prose_matches_tokens_case_insensitively_and_keeps_the_enum_spelling() {
+        let schema = enum_tiny_schema("verdict", &["execute", "deduped", "error"]);
+        let raw = "Verdict: DEDUPED — nothing further to run.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, json!({"verdict": "deduped"}));
+        assert_eq!(parsed.recovered_enum_token.as_deref(), Some("deduped"));
+    }
+
+    #[test]
+    fn enum_tiny_prose_requires_whole_tokens_not_substrings() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        // `owner`/`shown` contain "own" as a substring; `candidates` contains
+        // no "tip"; only whole-token occurrences may match.
+        let raw = "The owner class was not among the candidates shown today.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+        assert_eq!(parsed.recovered_enum_token, None);
+    }
+
+    #[test]
+    fn enum_tiny_prose_with_two_distinct_tokens_stays_a_string() {
+        let schema = enum_tiny_schema("disposition", &["proceed", "hold", "not_ahead"]);
+        let raw = "I could proceed with the deploy, or hold and wait for the window.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+        assert_eq!(parsed.recovered_enum_token, None);
+    }
+
+    #[test]
+    fn enum_tiny_prose_with_a_repeated_single_token_still_recovers() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "Entry class: own. The own class was chosen.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, json!({"entry_class": "own"}));
+    }
+
+    #[test]
+    fn enum_tiny_prose_with_zero_tokens_stays_a_string() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "I could not complete the extraction step.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn extra_property_schema_prose_stays_a_string() {
+        // The deploy-executor preflight's real shape: one required enum
+        // property plus an optional companion — extra properties are not
+        // enum-tiny, so the rung must not fire.
+        let schema = json!({
+            "type": "object",
+            "required": ["disposition"],
+            "properties": {
+                "disposition": {"type": "string", "enum": ["proceed", "hold", "not_ahead"]},
+                "pr": {"type": "integer"}
+            }
+        });
+        let raw = "the disposition is proceed, pr pending";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+        assert_eq!(parsed.recovered_enum_token, None);
+    }
+
+    #[test]
+    fn string_enum_without_the_object_wrapper_stays_a_string() {
+        let schema = json!({"type": "string", "enum": ["proceed", "hold"]});
+        let raw = "I would proceed.";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn non_enum_property_type_stays_a_string() {
+        let schema = json!({
+            "type": "object",
+            "required": ["head_sha"],
+            "properties": {"head_sha": {"type": "string"}}
+        });
+        let raw = "the head sha is abcdef123";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn multiple_required_properties_stay_a_string() {
+        let schema = json!({
+            "type": "object",
+            "required": ["status", "word_count"],
+            "properties": {
+                "status": {"type": "string", "enum": ["ok", "failed"]},
+                "word_count": {"type": "integer"}
+            }
+        });
+        let raw = "status ok";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn existing_container_extraction_wins_over_the_enum_tiny_rung() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "The verdict:\n```json\n{\"entry_class\": \"fresh\"}\n```";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, json!({"entry_class": "fresh"}));
+        assert_eq!(
+            parsed.recovered_enum_token, None,
+            "a container extraction is not a prose recovery"
+        );
+    }
+
+    #[test]
+    fn competing_containers_stay_a_string_even_under_an_enum_tiny_schema() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "first {\"entry_class\":\"own\"}; second {\"entry_class\":\"fresh\"}";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+    }
+
+    #[test]
+    fn a_failing_container_blocks_the_prose_rung() {
+        let schema = enum_tiny_schema(
+            "entry_class",
+            &["own", "fresh", "tip", "fallback", "reject"],
+        );
+        let raw = "the entry class is own: {\"wrong_prop\": 1}";
+
+        let parsed = parse_step_output_value_detailed(raw, Some(&schema));
+
+        // A container exists (it merely fails the schema): the current
+        // extraction behavior holds byte-for-byte — the prose rung does not
+        // fire on top of it.
+        assert_eq!(parsed.value, Value::String(raw.into()));
+        assert_eq!(parsed.recovered_enum_token, None);
+    }
+
+    #[test]
+    fn prose_recovery_never_fires_without_a_declared_schema() {
+        let raw = "the entry class is own";
+
+        let parsed = parse_step_output_value_detailed(raw, None);
+
+        assert_eq!(parsed.value, Value::String(raw.into()));
+        assert_eq!(parsed.recovered_enum_token, None);
     }
 
     #[test]
