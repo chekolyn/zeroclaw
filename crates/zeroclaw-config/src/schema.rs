@@ -15343,6 +15343,14 @@ pub struct RiskProfileConfig {
     /// This keeps the post-change eager-MCP default usable for agents with an
     /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
     ///
+    /// Per-server override: when [`Self::mcp_servers`] carries an entry for
+    /// a server, that server's tools are deny-by-default under this
+    /// profile — only the listed tools (or the explicit `"*"` wildcard)
+    /// are admitted, regardless of the `__` auto-admit above. The
+    /// auto-admit remains the behavior ONLY for servers WITHOUT a map
+    /// entry; an empty `tools` list on an entry means "deny all tools
+    /// from this server".
+    ///
     /// Scope of the exception: the `__` auto-admit applies only to this
     /// risk-profile allow-list, **not** to caller-supplied per-run
     /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
@@ -15366,6 +15374,21 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Per-profile MCP tool grants (`[risk_profiles.<alias>.mcp_servers.<server>]`).
+    ///
+    /// Each entry keys an MCP server name (a `[[mcp.servers]].name` value)
+    /// and lists the tools this profile may call on that server. A server
+    /// WITH an entry here is deny-by-default: only the listed tools are
+    /// admitted (the explicit `"*"` entry admits every tool from that
+    /// server); an empty or absent `tools` list denies all of that
+    /// server's tools. A server WITHOUT an entry keeps the legacy
+    /// behavior: its `<server>__<tool>` names ride the `allowed_tools`
+    /// `__` auto-admit above. The map threads to
+    /// `SecurityPolicy.mcp_servers` unchanged and is enforced on every
+    /// tool-admission gate that reads it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub mcp_servers: HashMap<String, McpProfileGrant>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -15411,6 +15434,7 @@ impl Default for RiskProfileConfig {
             allowed_tools: Vec::new(),
             deny_all_tools: false,
             excluded_tools: Vec::new(),
+            mcp_servers: HashMap::new(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
@@ -15645,6 +15669,26 @@ pub struct McpBundleConfig {
     /// MCP server IDs removed from the grant. Deny wins: a name listed here is
     /// excluded even if another referenced bundle includes it.
     pub exclude: Vec<String>,
+}
+
+/// Per-profile MCP tool grant (`[risk_profiles.<alias>.mcp_servers.<server>]`).
+///
+/// The value type of [`RiskProfileConfig::mcp_servers`]: the explicit tool
+/// grant for ONE MCP server under ONE risk profile. `tools` carries bare
+/// tool names (the server is the TOML map key — `search_dashboards`, not
+/// `grafana__search_dashboards`); `"*"` is the explicit whole-server
+/// wildcard. An empty or absent list denies every tool from the server;
+/// a server with NO entry on the map at all keeps the legacy behavior (its
+/// `<server>__<tool>` names ride the `allowed_tools` `__` auto-admit).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "mcp_profile_grant"]
+#[serde(default)]
+pub struct McpProfileGrant {
+    /// Tools this profile may call on the granting server. Bare tool
+    /// names; `"*"` is the explicit wildcard. Empty means deny-all for
+    /// this server.
+    pub tools: Vec<String>,
 }
 
 // ── Runtime ──────────────────────────────────────────────────────
@@ -35806,6 +35850,88 @@ allowed_tools = ["shell"]
             err.to_string()
                 .contains("risk_profiles.default.deny_all_tools"),
             "error must name the offending path, got: {err}"
+        );
+    }
+
+    /// `RiskProfileConfig.mcp_servers` — the per-profile MCP tool grant
+    /// map. Each entry keys an MCP server name (a `[[mcp.servers]].name`
+    /// value) and carries that server's explicit tool grant under the
+    /// profile. Bare tool names only (the server is the map key); `"*"`
+    /// parses as the literal wildcard entry (the post-convergence-cut
+    /// explicit opt-in).
+    #[test]
+    async fn risk_profile_mcp_servers_map_parses_per_server_grants() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.full_autonomy.mcp_servers.grafana]
+tools = ["search_dashboards"]
+
+[risk_profiles.full_autonomy.mcp_servers.k8s]
+tools = ["*"]
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("full_autonomy").unwrap();
+        let grafana = profile
+            .mcp_servers
+            .get("grafana")
+            .expect("the grafana server entry must parse into the grant map");
+        assert_eq!(
+            grafana.tools,
+            vec!["search_dashboards".to_string()],
+            "bare tool names must parse; the server is the map key"
+        );
+        let k8s = profile
+            .mcp_servers
+            .get("k8s")
+            .expect("the k8s server entry must parse into the grant map");
+        assert_eq!(
+            k8s.tools,
+            vec!["*".to_string()],
+            "'*' must parse as the literal wildcard entry"
+        );
+    }
+
+    /// Absent `mcp_servers` under a profile is the empty map (the legacy
+    /// state: every granted server rides the `__` auto-admit). The map must
+    /// ALSO register as a nested map-key section, not a scalar property:
+    /// without `#[nested]` the Configurable derive silently scalar-registers
+    /// the `HashMap<String, McpProfileGrant>` field and the schema lint
+    /// still passes, so `get_map_keys` resolving the section is the
+    /// regression pin.
+    #[test]
+    async fn risk_profile_mcp_servers_defaults_absent_and_registers_as_nested_map_section() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.full_autonomy]
+allowed_commands = ["git"]
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("full_autonomy").unwrap();
+        assert!(
+            profile.mcp_servers.is_empty(),
+            "an absent mcp_servers key must parse as the empty grant map"
+        );
+
+        let with_entry = parse_test_config(
+            r#"
+default_temperature = 0.7
+
+[risk_profiles.full_autonomy.mcp_servers.grafana]
+tools = ["search_dashboards"]
+"#,
+        );
+        let profile = with_entry.risk_profiles.get("full_autonomy").unwrap();
+        let keys = profile
+            .get_map_keys("risk_profile.mcp_servers")
+            .expect(
+                "mcp_servers must register as a nested map-key section, not a scalar \
+                 (the #[nested] attribute is load-bearing)",
+            );
+        assert!(
+            keys.iter().any(|k| k == "grafana"),
+            "the parsed server entry must surface as a map key, got: {keys:?}"
         );
     }
 
