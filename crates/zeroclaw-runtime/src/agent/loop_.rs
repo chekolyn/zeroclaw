@@ -463,21 +463,23 @@ pub fn apply_policy_tool_filter(
 }
 
 /// Build the MCP tool-access policy for an agent from its `SecurityPolicy`
-/// (`allowed_tools` + `excluded_tools`) and an optional caller-supplied
-/// allowlist. Shared by the runtime agent loop and the channels orchestrator
-/// so every MCP registration site gates through identical logic.
+/// (`allowed_tools` + `excluded_tools` + the `mcp_servers` grant map) and an
+/// optional caller-supplied allowlist. Shared by the runtime agent loop, the
+/// channels orchestrator, and the delegate path so every MCP admission gate
+/// constructs through identical logic.
 pub fn mcp_tool_access_policy(
     security: &zeroclaw_config::policy::SecurityPolicy,
     caller_allowed: Option<&[String]>,
 ) -> Option<zeroclaw_tools::tool_search::ToolAccessPolicy> {
-    // The `mcp_servers` grant map stays `None` until the wiring task threads
-    // it here (the shared construction site for the runtime loop and the
-    // channels orchestrator); `None` keeps the legacy auto-admit.
+    // The profile's `mcp_servers` grant map threads into the shared gate: a
+    // server WITH an entry is deny-by-default; servers without an entry (and
+    // empty maps, which `from_security` ignores) keep the legacy
+    // `<server>__<tool>` auto-admit.
     zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
         security.allowed_tools.as_deref(),
         security.excluded_tools.as_deref(),
         caller_allowed,
-        None,
+        Some(&security.mcp_servers),
     )
 }
 
@@ -528,6 +530,18 @@ pub fn register_eager_mcp_tool_if_allowed(
     policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
 ) -> bool {
     if !eager_mcp_tool_allowed(wrapper.name(), policy) {
+        // The grant map's denial is otherwise silent (the tool simply never
+        // registers) — surface the exact reason so the profile's
+        // `mcp_servers` map stays observable at the registration boundary.
+        // Non-map denials (allowlist/denylist) keep their legacy silence.
+        if let Some(reason) = policy.and_then(|p| p.mcp_grant_denial_reason(wrapper.name())) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool),
+                &format!("MCP eager registration skipped: {reason}"),
+            );
+        }
         return false;
     }
     if let Some(handle) = delegate_handle {
@@ -18898,6 +18912,7 @@ Let me check the result."#;
             None,
             Some(&excluded),
             None,
+            None,
         )
         .expect("denylist yields a policy");
 
@@ -21230,6 +21245,106 @@ Let me check the result."#;
             .map(|tool| tool.name().to_string())
             .collect();
         assert_eq!(delegate_names, vec!["fs__read_file", "github__search"]);
+    }
+
+    #[test]
+    fn mcp_tool_access_policy_threads_the_profile_grant_map() {
+        // The seam must thread the profile's `mcp_servers` grant map into the
+        // shared gate — the runtime loop and the channels orchestrator both
+        // construct through here, so a map that stops here bypasses the
+        // per-profile grant contract everywhere downstream.
+        let mut policy = TestPolicy::default();
+        policy.mcp_servers.insert(
+            "grafana".to_string(),
+            zeroclaw_config::schema::McpProfileGrant {
+                tools: vec!["search_dashboards".to_string()],
+            },
+        );
+        let access_policy = super::mcp_tool_access_policy(&policy, None)
+            .expect("a non-empty grant map conjures a policy");
+
+        // The map threads unchanged...
+        let grant = access_policy
+            .mcp_servers
+            .as_ref()
+            .expect("the grant map must reach the policy")
+            .get("grafana")
+            .expect("the grafana grant");
+        assert_eq!(grant.tools, vec!["search_dashboards".to_string()]);
+        // ...and the threaded map denies the mapped server's unlisted tool...
+        assert!(
+            !access_policy.is_tool_allowed("grafana__update_dashboard"),
+            "a mapped server's unlisted tool must be denied through the shared gate"
+        );
+        // ...while admitting the granted one.
+        assert!(
+            access_policy.is_tool_allowed("grafana__search_dashboards"),
+            "the granted tool must pass the shared gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_mcp_registration_skip_surfaces_the_grant_denial_reason() {
+        let mut policy = TestPolicy::default();
+        policy.mcp_servers.insert(
+            "grafana".to_string(),
+            zeroclaw_config::schema::McpProfileGrant {
+                tools: vec!["search_dashboards".to_string()],
+            },
+        );
+        let access_policy = super::mcp_tool_access_policy(&policy, None)
+            .expect("a non-empty grant map conjures a policy");
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let mut tools: Vec<Box<dyn TestTool>> = Vec::new();
+        let registered = super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("grafana__update_dashboard"),
+            &mut tools,
+            None,
+            Some(&access_policy),
+        );
+        assert!(
+            !registered,
+            "the grant map's omission must skip the eager registration"
+        );
+        assert!(
+            tools.is_empty(),
+            "a skipped tool must not reach the registry"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut denial = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| {
+                            m.contains("grafana__update_dashboard")
+                                && m.contains("mcp_servers grant")
+                        })
+                    {
+                        denial = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        let value = denial.expect("the eager skip must record the grant denial reason");
+        assert!(
+            value["message"].as_str().is_some_and(|m| m.contains(
+                "`grafana__update_dashboard` is not on this profile's mcp_servers grant for `grafana`."
+            )),
+            "the recorded reason must be the exact grant message, got: {value}"
+        );
     }
 
     // ── agent_provider_composite regression ───────────────────────────────

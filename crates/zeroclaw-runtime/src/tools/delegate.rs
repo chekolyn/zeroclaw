@@ -7,7 +7,7 @@ use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, TOOL_LOOP_THREAD_ID, ToolLoop, apply_text_tool_prompt_policy,
-    run_tool_call_loop,
+    mcp_tool_access_policy, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequirement};
@@ -2670,6 +2670,7 @@ impl DelegateTool {
             } else {
                 Some(profile.excluded_tools.clone())
             },
+            mcp_servers: profile.mcp_servers.clone(),
             ..SecurityPolicy::default()
         })
     }
@@ -2694,23 +2695,22 @@ impl DelegateTool {
             } else {
                 Some(profile.excluded_tools.clone())
             },
+            mcp_servers: profile.mcp_servers.clone(),
             ..SecurityPolicy::default()
         })
     }
 
+    /// The delegate-path MCP admission gate — the third enforcement copy,
+    /// collapsed onto the shared `ToolAccessPolicy::is_tool_allowed`
+    /// composition (denied > mcp_servers > allowed > caller_allowed): the
+    /// profile's `mcp_servers` grant map denies unlisted tools on mapped
+    /// servers, the legacy `<server>__<tool>` auto-admit survives for
+    /// servers WITHOUT a map entry, and the risk-profile allow/deny lists
+    /// keep their semantics. The per-run caller list does not apply here —
+    /// the caller gate runs upstream of every call site
+    /// (`security.is_tool_allowed`).
     fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
-        let denied = policy
-            .excluded_tools
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name));
-        if denied {
-            return false;
-        }
-        match policy.allowed_tools.as_ref() {
-            None => true,
-            Some(list) if list.is_empty() => false,
-            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
-        }
+        mcp_tool_access_policy(policy, None).is_none_or(|gate| gate.is_tool_allowed(name))
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -6165,6 +6165,11 @@ impl DelegateTool {
                     let parent_tools = self.parent_tools.tools.read();
                     self.parent_tools.origins.snapshot(&parent_tools)
                 };
+                // The MCP gate is built ONCE above the per-tool iteration
+                // (the shared construction site; the collapsed
+                // `delegate_admits_with_mcp` composition rides
+                // `ToolAccessPolicy::is_tool_allowed` per name).
+                let mcp_gate = mcp_tool_access_policy(&tool_policy, None);
                 let inherited = snapshot
                     .into_iter()
                     .filter(|(tool, _)| tool.name() != Self::NAME)
@@ -6172,7 +6177,11 @@ impl DelegateTool {
                         !withhold_unrestricted || !tool.requires_unrestricted_principal()
                     })
                     .filter(|(tool, _)| self.security.is_tool_allowed(tool.name()))
-                    .filter(|(tool, _)| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                    .filter(|(tool, _)| {
+                        mcp_gate
+                            .as_ref()
+                            .is_none_or(|gate| gate.is_tool_allowed(tool.name()))
+                    })
                     .collect::<Vec<_>>();
                 let mut memory_kinds = Vec::new();
                 for (_, origin) in &inherited {
@@ -16924,12 +16933,94 @@ target = "memory_recall"
     }
 
     #[test]
+    fn delegate_mcp_grant_map_is_the_only_denier_when_allowed_tools_unrestricted() {
+        use zeroclaw_config::schema::McpProfileGrant;
+        // The discriminating construction: `allowed_tools` resolves to `None`
+        // (unrestricted — the legacy gate admits every name), so the ONLY
+        // possible denier for a `<server>__<tool>` name is the profile's
+        // grant map. Under a non-empty allow-list the strict parent filter
+        // (security.is_tool_allowed) already denies every `__` name before
+        // this gate runs, which would make a same-shaped test
+        // non-discriminating.
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: Vec::new(),
+                mcp_servers: HashMap::from([(
+                    "grafana".to_string(),
+                    McpProfileGrant {
+                        tools: vec!["search_dashboards".to_string()],
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        // The map omits the tool → denied in the child path; the map is the
+        // only possible denier under this construction.
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "grafana__update_dashboard"),
+            "the grant map omitting the tool must deny it when allowed_tools is unrestricted"
+        );
+        // The inverse: the granted tool is ADMITTED in the child path — the
+        // inherited-tools filter admits it and the collapsed gate must not
+        // over-deny a mapped server's granted tool.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "grafana__search_dashboards"),
+            "the granted tool must be admitted in the child path"
+        );
+    }
+
+    #[test]
+    fn resolve_tool_policy_from_config_threads_the_grant_map() {
+        use zeroclaw_config::schema::McpProfileGrant;
+        // The second builder: the config-sourced path must thread the map
+        // too, or a config-resolved delegate target bypasses the per-profile
+        // grant map forever.
+        let mut config = zeroclaw_config::schema::Config::default();
+        let profile = config
+            .risk_profiles
+            .entry("agentic_test".to_string())
+            .or_default();
+        profile.mcp_servers.insert(
+            "grafana".to_string(),
+            McpProfileGrant {
+                tools: vec!["search_dashboards".to_string()],
+            },
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy_from_config(Some(&config), "agentic_test")
+            .expect("the config profile resolves");
+
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "grafana__update_dashboard"),
+            "the config-sourced grant map omitting the tool must deny it"
+        );
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "grafana__search_dashboards"),
+            "the config-sourced granted tool must be admitted"
+        );
+    }
+
+    #[test]
     fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;
         let policy = ToolAccessPolicy::from_security(
             Some(&["shell".to_string()]),
             None,
             Some(&["shell".to_string()]),
+            None,
         )
         .expect("policy");
         assert!(policy.is_tool_allowed("shell"));
