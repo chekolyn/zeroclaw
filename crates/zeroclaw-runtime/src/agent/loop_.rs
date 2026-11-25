@@ -470,10 +470,14 @@ pub fn mcp_tool_access_policy(
     security: &zeroclaw_config::policy::SecurityPolicy,
     caller_allowed: Option<&[String]>,
 ) -> Option<zeroclaw_tools::tool_search::ToolAccessPolicy> {
+    // The `mcp_servers` grant map stays `None` until the wiring task threads
+    // it here (the shared construction site for the runtime loop and the
+    // channels orchestrator); `None` keeps the legacy auto-admit.
     zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
         security.allowed_tools.as_deref(),
         security.excluded_tools.as_deref(),
         caller_allowed,
+        None,
     )
 }
 

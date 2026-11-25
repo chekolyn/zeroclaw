@@ -951,6 +951,7 @@ impl ScopedToolRegistry {
                     security.allowed_tools.as_deref(),
                     security.excluded_tools.as_deref(),
                     caller_allowed,
+                    Some(&security.mcp_servers),
                 ),
             );
             let tool = match &session_memory {
@@ -1490,6 +1491,7 @@ impl ScopedToolRegistry {
             security.allowed_tools.as_deref(),
             security.excluded_tools.as_deref(),
             caller_allowed,
+            Some(&security.mcp_servers),
         );
         let search_admitted = search_policy
             .as_ref()

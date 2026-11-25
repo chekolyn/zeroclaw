@@ -1,5 +1,6 @@
 //! `tool_search` discovery for built-in and MCP tool schemas.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet, deferred_search_score};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
+use zeroclaw_config::schema::McpProfileGrant;
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
@@ -18,6 +20,11 @@ pub struct ToolAccessPolicy {
     pub allowed: Option<Vec<String>>,
     pub caller_allowed: Option<Vec<String>>,
     pub denied: Option<Vec<String>>,
+    /// The per-profile MCP grant map (`SecurityPolicy.mcp_servers`). `Some`
+    /// only when the map carries at least one entry: a server WITH an entry
+    /// is deny-by-default under [`Self::is_tool_allowed`]; servers without
+    /// an entry keep the legacy `<server>__<tool>` auto-admit.
+    pub mcp_servers: Option<HashMap<String, McpProfileGrant>>,
 }
 
 impl ToolAccessPolicy {
@@ -25,6 +32,7 @@ impl ToolAccessPolicy {
         allowed_tools: Option<&[String]>,
         excluded_tools: Option<&[String]>,
         caller_allowed: Option<&[String]>,
+        mcp_servers: Option<&HashMap<String, McpProfileGrant>>,
     ) -> Option<Self> {
         let mut policy = Self::default();
         if let Some(list) = allowed_tools {
@@ -36,15 +44,43 @@ impl ToolAccessPolicy {
         if let Some(list) = excluded_tools {
             policy.denied = Some(list.to_vec());
         }
-        if policy.allowed.is_some() || policy.caller_allowed.is_some() || policy.denied.is_some() {
+        // An empty map governs nothing — every server keeps the legacy
+        // behavior — so it must not conjure a policy for an otherwise-gateless
+        // profile (`None` stays "no policy").
+        if let Some(map) = mcp_servers
+            && !map.is_empty()
+        {
+            policy.mcp_servers = Some(map.clone());
+        }
+        if policy.allowed.is_some()
+            || policy.caller_allowed.is_some()
+            || policy.denied.is_some()
+            || policy.mcp_servers.is_some()
+        {
             Some(policy)
         } else {
             None
         }
     }
 
+    /// The per-profile `mcp_servers` denial reason for `name`, when the map
+    /// governs the name's server and does not grant it. `None` when the name
+    /// is not map-governed (no `<server>__<tool>` shape, no map, no entry
+    /// for the server) or the grant admits it.
+    pub fn mcp_grant_denial_reason(&self, name: &str) -> Option<String> {
+        let (server, tool) = name.split_once("__")?;
+        let grant = self.mcp_servers.as_ref()?.get(server)?;
+        let granted = grant.tools.iter().any(|t| t == "*" || t == tool);
+        if granted {
+            return None;
+        }
+        Some(format!(
+            "`{name}` is not on this profile's mcp_servers grant for `{server}`."
+        ))
+    }
+
     pub fn is_tool_allowed(&self, name: &str) -> bool {
-        // Deny-list always wins.
+        // 1. Deny-list always wins.
         let in_deny = self
             .denied
             .as_ref()
@@ -53,7 +89,26 @@ impl ToolAccessPolicy {
             return false;
         }
 
-        // Risk-profile gate: MCP `<server>__<tool>` names are auto-admitted
+        // 2. The per-profile `mcp_servers` grant (composition order:
+        //    denied > mcp_servers > allowed > caller_allowed). For a server
+        //    WITH a map entry the grant is deny-by-default: the tool passes
+        //    only when the entry lists its bare tool part (the name splits
+        //    at the FIRST `__`, the fork's own `<server>__<tool>` convention)
+        //    or the entry carries the explicit `"*"` wildcard. A server with
+        //    NO entry keeps the legacy behavior below. The map can only veto:
+        //    a granted tool still passes the remaining gates, so
+        //    `deny_all_tools` (the explicit empty allow-list) and the
+        //    caller-supplied per-run list still narrow it.
+        if let Some((server, tool)) = name.split_once("__")
+            && let Some(grant) = self.mcp_servers.as_ref().and_then(|map| map.get(server))
+        {
+            let granted = grant.tools.iter().any(|t| t == "*" || t == tool);
+            if !granted {
+                return false;
+            }
+        }
+
+        // 3. Risk-profile gate: MCP `<server>__<tool>` names are auto-admitted
         // when the list is non-empty. An explicit empty list (`Some(vec![])`)
         // still means "deny everything".
         let risk_ok = match self.allowed.as_ref() {
@@ -65,6 +120,7 @@ impl ToolAccessPolicy {
             return false;
         }
 
+        // 4. The caller-supplied per-run list.
         match self.caller_allowed.as_ref() {
             None => true,
             Some(list) => list.iter().any(|t| t == name),
@@ -690,6 +746,7 @@ mod tests {
                 "risk_blocked".into(),
             ]),
             denied: Some(vec!["blocked".into()]),
+            mcp_servers: None,
         };
         let tool =
             ToolSearchTool::for_builtin_schemas(Arc::clone(&activated)).with_access_policy(policy);
@@ -1056,9 +1113,16 @@ mod tests {
         let stubs = vec![
             make_stub("srv__allowed_tool", "An allowed tool"),
             make_stub("srv__blocked_tool", "A blocked tool"),
+            make_stub("srv__unlisted_tool", "An unlisted tool"),
+            make_stub("other__legacy_tool", "A legacy tool"),
         ];
+        // The per-profile `mcp_servers` grant for `srv` is deny-by-default:
+        // `srv__unlisted_tool` is dropped by the MAP (not the deny-list),
+        // while `other` has no map entry and keeps the legacy auto-admit.
+        let map = grant_map(&[("srv", &["allowed_tool"])]);
         let policy = ToolAccessPolicy {
             denied: Some(vec!["srv__blocked_tool".into()]),
+            mcp_servers: Some(map),
             ..ToolAccessPolicy::default()
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
@@ -1071,7 +1135,16 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("srv__allowed_tool"));
         assert!(!result.output.contains("srv__blocked_tool"));
+        assert!(
+            !result.output.contains("srv__unlisted_tool"),
+            "a mapped server's unlisted tool must be denied by the mcp_servers grant"
+        );
+        assert!(
+            result.output.contains("other__legacy_tool"),
+            "a server with no map entry keeps the legacy auto-admit"
+        );
         assert!(!activated.lock().unwrap().is_activated("srv__blocked_tool"));
+        assert!(!activated.lock().unwrap().is_activated("srv__unlisted_tool"));
     }
 
     #[tokio::test]
@@ -1108,28 +1181,45 @@ mod tests {
         let stubs = vec![
             make_stub("srv__ok", "OK tool"),
             make_stub("srv__nope", "Blocked tool"),
+            make_stub("srv__unlisted", "Unlisted tool"),
+            make_stub("other__legacy", "Legacy tool"),
         ];
-        // Runtime-discovered MCP tools (names containing "__") are auto-admitted
-        // when an allow-list is present, so the operator-visible way to block a
-        // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
+        // Runtime-discovered MCP tools (names containing "__") are governed
+        // by the per-profile `mcp_servers` grant when the profile carries an
+        // entry for the server (deny-by-default); servers without an entry
+        // keep the legacy allow-list auto-admit. The operator-visible way to
+        // block a specific MCP tool is the map entry (or the deny-list, the
+        // `excluded_tools` equivalent, which still wins over the map).
         // See `ToolAccessPolicy::is_tool_allowed` and
+        let map = grant_map(&[("srv", &["ok"])]);
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
             denied: Some(vec!["srv__nope".into()]),
+            mcp_servers: Some(map),
             ..ToolAccessPolicy::default()
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
             .with_access_policy(policy);
 
         let result = tool
-            .execute(serde_json::json!({"query": "select:srv__ok,srv__nope"}))
+            .execute(serde_json::json!({"query": "select:srv__ok,srv__nope,srv__unlisted,other__legacy"}))
             .await
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("srv__ok"));
         assert!(!result.output.contains("\"name\": \"srv__nope\""));
+        assert!(
+            !result.output.contains("\"name\": \"srv__unlisted\""),
+            "the mapped server's unlisted tool must be denied by the map — \
+             the legacy allow-list auto-admit would have passed it"
+        );
+        assert!(
+            result.output.contains("other__legacy"),
+            "the no-entry legacy path keeps the auto-admit"
+        );
         assert!(result.output.contains("Not found"));
         assert!(!activated.lock().unwrap().is_activated("srv__nope"));
+        assert!(!activated.lock().unwrap().is_activated("srv__unlisted"));
     }
 
     #[tokio::test]
@@ -1219,8 +1309,9 @@ mod tests {
         // The risk-profile gate is wide (unrestricted), so the MCP
         // auto-admit would happily pass any `__` name. The caller-supplied
         // per-run list narrows down to a single non-MCP tool (`cron_add`).
-        let policy = ToolAccessPolicy::from_security(None, None, Some(&["cron_add".to_string()]))
-            .expect("caller-supplied list should produce a policy");
+        let policy =
+            ToolAccessPolicy::from_security(None, None, Some(&["cron_add".to_string()]), None)
+                .expect("caller-supplied list should produce a policy");
 
         assert!(
             policy.is_tool_allowed("cron_add"),
@@ -1237,6 +1328,26 @@ mod tests {
             "second MCP wrapper outside the caller list must also be \
              rejected (PR #7547 review regression)"
         );
+
+        // The map does not leak past the caller gate either: a map-granted
+        // tool outside the per-run list is still rejected, and a no-entry
+        // server's legacy path still narrows at the caller gate.
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy = ToolAccessPolicy::from_security(
+            None,
+            None,
+            Some(&["cron_add".to_string()]),
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "a map grant does not bypass the caller-supplied per-run list"
+        );
+        assert!(
+            !policy.is_tool_allowed("github__search"),
+            "the no-entry legacy path still narrows at the caller gate"
+        );
     }
 
     #[test]
@@ -1245,6 +1356,7 @@ mod tests {
             Some(&["shell".to_string()]),
             None,
             Some(&["shell".to_string(), "github__search".to_string()]),
+            None,
         )
         .expect("risk + caller lists should produce a policy");
 
@@ -1263,6 +1375,21 @@ mod tests {
         );
         // Non-MCP outside both lists: rejected.
         assert!(!policy.is_tool_allowed("memory_recall"));
+
+        // With a map entry, the granted tool still narrows at the caller
+        // gate: the map can only veto, and the per-run list is the last gate.
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string(), "github__search".to_string()]),
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "a map-granted tool outside the caller list is still narrowed"
+        );
     }
 
     #[test]
@@ -1271,12 +1398,22 @@ mod tests {
         // empty principal list must yield a tool-less session even in the
         // presence of MCP `<server>__<tool>` names, which the risk-profile
         // gate would otherwise auto-admit. No `__` escape at the caller layer.
-        let policy = ToolAccessPolicy::from_security(None, None, Some(&[]))
+        let policy = ToolAccessPolicy::from_security(None, None, Some(&[]), None)
             .expect("an empty caller allowlist still produces a policy");
         assert!(!policy.is_tool_allowed("shell"));
         assert!(
             !policy.is_tool_allowed("filesystem__write_file"),
             "empty caller allowlist must deny MCP tools despite the __ auto-admit"
+        );
+
+        // The map grant does not escape an empty caller allowlist either —
+        // even a wildcard entry stays narrowed by the per-run list.
+        let map = grant_map(&[("grafana", &["*"])]);
+        let policy =
+            ToolAccessPolicy::from_security(None, None, Some(&[]), Some(&map)).expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "empty caller allowlist denies even a wildcard-granted MCP tool"
         );
     }
 
@@ -1286,6 +1423,7 @@ mod tests {
             Some(&["shell".to_string()]),
             Some(&["filesystem__write_file".to_string()]),
             Some(&["shell".to_string(), "filesystem__write_file".to_string()]),
+            None,
         )
         .expect("policy with all three fields should be constructed");
 
@@ -1293,6 +1431,242 @@ mod tests {
         assert!(
             !policy.is_tool_allowed("filesystem__write_file"),
             "denylist subtracts even when both gates would admit"
+        );
+
+        // The denylist subtracts from a map grant too (denied > mcp_servers).
+        let map = grant_map(&[("grafana", &["write_file"])]);
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            Some(&["grafana__write_file".to_string()]),
+            Some(&["shell".to_string(), "grafana__write_file".to_string()]),
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__write_file"),
+            "denylist subtracts even when the mcp_servers grant admits"
+        );
+    }
+
+    // ── The per-profile `mcp_servers` grant map ─────────────────────────
+    // (composition order: denied > mcp_servers > allowed > caller_allowed)
+    //
+    // `mcp_servers` is `Option<HashMap<String, McpProfileGrant>>`: `None`
+    // keeps the legacy `<server>__<tool>` auto-admit; a map entry for a
+    // server makes that server deny-by-default (only the listed bare tool
+    // names, or the explicit `"*"` wildcard, pass). The map can only veto —
+    // a granted tool still passes the allow-list and caller gates.
+
+    fn grant_map(entries: &[(&str, &[&str])]) -> HashMap<String, McpProfileGrant> {
+        entries
+            .iter()
+            .map(|(server, tools)| {
+                (
+                    (*server).to_string(),
+                    McpProfileGrant {
+                        tools: tools.iter().map(|t| (*t).to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mcp_servers_map_entry_is_deny_by_default_per_server() {
+        // A map entry for `grafana` makes that server deny-by-default: only
+        // the listed bare tool names pass. A server with NO entry keeps the
+        // legacy auto-admit, and non-MCP names are never map-governed.
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("a map entry produces a policy");
+        assert!(policy.is_tool_allowed("grafana__search_dashboards"));
+        assert!(
+            !policy.is_tool_allowed("grafana__update_dashboard"),
+            "a mapped server denies its unlisted tools"
+        );
+        assert!(
+            policy.is_tool_allowed("github__search"),
+            "a server with no map entry keeps the legacy auto-admit"
+        );
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("file_write"),
+            "non-MCP names ride the allow-list exactly as before"
+        );
+    }
+
+    #[test]
+    fn mcp_servers_wildcard_entry_admits_every_server_tool() {
+        let map = grant_map(&[("grafana", &["*"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("a map entry produces a policy");
+        assert!(policy.is_tool_allowed("grafana__search_dashboards"));
+        assert!(policy.is_tool_allowed("grafana__update_dashboard"));
+        assert!(policy.is_tool_allowed("grafana__anything_at_all"));
+
+        // The wildcard is per-server: another mapped server without "*"
+        // stays deny-by-default.
+        let map = grant_map(&[("grafana", &["*"]), ("k8s", &["namespaces_list"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("policy");
+        assert!(policy.is_tool_allowed("k8s__namespaces_list"));
+        assert!(!policy.is_tool_allowed("k8s__pods_delete"));
+    }
+
+    #[test]
+    fn mcp_servers_absence_keeps_the_legacy_auto_admit() {
+        // No map at all (the `None` pass): the legacy `__` auto-admit under
+        // a non-empty allow-list, exactly as before the map existed.
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, None)
+                .expect("an allow-list produces a policy");
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("github__search"));
+        assert!(!policy.is_tool_allowed("file_write"));
+
+        // An empty map governs nothing: it must not conjure a policy for an
+        // otherwise-ungated profile (the `None`-policy = unrestricted
+        // contract).
+        let empty = grant_map(&[]);
+        assert!(
+            ToolAccessPolicy::from_security(None, None, None, Some(&empty)).is_none(),
+            "an empty map is not a gate — from_security stays None"
+        );
+        // ...and alongside a real allow-list it behaves as the legacy path.
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&empty))
+                .expect("the allow-list produces a policy");
+        assert!(policy.is_tool_allowed("github__search"));
+    }
+
+    #[test]
+    fn denylist_beats_the_mcp_servers_grant() {
+        // Composition order: denied > mcp_servers. An exact `denied` entry
+        // subtracts a tool the map grants.
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            Some(&["grafana__search_dashboards".to_string()]),
+            None,
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "an exact denied entry beats the mcp_servers grant"
+        );
+    }
+
+    #[test]
+    fn caller_allowlist_narrows_a_map_granted_tool() {
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string()]),
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "the map grant does not bypass the caller-supplied per-run list"
+        );
+
+        // ...and the caller list naming the full prefixed name admits it.
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["grafana__search_dashboards".to_string()]),
+            Some(&map),
+        )
+        .expect("policy");
+        assert!(policy.is_tool_allowed("grafana__search_dashboards"));
+    }
+
+    #[test]
+    fn deny_all_tools_beats_the_mcp_servers_grant() {
+        // `deny_all_tools` surfaces as the explicit empty allow-list
+        // (`Some(vec![])`): it denies everything, map grant included — the
+        // map can only veto, never force-admit past the allow-list gate.
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy = ToolAccessPolicy::from_security(Some(&[]), None, None, Some(&map))
+            .expect("an explicit empty allow-list produces a policy");
+        assert!(
+            !policy.is_tool_allowed("grafana__search_dashboards"),
+            "deny-all beats a map grant — no map escape from an explicit \
+             empty allow-list"
+        );
+    }
+
+    #[test]
+    fn mcp_servers_map_split_is_at_the_first_double_underscore() {
+        // `server__tool__sub` splits at the FIRST `__`: server = `server`,
+        // tool = `tool__sub` (the fork's own `<server>__<tool>` convention,
+        // the `split_once` shape mcp_deferred uses). A map entry must name
+        // the full bare tool part to grant it.
+        let map = grant_map(&[("server", &["tool__sub"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("policy");
+        assert!(policy.is_tool_allowed("server__tool__sub"));
+        assert!(
+            !policy.is_tool_allowed("server__tool"),
+            "the entry lists `tool__sub`, not `tool` — the split is at the \
+             first `__`"
+        );
+    }
+
+    #[test]
+    fn mcp_servers_map_never_governs_non_mcp_names() {
+        // A name without `__` rides `allowed`/`caller_allowed` exactly as
+        // before — the map is consulted only for `<server>__<tool>` names,
+        // even when a map entry's key would collide with the name's prefix.
+        let map = grant_map(&[("shell", &["*"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("policy");
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("file_write"),
+            "a non-MCP name outside the allow-list is denied — the map's \
+             wildcard entry is irrelevant to it"
+        );
+    }
+
+    #[test]
+    fn mcp_grant_denial_reason_names_the_server_and_the_exact_message() {
+        let map = grant_map(&[("grafana", &["search_dashboards"])]);
+        let policy =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, Some(&map))
+                .expect("policy");
+        assert_eq!(
+            policy.mcp_grant_denial_reason("grafana__update_dashboard"),
+            Some(
+                "`grafana__update_dashboard` is not on this profile's \
+                 mcp_servers grant for `grafana`."
+                    .to_string()
+            )
+        );
+        // A granted tool carries no denial reason.
+        assert_eq!(
+            policy.mcp_grant_denial_reason("grafana__search_dashboards"),
+            None
+        );
+        // No map entry for the server → no map denial reason (the legacy
+        // path's refusals carry their own wording elsewhere).
+        assert_eq!(policy.mcp_grant_denial_reason("github__search"), None);
+        // Non-MCP name → no map denial reason.
+        assert_eq!(policy.mcp_grant_denial_reason("file_write"), None);
+        // No map at all → no map denial reason.
+        let no_map =
+            ToolAccessPolicy::from_security(Some(&["shell".to_string()]), None, None, None)
+                .expect("policy");
+        assert_eq!(
+            no_map.mcp_grant_denial_reason("grafana__update_dashboard"),
+            None
         );
     }
 }
