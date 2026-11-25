@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod procedural_memory;
 pub mod restore_drive;
 pub mod route;
+pub mod run_events;
 pub mod rundata;
 pub mod schema;
 pub mod scope;

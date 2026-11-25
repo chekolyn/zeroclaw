@@ -6779,16 +6779,34 @@ impl SopEngine {
     /// log already explains gates and promotions. Emitted only after the
     /// terminal write succeeded, so a retained (failed-to-persist) run never
     /// leaves a phantom failure row behind.
-    fn record_run_failed_event(&self, run_id: &str, status: SopRunStatus, reason: Option<&str>) {
-        if status != SopRunStatus::Failed {
+    ///
+    /// The same pass publishes the event-driven run-failed MQTT event (the
+    /// north Stage-2 leg): fire-and-forget and best-effort — a publish failure
+    /// NEVER fails the run's terminal path, and the `Handle::try_current`
+    /// guard keeps sync contexts (tests, non-runtime callers) panic-free (a
+    /// skipped publish is by design; the C7 boot-time reconcile is the
+    /// boot-safe backstop). The boot fast-fail paths (restore_drive's
+    /// terminal writes) ride this same publish point through `finish_run`.
+    fn record_run_failed_event(&self, run: &SopRun, reason: Option<&str>) {
+        if run.status != SopRunStatus::Failed {
             return;
         }
         self.record_transition_event(
-            run_id,
+            &run.run_id,
             "run_failed",
             reason.map(str::to_string),
             ::serde_json::json!({}),
         );
+        // The publish rides the `channel-mqtt` feature exactly as the
+        // delegate publish sites do (rumqttc is optional).
+        #[cfg(feature = "channel-mqtt")]
+        if let Some((topic, payload)) = super::run_events::run_failed_event_for(run) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = crate::mqtt_bus::publish(&topic, payload.into_bytes(), false).await;
+                });
+            }
+        }
     }
 
     pub fn finish_run(
@@ -6808,7 +6826,7 @@ impl SopEngine {
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
         self.persist_terminal(&run)?;
-        self.record_run_failed_event(run_id, status, reason.as_deref());
+        self.record_run_failed_event(&run, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
@@ -6872,7 +6890,7 @@ impl SopEngine {
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
         self.persist_terminal_with_gate_event(&run, event)?;
-        self.record_run_failed_event(run_id, status, reason.as_deref());
+        self.record_run_failed_event(&run, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
@@ -12126,6 +12144,114 @@ mod tests {
             .find(|event| event.kind == "run_failed")
             .expect("a terminal failure must append a run_failed audit row");
         assert_eq!(failure_event.reason.as_deref(), Some(reason));
+    }
+
+    /// The event-driven run-failed publish (the north Stage-2 leg): a failed
+    /// run's finish yields the run-failed event — the emit decision rides the
+    /// same pass as the terminal write, and the terminal path's own
+    /// invariants (the audit row, the store row) are unchanged by the publish
+    /// leg. Sync on purpose: the publish is best-effort and must stay
+    /// panic-free outside a tokio runtime (a bare spawn would kill the
+    /// terminal path here).
+    #[test]
+    fn failed_run_finish_yields_the_run_failed_event_payload() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "disk quota exceeded".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Failed { .. }));
+
+        // The terminal run's state is exactly the publish input: the emit
+        // decision yields the fixed failed topic + the full payload.
+        let finished = engine.get_run(&run_id).expect("a retained terminal run");
+        let (topic, payload) = crate::sop::run_events::run_failed_event_for(finished)
+            .expect("a failed run's terminal state emits the run-failed event");
+        assert_eq!(topic, "zeroclaw/sop/runs/failed");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["run_id"], run_id);
+        assert_eq!(parsed["sop_name"], "s1");
+        assert_eq!(parsed["total_steps"], 2);
+        assert_eq!(parsed["source"], "gateway");
+
+        // The terminal path is unchanged by the publish: the audit row and
+        // the durable store row are exactly what they were before the leg.
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(
+            events.iter().any(|event| event.kind == "run_failed"),
+            "the terminal failure still appends the run_failed audit row"
+        );
+        let persisted = store.load_run(&run_id).unwrap().expect("a terminal row");
+        assert_eq!(persisted.run.status, SopRunStatus::Failed);
+    }
+
+    /// The omits pin at the engine level: a completed run's finish emits
+    /// nothing — the failed topic stays failed-only.
+    #[test]
+    fn completed_run_finish_yields_no_run_failed_event() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 2,
+                    status: SopStepStatus::Completed,
+                    output: "done".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+
+        let finished = engine.get_run(&run_id).expect("a retained terminal run");
+        assert!(
+            crate::sop::run_events::run_failed_event_for(finished).is_none(),
+            "a completed run must not emit the run-failed event"
+        );
     }
 
     /// The cause is failure-only: completing or cancelling a run must not
