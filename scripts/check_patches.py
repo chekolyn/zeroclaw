@@ -192,6 +192,16 @@ PROBE_REGISTRY: dict = {
         "pattern": r"restore_drive::drive_restored_runs",
         "min_count": 1,
     },
+    # The per-profile mcp_servers tool gate (MCP-PROFILE-GATE): the shared
+    # composition lives in tool_search.rs — the probe pins the grant surface
+    # (mcp_grant_denial_reason + its pins) and the composition-order marker
+    # (denied > mcp_servers > allowed > caller_allowed) so a rebase that
+    # drops either collapses below the floor loudly.
+    "mcp-server-tool-gate": {
+        "glob": "crates/zeroclaw-tools/src/tool_search.rs",
+        "pattern": r"mcp_grant_denial_reason|denied > mcp_servers > allowed > caller_allowed",
+        "min_count": 6,
+    },
 }
 
 # The mechanism's own surfaces — a commit touching ONLY these files is exempt
