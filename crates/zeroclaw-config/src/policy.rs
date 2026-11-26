@@ -361,6 +361,14 @@ pub struct SecurityPolicy {
     /// allowed set comes from `allowed_tools` or from the unrestricted
     /// default). `None` and `Some(vec![])` both mean "exclude nothing".
     pub excluded_tools: Option<Vec<String>>,
+    /// Per-profile MCP tool grants, threaded unchanged from
+    /// `RiskProfileConfig.mcp_servers`. An entry for a server makes that
+    /// server's tools deny-by-default (only the listed tools admitted;
+    /// `"*"` is the explicit whole-server wildcard); an empty map means
+    /// no per-server gating — every granted server rides the legacy `__`
+    /// auto-admit. Consumed by the tool-admission gates
+    /// (`ToolAccessPolicy::from_security` and the delegate path).
+    pub mcp_servers: HashMap<String, crate::schema::McpProfileGrant>,
     /// Tools that never require approval in this profile. Mirrors
     /// `RiskProfileConfig.auto_approve`.
     pub auto_approve: Vec<String>,
@@ -797,6 +805,7 @@ impl Default for SecurityPolicy {
             shell_timeout_secs: 60,
             allowed_tools: None,
             excluded_tools: None,
+            mcp_servers: HashMap::new(),
             auto_approve: vec![],
             always_ask: vec![],
             sandbox_enabled: None,
@@ -5949,6 +5958,7 @@ impl SecurityPolicy {
             } else {
                 Some(risk_profile.excluded_tools.clone())
             },
+            mcp_servers: risk_profile.mcp_servers.clone(),
             auto_approve: risk_profile.auto_approve.clone(),
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
@@ -6603,6 +6613,14 @@ mod tests {
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             deny_all_tools: false,
             excluded_tools: vec!["spawn_subagent".into()],
+            mcp_servers: [(
+                "grafana".to_string(),
+                crate::schema::McpProfileGrant {
+                    tools: vec!["search_dashboards".into()],
+                },
+            )]
+            .into_iter()
+            .collect(),
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
@@ -6671,6 +6689,15 @@ mod tests {
         assert_eq!(
             policy.arg_deny_exemptions, expected_exemptions,
             "arg_deny_exemptions must reach the policy"
+        );
+        let expected_grafana_tools = ["search_dashboards".to_string()];
+        assert_eq!(
+            policy
+                .mcp_servers
+                .get("grafana")
+                .map(|grant| grant.tools.as_slice()),
+            Some(expected_grafana_tools.as_slice()),
+            "mcp_servers must reach the policy unchanged (the per-profile MCP grant map)"
         );
     }
 
