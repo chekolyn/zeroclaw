@@ -531,8 +531,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_success_writes_step_audit() {
-        let (engine, run_id) = engine_with_active_run();
+    async fn advance_success_mints_no_memory_rows_and_the_ledger_row_lands() {
+        // The engine carries an explicit durable store so the test can assert
+        // the run-ledger row directly.
+        let store: Arc<dyn crate::sop::store::SopRunStore> =
+            Arc::new(crate::sop::store::InMemoryRunStore::new());
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(Arc::clone(&store));
+        engine.set_sops_for_test(vec![test_sop()]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-02-19T12:00:00Z".into(),
+        };
+        engine.start_run("test-sop", event).unwrap();
+        let run_id = engine
+            .active_runs()
+            .keys()
+            .next()
+            .expect("expected active run")
+            .clone();
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
         let tmp = tempfile::tempdir().unwrap();
         let mem_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "sqlite".into(),
@@ -542,8 +562,8 @@ mod tests {
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
         let audit = Arc::new(SopAuditLogger::new(memory.clone()));
 
-        let tool = SopAdvanceTool::new(engine).with_audit(audit.clone());
-        let result = tool
+        let tool = SopAdvanceTool::new(engine).with_audit(audit);
+        let first = tool
             .execute(json!({
                 "run_id": run_id,
                 "status": "completed",
@@ -551,9 +571,18 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(result.success);
+        assert!(first.success);
+        let second = tool
+            .execute(json!({
+                "run_id": run_id,
+                "status": "completed",
+                "output": "Step 2 done"
+            }))
+            .await
+            .unwrap();
+        assert!(second.success, "the run completes on the second advance");
 
-        // Verify step audit was written
+        // The mint-stop: a dispatched run writes ZERO sop_* memory rows.
         let entries = memory
             .list(
                 Some(&zeroclaw_memory::traits::MemoryCategory::Custom(
@@ -563,13 +592,20 @@ mod tests {
             )
             .await
             .unwrap();
-        let step_keys: Vec<_> = entries
-            .iter()
-            .filter(|e| e.key.starts_with("sop_step_"))
-            .collect();
         assert!(
-            !step_keys.is_empty(),
-            "step audit should be written on success"
+            entries.is_empty(),
+            "the dispatched run minted sop_* memory rows: {entries:?}"
+        );
+
+        // The run-ledger row still lands: the store carries the terminal run.
+        let ledger = store
+            .load_run(&run_id)
+            .unwrap()
+            .expect("the run-ledger row still lands in the run-state store");
+        assert_eq!(ledger.run.run_id, run_id);
+        assert_eq!(
+            ledger.run.status,
+            crate::sop::types::SopRunStatus::Completed
         );
     }
 }

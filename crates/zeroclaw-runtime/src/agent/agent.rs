@@ -8054,20 +8054,9 @@ mod tests {
         );
         let on_alice = sop_audit_rows(&shared, Some(&PrincipalScope::new("user:alice"))).await;
         assert!(
-            on_alice.contains("P-SOP-PAYLOAD-MARKER"),
-            "the run start is audited on the owner's plane:\n{on_alice}"
-        );
-        assert!(
-            on_alice.contains("P-SOP-STEP-OUTPUT-MARKER"),
-            "the step result is audited on the owner's plane:\n{on_alice}"
-        );
-        assert!(
-            on_alice.contains("P-QUEUED-STEP-MARKER"),
-            "the queued run's step results are audited on the owner's plane:\n{on_alice}"
-        );
-        assert!(
-            on_alice.contains("P-ADVANCE-QUEUED-MARKER"),
-            "the step `sop_advance` queued is audited on the owner's plane:\n{on_alice}"
+            on_alice.is_empty(),
+            "the mint-stop: no SOP audit rows are minted on any plane (the durable \
+             record is the run-state store):\n{on_alice}"
         );
     }
 
@@ -8134,7 +8123,8 @@ mod tests {
         assert!(
             sop_audit_rows(&shared, Some(&PrincipalScope::new("user:alice")))
                 .await
-                .contains("P-APPROVED-STEP-MARKER")
+                .is_empty(),
+            "the mint-stop: no SOP audit rows are minted on any plane"
         );
     }
 
@@ -8170,8 +8160,8 @@ mod tests {
         );
         let on_alice = sop_audit_rows(&shared, Some(&PrincipalScope::new("user:alice"))).await;
         assert!(
-            on_alice.contains("P-PIPELINE-SOP-MARKER"),
-            "the pipeline's run start is audited on the owner's plane:\n{on_alice}"
+            on_alice.is_empty(),
+            "the mint-stop: no SOP audit rows are minted on any plane:\n{on_alice}"
         );
     }
 
@@ -8468,12 +8458,12 @@ mod tests {
                 !shared_rows.contains(marker),
                 "shared audit leaked {marker}: {shared_rows}"
             );
-            assert!(
-                private_rows.contains(marker),
-                "missing owner audit {marker}: {private_rows}"
-            );
         }
-        assert!(private_rows.contains("completed"));
+        assert!(
+            private_rows.is_empty(),
+            "the mint-stop: no SOP audit rows are minted on any plane (the durable \
+             record is the run-state store):\n{private_rows}"
+        );
     }
 
     #[tokio::test]
@@ -23989,14 +23979,16 @@ mod capability_construction_tests {
                 .success
         );
         assert_eq!(memory.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The mint-stop: the audit probe can no longer prove identity by
+        // minting a row — the audit path writes no memory rows, so the
+        // recipe's Arc::ptr_eq asserts above carry the identity property.
         assert!(
             actual
                 .get("sop_step_source-identity_1")
                 .await
                 .unwrap()
-                .unwrap()
-                .content
-                .contains("actual-memory-identity")
+                .is_none(),
+            "the mint-stop: the audit probe must not mint memory rows"
         );
 
         let (engine, audit) = crate::sop::build_sop_engine(
