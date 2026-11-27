@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::engine::now_iso8601;
 use super::types::{SopRun, SopStepResult, SopStepStatus, SopTriggerSource};
 use crate::agent::history::truncate_tool_result;
 use crate::agent::turn::redact::scrub_credentials;
@@ -16,12 +15,18 @@ pub struct SopAuditLogger {
     memory: Arc<dyn Memory>,
 }
 
-/// The audit logger a session's SOP tool writes through. An unowned
-/// session keeps the logger its tools were built with. Once its session is
-/// pinned to an owner, the logger is one over the owner's routed memory, so
-/// the run payloads and step outputs an audit row carries stay on that
-/// owner's plane rather than the shared one the daemon's logger writes. A
-/// tool built without an audit logger stays without one.
+/// The SOP audit logger a session's SOP tool writes through. The mint-stop
+/// (SOP-RUNSTATE-MEM-STOP) retired the memory plane as an audit home: the
+/// logger persists NO sop-class run-state into `memory.memories`. The durable
+/// records are the SOP run-state store (the engine's `save_run`/`finish_run`
+/// ledger over `<data_dir>/sop/runs.db`) and the sidecar's `sop_executions`
+/// ledger; the structured log events each entry point emits remain the
+/// bounded, credential-scrubbed projection for run-log surfaces.
+/// An unowned run keeps the logger its tools were built with. Once its
+/// session is pinned to an owner, the logger is one over the owner's routed
+/// memory, so an audit refusal reads that owner's plane rather than the
+/// shared one the daemon's logger reads. A tool built without an audit
+/// logger stays without one.
 /// The audit logger that may record a run with `owner`. An unowned run
 /// keeps `audit`. An owned run keeps a logger already on its owner's plane,
 /// gets the shared logger re-scoped to its owner, and gets no logger when
@@ -75,9 +80,6 @@ impl SopAuditLogger {
 
     /// Log the start of a new SOP run.
     pub async fn log_run_start(&self, run: &SopRun) -> Result<()> {
-        let key = run_key(&run.run_id);
-        let content = serde_json::to_string_pretty(run)?;
-        self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -92,12 +94,9 @@ impl SopAuditLogger {
 
     /// Log a step result.
     pub async fn log_step_result(&self, run_id: &str, result: &SopStepResult) -> Result<()> {
-        let key = step_key(run_id, result.step_number);
-        let content = serde_json::to_string_pretty(result)?;
-        self.memory.store(&key, &content, category(), None).await?;
-
-        // The durable audit record retains the canonical result. The structured
-        // event is a bounded, credential-scrubbed projection for run-log surfaces.
+        // The canonical result is retained by the SOP run-state store (the
+        // run's `step_results` on its persisted record). The structured event
+        // is a bounded, credential-scrubbed projection for run-log surfaces.
         let output = truncate_tool_result(
             &scrub_credentials(&result.output),
             MAX_STEP_LOG_OUTPUT_CHARS,
@@ -156,17 +155,6 @@ impl SopAuditLogger {
         patterns: &[String],
         score: f64,
     ) -> Result<()> {
-        let now = now_iso8601();
-        let key = event_key("suspicious_untrusted", &now);
-        let content = serde_json::to_string_pretty(&serde_json::json!({
-            "kind": "suspicious_untrusted",
-            "source": source,
-            "topic": topic,
-            "patterns": patterns,
-            "score": score,
-            "timestamp": now,
-        }))?;
-        self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -190,17 +178,6 @@ impl SopAuditLogger {
         topic: Option<&str>,
         reason: &str,
     ) -> Result<()> {
-        let now = now_iso8601();
-        let key = event_key("blocked_unsafe", &now);
-        let content = serde_json::to_string_pretty(&serde_json::json!({
-            "kind": "blocked_unsafe",
-            "sop_name": sop_name,
-            "source": source,
-            "topic": topic,
-            "reason": reason,
-            "timestamp": now,
-        }))?;
-        self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -218,9 +195,6 @@ impl SopAuditLogger {
 
     /// Log run completion (updates the run record with final state).
     pub async fn log_run_complete(&self, run: &SopRun) -> Result<()> {
-        let key = run_key(&run.run_id);
-        let content = serde_json::to_string_pretty(run)?;
-        self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -270,19 +244,6 @@ impl SopAuditLogger {
 
 fn run_key(run_id: &str) -> String {
     format!("sop_run_{run_id}")
-}
-
-fn step_key(run_id: &str, step_number: u32) -> String {
-    format!("sop_step_{run_id}_{step_number}")
-}
-
-fn event_key(kind: &str, timestamp: &str) -> String {
-    let safe_timestamp: String = timestamp
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    let suffix = rand::random::<u32>();
-    format!("sop_event_{kind}_{safe_timestamp}_{suffix:08x}")
 }
 
 fn category() -> MemoryCategory {
@@ -402,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_roundtrip() {
+    async fn the_audit_path_mints_no_memory_rows() {
         let mem_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "sqlite".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -411,32 +372,41 @@ mod tests {
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
-        let logger = SopAuditLogger::new(memory);
+        let logger = SopAuditLogger::new(Arc::clone(&memory));
 
-        // Log run start
+        // Drive every audit entry point of a full run lifecycle.
         let run = test_run();
         logger.log_run_start(&run).await.unwrap();
-
-        // Log step result
-        let step = test_step_result(1);
-        logger.log_step_result(&run.run_id, &step).await.unwrap();
-
-        // Log run complete
+        logger
+            .log_step_result(&run.run_id, &test_step_result(1))
+            .await
+            .unwrap();
+        logger
+            .log_suspicious_untrusted(SopTriggerSource::Manual, None, &[], 0.5)
+            .await
+            .unwrap();
+        logger
+            .log_blocked_unsafe(Some("test-sop"), SopTriggerSource::Manual, None, "reason")
+            .await
+            .unwrap();
         let mut completed_run = run.clone();
         completed_run.status = SopRunStatus::Completed;
         completed_run.completed_at = Some("2026-02-19T12:05:00Z".into());
-        completed_run.step_results = vec![step];
         logger.log_run_complete(&completed_run).await.unwrap();
 
-        // Retrieve
-        let retrieved = logger.get_run("run-test-001").await.unwrap().unwrap();
-        assert_eq!(retrieved.run_id, "run-test-001");
-        assert_eq!(retrieved.status, SopRunStatus::Completed);
-        assert_eq!(retrieved.step_results.len(), 1);
-
-        // List runs
-        let keys = logger.list_runs().await.unwrap();
-        assert!(keys.contains(&"sop_run_run-test-001".to_string()));
+        // The mint-stop: the SOP audit path persists NO run-state into
+        // memory.memories. The durable homes are the SOP run-state store
+        // (the engine's save_run/finish_run ledger) and the sidecar's
+        // sop_executions ledger — not the recall-facing memory plane.
+        let minted = memory.list(Some(&category()), None).await.unwrap();
+        assert!(
+            minted.is_empty(),
+            "the audit path minted sop_* memory rows: {minted:?}"
+        );
+        assert!(
+            logger.get_run(&run.run_id).await.unwrap().is_none(),
+            "a run that was never minted must not read back from memory"
+        );
     }
 
     #[tokio::test]

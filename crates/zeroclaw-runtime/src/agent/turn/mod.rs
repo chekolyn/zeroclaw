@@ -9996,8 +9996,9 @@ mod sop_step_reassembly_tests {
             .await
             .unwrap();
         assert!(
-            on_owner.iter().any(|row| row.key == step_key),
-            "the step is audited on the run owner's plane"
+            on_owner.iter().all(|row| !row.key.starts_with("sop_")),
+            "the mint-stop: no SOP audit rows are minted on any plane (the durable \
+             record is the run-state store): {on_owner:?}"
         );
         let owned = exec_cache
             .iter()

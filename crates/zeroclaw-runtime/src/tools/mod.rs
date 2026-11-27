@@ -7671,8 +7671,11 @@ permissions = ["http_client"]
         let mut cfg = test_config(&tmp);
         cfg.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
 
+        let store: Arc<dyn crate::sop::store::SopRunStore> =
+            Arc::new(crate::sop::store::InMemoryRunStore::new());
         let tools = {
-            let mut engine = crate::sop::SopEngine::new(cfg.sop.clone());
+            let mut engine =
+                crate::sop::SopEngine::new(cfg.sop.clone()).with_store(Arc::clone(&store));
             engine.reload(tmp.path());
             let sop_engine = Arc::new(std::sync::Mutex::new(engine));
             let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
@@ -7713,12 +7716,16 @@ permissions = ["http_client"]
             .unwrap();
         assert!(result.success, "sop_execute failed: {result:?}");
 
-        let audit = crate::sop::SopAuditLogger::new(mem.clone());
-        let run_keys = audit.list_runs().await.unwrap();
-        assert!(
-            !run_keys.is_empty(),
-            "registered sop_execute must persist a sop_run_* audit entry; got none (audit not wired)"
-        );
+        // The mint-stop retired the memory audit trail; the wiring proof reads
+        // the run ledger: the dispatched run's row lands in the run-state store.
+        let stored = store
+            .load_active_runs()
+            .unwrap()
+            .into_iter()
+            .chain(store.load_terminal_runs(0).unwrap())
+            .find(|run| run.run.sop_name == "canary")
+            .expect("registered sop_execute must land the run in the run-state store (wiring)");
+        assert_eq!(stored.run.sop_name, "canary");
     }
 
     #[test]

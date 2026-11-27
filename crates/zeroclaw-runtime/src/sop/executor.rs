@@ -1754,12 +1754,9 @@ mod tests {
         );
         let on_owner = sop_rows(&shared, Some(&owner)).await;
         assert!(
-            on_owner.contains(&format!("sop_step_{run_id}_1")),
-            "the resumed step is audited on the owner's plane:\n{on_owner}"
-        );
-        assert!(
-            on_owner.contains("P-HEADLESS-PAYLOAD-MARKER"),
-            "the finished run, payload included, is audited on the owner's plane:\n{on_owner}"
+            on_owner.is_empty(),
+            "the mint-stop: no SOP audit rows are minted on any plane (the durable \
+             record is the run-state store):\n{on_owner}"
         );
     }
 

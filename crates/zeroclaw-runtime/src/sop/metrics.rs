@@ -5,8 +5,9 @@ use std::time::Instant;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::json;
 
+use anyhow::Context;
+
 use super::types::{SopRun, SopRunStatus, SopStepStatus};
-use zeroclaw_memory::traits::{Memory, MemoryCategory};
 
 /// Maximum recent runs kept in each ring buffer (global + per-SOP).
 /// Covers ~90-day window at ~11 runs/day. If throughput exceeds this,
@@ -231,25 +232,23 @@ impl SopMetricsCollector {
 
     // ── Warm-start (async) ─────────────────────────────────────
 
-    pub async fn rebuild_from_persistence(
-        memory: &dyn Memory,
-        store: &dyn super::store::SopRunStore,
-    ) -> anyhow::Result<Self> {
-        let category = MemoryCategory::Custom("sop".into());
-        let entries = memory.list(Some(&category), None).await?;
-
-        // Pass 1: terminal run snapshots from the Memory run audit.
+    pub fn rebuild_from_persistence(store: &dyn super::store::SopRunStore) -> anyhow::Result<Self> {
+        // Pass 1: terminal run snapshots from the run-state store. The
+        // mint-stop (SOP-RUNSTATE-MEM-STOP) retired the Memory run audit; the
+        // warm-start reconciles to the run ledger, never to memory. The
+        // store's terminal window is its retention policy's.
         let mut runs: HashMap<String, SopRun> = HashMap::new();
         // sop_name per run_id, for the pending maps + per-SOP counters.
         let mut approval_sop_names: HashMap<String, String> = HashMap::new();
-        for entry in &entries {
-            if entry.key.starts_with("sop_run_")
-                && let Ok(run) = serde_json::from_str::<SopRun>(&entry.content)
-                && matches!(
-                    run.status,
-                    SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
-                )
-            {
+        let terminal = store
+            .load_terminal_runs(0)
+            .with_context(|| "SOP metrics warm-start could not read terminal runs")?;
+        for persisted in terminal {
+            let run = persisted.run;
+            if matches!(
+                run.status,
+                SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+            ) {
                 approval_sop_names
                     .entry(run.run_id.clone())
                     .or_insert_with(|| run.sop_name.clone());
@@ -1243,18 +1242,11 @@ mod tests {
 
     // ── Warm-start tests ─────────────────────────────────────
 
-    #[tokio::test]
-    async fn warm_start_roundtrip() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
-        );
-
-        let audit = crate::sop::SopAuditLogger::new(memory.clone());
+    #[test]
+    fn warm_start_roundtrip() {
+        // The terminal run snapshot is sourced from the run-state store (the
+        // mint-stop retired the Memory run audit): `finish_run` records the
+        // terminal run.
         let run = make_run(
             "r1",
             "test-sop",
@@ -1265,19 +1257,21 @@ mod tests {
                 make_step(2, SopStepStatus::Completed),
             ],
         );
-        audit.log_run_start(&run).await.unwrap();
-        audit.log_run_complete(&run).await.unwrap();
+        let store = InMemoryRunStore::new();
+        store
+            .finish_run(
+                "r1",
+                &PersistedRun::new(run, "2026-02-19T12:05:00Z".into(), SopTriggerSource::Manual),
+            )
+            .unwrap();
 
         // The approval is sourced from the append-only gate ledger, not a Memory
         // audit key: a human (cli) approve row.
-        let store = InMemoryRunStore::new();
         store
             .append_event(&gate_approve_event("r1", "cli"))
             .unwrap();
 
-        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
-            .await
-            .unwrap();
+        let collector = SopMetricsCollector::rebuild_from_persistence(&store).unwrap();
 
         assert_eq!(
             collector.get_metric_value("sop.runs_completed"),
@@ -1293,18 +1287,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn warm_start_skips_running_runs() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
-        );
-
-        let audit = crate::sop::SopAuditLogger::new(memory.clone());
+    #[test]
+    fn warm_start_skips_running_runs() {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
@@ -1326,12 +1310,18 @@ mod tests {
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };
-        audit.log_run_start(&run).await.unwrap();
 
+        // The active run is sourced from the run-state store (the mint-stop
+        // retired the Memory run audit).
         let store = InMemoryRunStore::new();
-        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
-            .await
+        store
+            .save_run(&PersistedRun::new(
+                run,
+                "2026-02-19T12:00:00Z".into(),
+                SopTriggerSource::Manual,
+            ))
             .unwrap();
+        let collector = SopMetricsCollector::rebuild_from_persistence(&store).unwrap();
 
         assert_eq!(
             collector.get_metric_value("sop.runs_completed"),
@@ -1339,21 +1329,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn warm_start_empty_memory() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
-        );
-
+    #[test]
+    fn warm_start_empty_store() {
         let store = InMemoryRunStore::new();
-        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
-            .await
-            .unwrap();
+        let collector = SopMetricsCollector::rebuild_from_persistence(&store).unwrap();
 
         assert_eq!(
             collector.get_metric_value("sop.runs_completed"),
@@ -1361,18 +1340,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn warm_start_approval_matching() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
-        );
-
-        let audit = crate::sop::SopAuditLogger::new(memory.clone());
+    #[test]
+    fn warm_start_approval_matching() {
+        // The terminal run snapshot is sourced from the run-state store (the
+        // mint-stop retired the Memory run audit).
         let run = make_run(
             "r1",
             "test-sop",
@@ -1380,19 +1351,21 @@ mod tests {
             1,
             vec![make_step(1, SopStepStatus::Completed)],
         );
-        audit.log_run_start(&run).await.unwrap();
-        audit.log_run_complete(&run).await.unwrap();
+        let store = InMemoryRunStore::new();
+        store
+            .finish_run(
+                "r1",
+                &PersistedRun::new(run, "2026-02-19T12:05:00Z".into(), SopTriggerSource::Manual),
+            )
+            .unwrap();
 
         // A timeout auto-approval is a `gate_resolved` approve attributed to the
         // `system` source.
-        let store = InMemoryRunStore::new();
         store
             .append_event(&gate_approve_event("r1", "system"))
             .unwrap();
 
-        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
-            .await
-            .unwrap();
+        let collector = SopMetricsCollector::rebuild_from_persistence(&store).unwrap();
 
         assert_eq!(
             collector.get_metric_value("sop.timeout_auto_approvals"),
@@ -1408,18 +1381,9 @@ mod tests {
 
     // ── BUG 2 regression: warm-start pending for non-terminal runs ──
 
-    #[tokio::test]
-    async fn warm_start_preserves_pending_for_nonterminal_runs() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::from(
-            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
-        );
-
-        let audit = crate::sop::SopAuditLogger::new(memory.clone());
+    #[test]
+    fn warm_start_preserves_pending_for_nonterminal_runs() {
+        let store = InMemoryRunStore::new();
 
         // A Running (non-terminal) run with an approval. The run is discovered as
         // active from the store (`load_active_runs`); its approval comes from the
@@ -1445,12 +1409,9 @@ mod tests {
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };
-        audit.log_run_start(&running_run).await.unwrap();
-
-        let store = InMemoryRunStore::new();
         store
             .save_run(&PersistedRun::new(
-                running_run.clone(),
+                running_run,
                 "2026-02-19T12:00:00Z".into(),
                 SopTriggerSource::Manual,
             ))
@@ -1460,9 +1421,7 @@ mod tests {
             .unwrap();
 
         // Warm-start: run is non-terminal, approval should go into pending
-        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
-            .await
-            .unwrap();
+        let collector = SopMetricsCollector::rebuild_from_persistence(&store).unwrap();
 
         // All-time approval counted
         assert_eq!(
